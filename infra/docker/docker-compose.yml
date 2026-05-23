@@ -136,6 +136,28 @@ services:
       - ../grafana/provisioning:/etc/grafana/provisioning:ro
       - ../grafana/dashboards:/var/lib/grafana/dashboards:ro
 
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    environment:
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_PASSWORD:-change_me}
+      GENERIC_TIMEZONE: ${TZ:-UTC}
+      N8N_HOST: 0.0.0.0
+      N8N_PORT: 5678
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678/}
+      # Pull-through secrets so workflows can use {{$env.VAR}}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      AI_INVESTING_API_BASE: ${AI_INVESTING_API_BASE:-http://host.docker.internal:8000}
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n-data:/home/node/.n8n
+      - ../n8n/workflows:/data/workflows:ro
+
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
     restart: unless-stopped
@@ -155,3 +177,4 @@ volumes:
   prometheus-data:
   loki-data:
   tempo-data:
+  n8n-data:

@@ -86,3 +86,17 @@ def test_live_promotion_ready_returns_canary(tmp_path, monkeypatch):
     # Empty live curve → tier 0 → 5%
     assert r["capital_fraction"] == 0.05
     assert r["canary"]["tier_index"] == 0
+
+
+def test_security_rotation_reminder_records_audit():
+    c = TestClient(app)
+    payload = {
+        "ts": "2026-04-01T14:00:00Z",
+        "scope": "broker, market_data",
+        "runbook": "https://example.test/runbook",
+        "channel": "n8n-quarterly",
+    }
+    r = c.post("/security/rotation-reminder", json=payload).json()
+    assert r["ok"] is True and r["audit_id"]
+    listed = c.get("/security/audit").json()["events"]
+    assert any(e["audit_id"] == r["audit_id"] for e in listed)

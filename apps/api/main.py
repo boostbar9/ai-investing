@@ -13,6 +13,8 @@ Phase 3 endpoints:
 - GET  /activity           — recent audit events (activity feed module)
 - GET  /health/detail      — broker, LLM router, regime cache, DB health panel
 - GET  /live/promotion     — Phase 5 live readiness + canary capital tier
+- POST /security/rotation-reminder — n8n quarterly key-rotation event
+- GET  /security/audit     — list recent security audit events
 """
 from __future__ import annotations
 
@@ -202,6 +204,39 @@ async def activity_feed(limit: int = 50) -> dict[str, Any]:
             flat.append({**e, "decision_id": str(did)})
     flat.sort(key=lambda e: e.get("ts", ""), reverse=True)
     return {"events": flat[:limit]}
+
+
+class RotationReminder(BaseModel):
+    ts: str
+    scope: str
+    runbook: str
+    channel: str = "n8n-quarterly"
+
+
+# Append-only in-memory store; a real impl writes to the immutable audit table.
+_SECURITY_AUDIT: list[dict[str, Any]] = []
+
+
+@app.post("/security/rotation-reminder")
+async def rotation_reminder(body: RotationReminder) -> dict[str, Any]:
+    """Receive the n8n quarterly key-rotation reminder event.
+
+    Writes to the security audit log (§13). Returns the recorded audit id
+    so the n8n workflow can chain a Telegram confirmation.
+    """
+    entry = {
+        "audit_id": str(uuid4()),
+        "recorded_at": datetime.now(UTC).isoformat(),
+        **body.model_dump(),
+    }
+    _SECURITY_AUDIT.append(entry)
+    return {"ok": True, "audit_id": entry["audit_id"]}
+
+
+@app.get("/security/audit")
+async def list_security_audit(limit: int = 50) -> dict[str, Any]:
+    """List recent security audit events (rotation reminders, etc.)."""
+    return {"events": _SECURITY_AUDIT[-limit:][::-1]}
 
 
 @app.get("/live/promotion")
