@@ -15,6 +15,10 @@ Phase 3 endpoints:
 - GET  /live/promotion     — Phase 5 live readiness + canary capital tier
 - POST /security/rotation-reminder — n8n quarterly key-rotation event
 - GET  /security/audit     — list recent security audit events
+- POST /auth/passkey/register/options    — issue WebAuthn registration challenge
+- POST /auth/passkey/register/verify     — verify + persist a new passkey
+- POST /auth/passkey/authenticate/options — issue WebAuthn sign-in challenge
+- POST /auth/passkey/authenticate/verify  — verify sign-in + mint session
 """
 from __future__ import annotations
 
@@ -23,8 +27,17 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+
+from packages.shared.passkeys import (
+    PasskeyStore,
+    PasskeyVerificationError,
+    build_authentication_options,
+    build_registration_options,
+    verify_authentication,
+    verify_registration,
+)
 
 app = FastAPI(title="ai-investing API", version="0.1.0")
 
@@ -305,4 +318,119 @@ async def health_detail() -> dict[str, Any]:
         "regime":  {"ok": True, "source": "hmm-or-heuristic"},
         "db":      {"ok": True, "driver": "timescale"},
         "cache":   {"ok": True, "driver": "dragonfly"},
+    }
+
+
+# ---------------------------------------------------------------------------
+# §12 Phase 4 — passkey biometric login (issue #7)
+# ---------------------------------------------------------------------------
+#
+# Tailscale is the network gate; passkeys are the per-user lock inside it.
+# The server only trusts the `X-Tailscale-User` header set by the upstream
+# tsnsrv reverse proxy. In dev (no Tailscale), the header is absent and we
+# fall back to a single hardcoded operator id.
+
+_PASSKEY_STORE = PasskeyStore()
+
+
+def _rp_id() -> str:
+    return os.getenv("WEBAUTHN_RP_ID", "localhost")
+
+
+def _expected_origin() -> str:
+    return os.getenv("WEBAUTHN_ORIGIN", "http://localhost:3000")
+
+
+def _resolve_user(x_tailscale_user: str | None) -> str:
+    """Resolve the caller's identity.
+
+    In production this header is set by tsnsrv. In dev we fall back to
+    ``WEBAUTHN_DEV_USER`` (default ``devin``) so the flow is testable.
+    """
+    if x_tailscale_user:
+        return x_tailscale_user
+    return os.getenv("WEBAUTHN_DEV_USER", "devin")
+
+
+class RegistrationOptionsRequest(BaseModel):
+    user_display_name: str = ""
+
+
+class RegistrationVerifyRequest(BaseModel):
+    response: dict[str, Any]
+    label: str = ""
+
+
+class AuthenticationVerifyRequest(BaseModel):
+    response: dict[str, Any]
+
+
+@app.post("/auth/passkey/register/options")
+async def passkey_register_options(
+    body: RegistrationOptionsRequest,
+    x_tailscale_user: str | None = Header(default=None, alias="X-Tailscale-User"),
+) -> dict[str, Any]:
+    user_id = _resolve_user(x_tailscale_user)
+    return build_registration_options(
+        user_id,
+        rp_id=_rp_id(),
+        rp_name="ai-investing cockpit",
+        user_display_name=body.user_display_name or user_id,
+        existing_credentials=_PASSKEY_STORE.credentials_for_user(user_id),
+        store=_PASSKEY_STORE,
+    )
+
+
+@app.post("/auth/passkey/register/verify")
+async def passkey_register_verify(
+    body: RegistrationVerifyRequest,
+) -> dict[str, Any]:
+    try:
+        cred = verify_registration(
+            response=body.response,
+            expected_origin=_expected_origin(),
+            expected_rp_id=_rp_id(),
+            store=_PASSKEY_STORE,
+            label=body.label,
+        )
+    except PasskeyVerificationError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "ok": True,
+        "credential_id": cred.credential_id,
+        "user_id": cred.user_id,
+        "label": cred.label,
+    }
+
+
+@app.post("/auth/passkey/authenticate/options")
+async def passkey_authenticate_options(
+    x_tailscale_user: str | None = Header(default=None, alias="X-Tailscale-User"),
+) -> dict[str, Any]:
+    user_id = _resolve_user(x_tailscale_user)
+    return build_authentication_options(
+        user_id, rp_id=_rp_id(), store=_PASSKEY_STORE
+    )
+
+
+@app.post("/auth/passkey/authenticate/verify")
+async def passkey_authenticate_verify(
+    body: AuthenticationVerifyRequest,
+) -> dict[str, Any]:
+    try:
+        cred = verify_authentication(
+            response=body.response,
+            expected_origin=_expected_origin(),
+            expected_rp_id=_rp_id(),
+            store=_PASSKEY_STORE,
+        )
+    except PasskeyVerificationError as e:
+        raise HTTPException(status_code=401, detail=str(e)) from e
+    # A real impl mints a signed session token here. For the skeleton we
+    # return a placeholder the cockpit can stash in HttpOnly cookie via its
+    # own NextAuth handler.
+    return {
+        "ok": True,
+        "user_id": cred.user_id,
+        "session_hint": str(uuid4()),
     }

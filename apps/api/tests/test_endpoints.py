@@ -100,3 +100,97 @@ def test_security_rotation_reminder_records_audit():
     assert r["ok"] is True and r["audit_id"]
     listed = c.get("/security/audit").json()["events"]
     assert any(e["audit_id"] == r["audit_id"] for e in listed)
+
+
+def test_passkey_full_round_trip(monkeypatch):
+    import base64
+    import json
+
+    monkeypatch.setenv("WEBAUTHN_RP_ID", "localhost")
+    monkeypatch.setenv("WEBAUTHN_ORIGIN", "http://localhost:3000")
+    # Reset the in-process store so test order doesn't matter
+    from apps.api import main as api_main
+    from packages.shared.passkeys import PasskeyStore
+    api_main._PASSKEY_STORE = PasskeyStore()
+
+    c = TestClient(app)
+
+    def _b64url(b: bytes) -> str:
+        return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+    def _client_data(ctype: str, challenge: str) -> str:
+        return _b64url(json.dumps({
+            "type": ctype, "challenge": challenge,
+            "origin": "http://localhost:3000",
+        }).encode())
+
+    # 1. registration options
+    opts = c.post("/auth/passkey/register/options", json={}).json()
+    assert opts["rp"]["id"] == "localhost"
+    assert opts["challenge"]
+
+    # 2. registration verify
+    reg = c.post("/auth/passkey/register/verify", json={
+        "response": {
+            "id": "cred-test",
+            "rawId": "cred-test",
+            "type": "public-key",
+            "response": {
+                "clientDataJSON": _client_data("webauthn.create", opts["challenge"]),
+                "publicKey": "pk-blob",
+                "transports": ["internal"],
+            },
+        },
+        "label": "Test device",
+    }).json()
+    assert reg["ok"] is True and reg["credential_id"] == "cred-test"
+
+    # 3. authentication options
+    auth_opts = c.post("/auth/passkey/authenticate/options", json={}).json()
+    assert any(cred["id"] == "cred-test" for cred in auth_opts["allowCredentials"])
+
+    # 4. authentication verify
+    signed = c.post("/auth/passkey/authenticate/verify", json={
+        "response": {
+            "id": "cred-test",
+            "rawId": "cred-test",
+            "type": "public-key",
+            "response": {
+                "clientDataJSON": _client_data("webauthn.get", auth_opts["challenge"]),
+            },
+        },
+    }).json()
+    assert signed["ok"] is True
+    assert signed["session_hint"]
+
+
+def test_passkey_authenticate_rejects_unknown_credential(monkeypatch):
+    import base64
+    import json
+
+    monkeypatch.setenv("WEBAUTHN_RP_ID", "localhost")
+    monkeypatch.setenv("WEBAUTHN_ORIGIN", "http://localhost:3000")
+    from apps.api import main as api_main
+    from packages.shared.passkeys import PasskeyStore
+    api_main._PASSKEY_STORE = PasskeyStore()
+
+    c = TestClient(app)
+    opts = c.post("/auth/passkey/authenticate/options", json={}).json()
+    body = {
+        "response": {
+            "id": "cred-does-not-exist",
+            "rawId": "cred-does-not-exist",
+            "type": "public-key",
+            "response": {
+                "clientDataJSON": base64.urlsafe_b64encode(
+                    json.dumps({
+                        "type": "webauthn.get",
+                        "challenge": opts["challenge"],
+                        "origin": "http://localhost:3000",
+                    }).encode()
+                ).rstrip(b"=").decode("ascii"),
+            },
+        },
+    }
+    r = c.post("/auth/passkey/authenticate/verify", json=body)
+    assert r.status_code == 401
