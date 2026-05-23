@@ -1,8 +1,21 @@
-# Day-1 Operator Checklist
+# Day-1 Operator Checklist (§21)
 
 A one-page checklist for the very first day running the platform.
 
-## Before market open (06:00 PT)
+## One-time bring-up (§21)
+
+- [ ] `gh repo create` + push Phase 0 — done.
+- [ ] Doppler project loaded with all keys.
+- [ ] `make setup` succeeds clean.
+- [ ] Ollama models pulled; smoke chat against DeepSeek R1 works.
+- [ ] Alpaca paper linked; first 1-share order succeeds.
+- [ ] Telegram bot responds to `/start` and `/pending`.
+- [ ] Cockpit installs as PWA; Face ID / passkey login works.
+- [ ] First nightly backtest passes.
+- [ ] Risk profile selected (Balanced default).
+- [ ] Tailscale Funnel verified externally.
+
+## Every market open (06:00 PT)
 
 - [ ] Pull latest `main` and re-run `make setup` if there were merges.
 - [ ] `make ps` — all 7 services green (postgres, dragonfly, temporal, ollama, mlflow, grafana, otel-collector).
