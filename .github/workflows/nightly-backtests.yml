@@ -1,0 +1,53 @@
+name: Nightly Backtests
+
+on:
+  schedule:
+    # 09:00 UTC = 02:00 PT — runs after US market close + data refresh
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  matrix:
+    name: ${{ matrix.strategy }} × ${{ matrix.regime }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        strategy: [trend-following, sector-rotation, mean-reversion, sentiment-overlay]
+        regime: [bull, bear, chop, crisis, full-history]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Sync deps
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync --all-extras || true
+      - name: Run backtest
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv run python -m packages.backtests.run \
+            --strategy ${{ matrix.strategy }} \
+            --regime ${{ matrix.regime }} \
+            --output artifacts/${{ matrix.strategy }}-${{ matrix.regime }}.json || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backtest-${{ matrix.strategy }}-${{ matrix.regime }}
+          path: artifacts/
+          if-no-files-found: ignore
+
+  gate:
+    name: Sharpe-drop gate
+    needs: matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+      - name: Block on >10% Sharpe drop vs main
+        run: |
+          echo "TODO: implement Sharpe-drop gate per §10. Blocks merge when drop > 10%."

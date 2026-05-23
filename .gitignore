@@ -1,0 +1,71 @@
+# ---- Secrets (never commit) ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+doppler.yaml
+
+# ---- Node / pnpm ----
+node_modules/
+.pnpm-store/
+.next/
+.turbo/
+dist/
+build/
+out/
+*.tsbuildinfo
+.eslintcache
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+.uv/
+.python-version
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Data / models / artifacts ----
+data/raw/
+data/processed/
+data/cache/
+models/
+*.parquet
+*.feather
+*.pkl
+*.h5
+*.onnx
+*.gguf
+*.safetensors
+mlruns/
+mlflow.db
+
+# ---- Infra ----
+.docker/
+*.log
+logs/
+tmp/
+postgres-data/
+timescale-data/
+dragonfly-data/
+temporal-data/
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ---- OS / misc ----
+Thumbs.db
+*.bak
