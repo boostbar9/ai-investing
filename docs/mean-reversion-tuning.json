@@ -1,0 +1,157 @@
+{
+  "panel": {
+    "shape": [
+      5032,
+      3
+    ],
+    "start": "2006-05-23",
+    "end": "2026-05-22",
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM"
+    ]
+  },
+  "grid_size": 18,
+  "baseline_params": {
+    "rsi_entry": 10.0,
+    "rsi_exit": 70.0,
+    "sma": 200.0
+  },
+  "baseline_metrics": {
+    "sharpe": 0.42741111263993237,
+    "max_dd": 0.24434413711029243,
+    "cagr": 0.04154097604900486,
+    "turnover": 28.637253559693317,
+    "n_days": 5032.0
+  },
+  "naive_best_params": {
+    "rsi_entry": 15.0,
+    "rsi_exit": 60.0,
+    "sma": 200.0
+  },
+  "naive_metrics": {
+    "sharpe": 0.5431307373816698,
+    "max_dd": 0.19640095150908832,
+    "cagr": 0.04882711394236239,
+    "turnover": 34.9381161007667,
+    "n_days": 5032.0
+  },
+  "folds": [
+    {
+      "fold": 1,
+      "fit_start": "2006-05-23",
+      "fit_end": "2010-05-20",
+      "test_start": "2010-05-21",
+      "test_end": "2014-05-20",
+      "fit_bars": 1006,
+      "test_bars": 1006,
+      "best_params": {
+        "rsi_entry": 15.0,
+        "rsi_exit": 60.0,
+        "sma": 100.0
+      },
+      "in_sample": {
+        "sharpe": 0.45567536532230934,
+        "max_dd": 0.11639775707619418,
+        "cagr": 0.0419419540973367,
+        "turnover": 28.725651577503427,
+        "n_days": 1006.0
+      },
+      "out_of_sample": {
+        "sharpe": 0.3599931361806074,
+        "max_dd": 0.2102319999140212,
+        "cagr": 0.03247525529831985,
+        "turnover": 33.85650684931506,
+        "n_days": 1006.0
+      }
+    },
+    {
+      "fold": 2,
+      "fit_start": "2006-05-23",
+      "fit_end": "2014-05-20",
+      "test_start": "2014-05-21",
+      "test_end": "2018-05-17",
+      "fit_bars": 2012,
+      "test_bars": 1006,
+      "best_params": {
+        "rsi_entry": 5.0,
+        "rsi_exit": 80.0,
+        "sma": 100.0
+      },
+      "in_sample": {
+        "sharpe": 0.4736028138886453,
+        "max_dd": 0.1855044859539581,
+        "cagr": 0.05166378962473406,
+        "turnover": 19.81200753682768,
+        "n_days": 2012.0
+      },
+      "out_of_sample": {
+        "sharpe": 0.26561190209133817,
+        "max_dd": 0.141102325286627,
+        "cagr": 0.020185067453638572,
+        "turnover": 22.31108442004118,
+        "n_days": 1006.0
+      }
+    },
+    {
+      "fold": 3,
+      "fit_start": "2006-05-23",
+      "fit_end": "2018-05-17",
+      "test_start": "2018-05-18",
+      "test_end": "2022-05-16",
+      "fit_bars": 3018,
+      "test_bars": 1006,
+      "best_params": {
+        "rsi_entry": 15.0,
+        "rsi_exit": 60.0,
+        "sma": 200.0
+      },
+      "in_sample": {
+        "sharpe": 0.46842803252897613,
+        "max_dd": 0.19640095150908832,
+        "cagr": 0.04071366404180843,
+        "turnover": 34.742003655471784,
+        "n_days": 3018.0
+      },
+      "out_of_sample": {
+        "sharpe": 0.5058160112070391,
+        "max_dd": 0.13506984050912207,
+        "cagr": 0.04867396467415541,
+        "turnover": 28.872858122001368,
+        "n_days": 1006.0
+      }
+    },
+    {
+      "fold": 4,
+      "fit_start": "2006-05-23",
+      "fit_end": "2022-05-16",
+      "test_start": "2022-05-17",
+      "test_end": "2026-05-20",
+      "fit_bars": 4024,
+      "test_bars": 1006,
+      "best_params": {
+        "rsi_entry": 15.0,
+        "rsi_exit": 60.0,
+        "sma": 200.0
+      },
+      "in_sample": {
+        "sharpe": 0.4481231254132946,
+        "max_dd": 0.19640095150908832,
+        "cagr": 0.04004995043503068,
+        "turnover": 34.624807264005476,
+        "n_days": 4024.0
+      },
+      "out_of_sample": {
+        "sharpe": 0.9892128398230668,
+        "max_dd": 0.08399827404256414,
+        "cagr": 0.0846130816392543,
+        "turnover": 34.34614071038252,
+        "n_days": 1006.0
+      }
+    }
+  ],
+  "oos_sharpe_avg": 0.5301584723255128,
+  "overfit_gap": 0.012972265056157006,
+  "verdict": "OK: walk-forward Sharpe (0.53) beats baseline (0.43) by a meaningful margin. The tuned params look reasonably robust."
+}

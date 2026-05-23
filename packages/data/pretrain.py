@@ -93,21 +93,50 @@ def _bars_to_parquet(bars: list[Bar], out: Path) -> int:
     return len(df)
 
 
+# Alpaca's free IEX daily feed only starts ~2016; for a real 20-year history
+# yfinance is the better source. We try Alpaca first only if it can reach
+# at least this far back, otherwise we go straight to yfinance.
+_MIN_DAILY_YEARS = 10
+
+
 async def _fetch_daily(symbol: str, alpaca: AlpacaDataAdapter, yf: YFinanceAdapter) -> list[Bar]:
-    """Try Alpaca first; fall back to yfinance on failure or missing keys."""
+    """Pull 20 years of daily bars. yfinance is the primary deep-history source.
+
+    Alpaca's free IEX feed has thinner deep history (~5y for many names), so
+    yfinance wins for daily. We still try Alpaca as a fallback if yfinance
+    fails for any reason.
+    """
+    try:
+        bars = await yf.get_daily_bars(symbol, range_="20y")
+        if len(bars) >= 252 * _MIN_DAILY_YEARS:
+            return bars
+        # yfinance returned something short — try Alpaca as a sanity check.
+        log.info(
+            "yfinance daily %s only %d bars; trying Alpaca as fallback",
+            symbol,
+            len(bars),
+        )
+        yfinance_bars = bars
+    except DataAdapterError as e:
+        log.warning("yfinance daily %s failed (%s); trying Alpaca", symbol, e)
+        yfinance_bars = []
+
     if alpaca.is_configured():
         end = datetime.now(UTC)
         start = end - timedelta(days=365 * 20 + 30)
         try:
-            return await alpaca.get_bars(
+            alpaca_bars = await alpaca.get_bars(
                 symbol,
                 start.strftime("%Y-%m-%d"),
                 end.strftime("%Y-%m-%d"),
                 timeframe="1Day",
             )
+            # Whichever has more history wins.
+            if len(alpaca_bars) > len(yfinance_bars):
+                return alpaca_bars
         except DataAdapterError as e:
-            log.warning("alpaca daily %s failed (%s); falling back to yfinance", symbol, e)
-    return await yf.get_daily_bars(symbol, range_="20y")
+            log.warning("alpaca daily %s also failed (%s)", symbol, e)
+    return yfinance_bars
 
 
 async def _fetch_intraday(
