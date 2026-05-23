@@ -41,6 +41,14 @@ class AlpacaDataAdapter(DataAdapter):
             headers={"APCA-API-KEY-ID": self.key_id, "APCA-API-SECRET-KEY": self.secret},
         )
 
+    def is_configured(self) -> bool:
+        """True iff both paper keys are present.
+
+        Pretrain/refresh skip Alpaca-only paths when this is False to avoid 401
+        spam. yfinance is the always-available fallback.
+        """
+        return bool(self.key_id and self.secret)
+
     async def health(self) -> dict[str, Any]:
         with span("data.alpaca_data.health"):
             try:
@@ -68,6 +76,11 @@ class AlpacaDataAdapter(DataAdapter):
         Common timeframes: ``"1Min"``, ``"5Min"``, ``"15Min"``, ``"1Hour"``, ``"1Day"``.
         ``feed="iex"`` is free for paper accounts; ``"sip"`` requires a paid plan.
         """
+        if not self.is_configured():
+            raise DataAdapterError(
+                "alpaca_data: ALPACA_PAPER_KEY_ID / ALPACA_PAPER_SECRET not set — "
+                "get free paper keys at https://app.alpaca.markets/paper/dashboard/overview"
+            )
         await BUCKETS["alpaca_data"].acquire()
         with span(
             "data.alpaca_data.bars",

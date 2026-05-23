@@ -144,8 +144,26 @@ async def run(
         "daily": {"symbols": 0, "rows": 0, "skipped_recent": 0},
         "intraday": {"symbols": 0, "rows": 0, "skipped_recent": 0},
         "macro": {"series": 0, "rows": 0, "skipped_recent": 0},
+        "skipped_sources": [],
         "errors": [],
     }
+
+    # Up-front config check: warn (don't fail) when optional keys are missing
+    # so the operator sees ONE clear message instead of N noisy 401/400 lines.
+    if not alpaca.is_configured():
+        log.info(
+            "alpaca_data skipped: set ALPACA_PAPER_KEY_ID + ALPACA_PAPER_SECRET "
+            "(free paper account) to enable intraday bars. yfinance will still "
+            "provide daily history."
+        )
+        summary["skipped_sources"].append("alpaca_data (no paper keys)")
+    if not fred.is_configured():
+        log.info(
+            "fred skipped: set FRED_API_KEY (free) to enable macro series "
+            "(VIX, unemployment, CPI, yield curve). Pretraining will still "
+            "complete with daily price history."
+        )
+        summary["skipped_sources"].append("fred (no api key)")
 
     try:
         # ---- Daily bars ----
@@ -165,6 +183,11 @@ async def run(
                 log.warning("daily %s failed: %s", sym, e)
 
         # ---- Intraday (5-min) ----
+        # Skip the whole intraday phase if Alpaca isn't configured — yfinance
+        # can't return reliable intraday history beyond ~60 days and the
+        # operator already saw the actionable message above.
+        if include_intraday and not alpaca.is_configured():
+            include_intraday = False
         if include_intraday:
             for sym in universe:
                 out = root / "intraday" / f"{sym}.parquet"
@@ -180,8 +203,11 @@ async def run(
                     summary["errors"].append(f"intraday {sym}: {e}")
 
         # ---- Macro (FRED) ----
+        # Same short-circuit: no key → skip the whole macro phase silently.
         import pandas as pd
 
+        if not fred.is_configured():
+            macro_series = ()
         for series_id in macro_series:
             out = root / "macro" / f"{series_id}.parquet"
             if _file_age_days(out) < refresh_after_days:

@@ -12,6 +12,9 @@ from packages.data.adapters.base import Bar
 class _FakeAlpaca:
     name = "alpaca_data"
 
+    def is_configured(self) -> bool:
+        return True
+
     async def get_bars(self, symbol, start, end, timeframe="1Day", feed="iex"):
         n = 5
         return [
@@ -54,6 +57,9 @@ class _FakeYF:
 class _FakeAlpacaFails:
     name = "alpaca_data"
 
+    def is_configured(self) -> bool:
+        return True
+
     async def get_bars(self, *args, **kwargs):
         from packages.data.adapters.base import DataAdapterError
 
@@ -65,6 +71,9 @@ class _FakeAlpacaFails:
 
 class _FakeFred:
     name = "fred"
+
+    def is_configured(self) -> bool:
+        return True
 
     async def get_series(self, series_id):
         return [
@@ -127,6 +136,40 @@ async def test_run_is_idempotent(tmp_path, monkeypatch):
     assert s2["daily"]["symbols"] == 0
     assert s2["daily"]["skipped_recent"] == 1
     assert s2["macro"]["skipped_recent"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_skips_cleanly_when_keys_missing(tmp_path, monkeypatch):
+    """With no Alpaca/FRED keys, pretrain still completes via yfinance and
+    surfaces the skipped sources in the summary instead of crashing."""
+    class _NoKeyAlpaca(_FakeAlpaca):
+        def is_configured(self) -> bool:
+            return False
+
+    class _NoKeyFred(_FakeFred):
+        def is_configured(self) -> bool:
+            return False
+
+    monkeypatch.setenv("DATA_PARQUET_ROOT", str(tmp_path))
+    monkeypatch.setattr(pretrain, "AlpacaDataAdapter", lambda: _NoKeyAlpaca())
+    monkeypatch.setattr(pretrain, "YFinanceAdapter", lambda: _FakeYF())
+    monkeypatch.setattr(pretrain, "FredAdapter", lambda: _NoKeyFred())
+
+    summary = await pretrain.run(
+        universe=("SPY",),
+        macro_series=("VIXCLS",),
+        include_intraday=True,
+    )
+    # Daily falls back to yfinance — still produces data.
+    assert summary["daily"]["symbols"] == 1
+    # Intraday + macro skip cleanly (no FRED/Alpaca calls).
+    assert summary["intraday"]["symbols"] == 0
+    assert summary["macro"]["series"] == 0
+    # Skipped sources are surfaced so the operator knows what to enable next.
+    assert "alpaca_data (no paper keys)" in summary["skipped_sources"]
+    assert "fred (no api key)" in summary["skipped_sources"]
+    # No errors — missing-key is not an error.
+    assert summary["errors"] == []
 
 
 @pytest.mark.asyncio

@@ -118,3 +118,29 @@ def test_sharpe_drop_needs_history():
     v = sharpe_drop_gate(eq)
     assert v.blocked is False
     assert v.reason is not None
+
+
+# ---------------------------------------------------------------------------
+# Regression: NaN/inf must NEVER be allowed to promote.
+# A bot that "promotes" on garbage data is the worst possible failure mode.
+# ---------------------------------------------------------------------------
+
+
+def test_promotion_rejects_nan_metrics():
+    # Equity series of all-NaN produces NaN metrics. Without the guard, NaN
+    # comparisons return False and the gate would silently promote.
+    nan_eq = pd.Series([np.nan] * 60)
+    v = promotion_gate(nan_eq, nan_eq, min_days=30)
+    assert v.promote is False
+    assert any("not finite" in r for r in v.reasons)
+
+
+def test_promotion_rejects_inf_metrics():
+    # Pathological challenger with infinite return on the last day.
+    rng = np.random.default_rng(0)
+    champ = _equity(rng.normal(0.001, 0.01, 60))
+    chal_rets = rng.normal(0.001, 0.01, 60)
+    chal_rets[-1] = np.inf
+    chal = _equity(chal_rets)
+    v = promotion_gate(champ, chal, min_days=30)
+    assert v.promote is False

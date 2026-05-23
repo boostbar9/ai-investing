@@ -17,6 +17,7 @@ trivially testable.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -116,6 +117,21 @@ def promotion_gate(
     }
 
     reasons: list[str] = []
+
+    # Reject NaN/inf metrics outright. NaN comparisons always return False, so
+    # the regression checks below would silently let a broken challenger through.
+    # A bot that "promotes" on garbage data is the worst possible failure mode.
+    for key, val in metrics.items():
+        if val is None or (isinstance(val, float) and not math.isfinite(val)):
+            reasons.append(f"{key} is not finite ({val!r}) — refusing to promote")
+    if reasons:
+        return PromotionVerdict(
+            promote=False,
+            days_outperformed=0,
+            reasons=reasons,
+            metrics=metrics,
+        )
+
     if metrics["challenger_sharpe"] - metrics["champion_sharpe"] < sharpe_margin:
         reasons.append(
             f"sharpe margin "

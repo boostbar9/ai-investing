@@ -5,7 +5,7 @@
         setup-windows pull-models pull-models-7900xt \
         dev up down logs ps \
         test test-node test-python lint format typecheck \
-        backtest nightly pretrain retune schedules \
+        backtest nightly pretrain retune schedules doctor first-run \
         clean reset
 
 help:  ## Show this help
@@ -116,6 +116,14 @@ retune:  ## Walk-forward retune of strategy params (writes data/params/champion.
 
 schedules:  ## Install Temporal schedules for nightly_refresh + weekly_retune
 	uv run python -m packages.data.jobs.scheduler
+
+doctor:  ## Readiness check: which data sources work, cache status, champion params
+	uv run python -m tools.doctor
+
+first-run: doctor pretrain retune  ## End-to-end first install: doctor → pretrain → retune
+	@echo ""
+	@echo "✅ First-run complete. The bot is trained on real history."
+	@echo "   Run 'make dev' to start the cockpit and start the nightly training loop."
 
 # ---------- House-keeping ----------
 clean:

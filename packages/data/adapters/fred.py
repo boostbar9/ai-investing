@@ -30,7 +30,20 @@ class FredAdapter(DataAdapter):
             except Exception as e:
                 return {"ok": False, "error": str(e)}
 
+    def is_configured(self) -> bool:
+        """Cheap check used by pretrain/refresh to skip work when no key is set.
+
+        FRED requires a free API key. Without it every request returns 400; we
+        avoid the noise by short-circuiting.
+        """
+        return bool(self.api_key)
+
     async def get_series(self, series_id: str) -> list[dict[str, Any]]:
+        if not self.api_key:
+            raise DataAdapterError(
+                "fred: FRED_API_KEY is not set — sign up free at "
+                "https://fred.stlouisfed.org/docs/api/api_key.html"
+            )
         await BUCKETS["fred"].acquire()
         with span("data.fred.series", {"series_id": series_id}):
             r = await self._client.get(

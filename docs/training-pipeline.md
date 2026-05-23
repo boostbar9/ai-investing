@@ -6,14 +6,22 @@ cloud dependency for the core pipeline.
 
 ## TL;DR
 
-1. **First install:** `make pretrain` — pulls 20 years of daily bars, 90 days
-   of 5-minute intraday bars, and the FRED macro series into `data/parquet/`.
-   Takes ~5–10 minutes on a clean install.
+0. **Sanity check:** `make doctor` — reports which data sources are enabled,
+   what's in the parquet cache, and whether champion params have been
+   trained. Prints the exact next command.
+1. **First install:** `make first-run` — one shot that runs `doctor → pretrain
+   → retune`. Or run each step on its own:
+   - `make pretrain` pulls 20 years of daily bars, 90 days of 5-minute
+     intraday bars (if Alpaca keys set), and FRED macro series (if key set)
+     into `data/parquet/`. ~5–10 minutes on a clean install. Idempotent.
+   - `make retune` runs walk-forward and writes `data/params/champion.json`.
 2. **Nightly @ 03:00 UTC:** the worker refreshes yesterday's bars and pulls a
    fresh sentiment snapshot.
 3. **Weekly @ Sunday 05:00 UTC:** walk-forward retune refits a small set of
    strategy parameters and promotes the challenger only if it clears the
-   same promotion gate the live champion/challenger flow uses.
+   same promotion gate the live champion/challenger flow uses. **NaN/inf
+   metrics are rejected outright** — the bot will never "succeed" on broken
+   data.
 
 You don't need to start the workflows by hand once `make schedules` has been
 run against your local Temporal cluster.
