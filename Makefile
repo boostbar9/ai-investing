@@ -2,6 +2,7 @@
 # Acceptance criterion §16: clone -> first backtest in < 30 min
 
 .PHONY: help setup setup-node setup-python setup-llms setup-db \
+        setup-windows pull-models pull-models-7900xt \
         dev up down logs ps \
         test test-node test-python lint format typecheck \
         backtest nightly \
@@ -27,11 +28,38 @@ setup-db:  ## Bring up Postgres+Timescale and run migrations
 	@sleep 3
 	uv run alembic -c packages/data/alembic.ini upgrade head || true
 
-setup-llms:  ## Pull DeepSeek R1 and Qwen 2.5 via Ollama
+setup-llms:  ## Pull DeepSeek R1 and Qwen 2.5 via Ollama (workstation profile)
 	docker compose -f infra/docker/docker-compose.yml up -d ollama
 	@sleep 5
 	docker compose -f infra/docker/docker-compose.yml exec -T ollama ollama pull deepseek-r1:70b || true
 	docker compose -f infra/docker/docker-compose.yml exec -T ollama ollama pull qwen2.5:72b || true
+
+# ---------- Local (Windows / single-PC) setup ----------
+# These targets assume Ollama is installed on the host (not in Docker) and
+# work for Path A (Ollama on Windows) and Path B (WSL2 + ROCm).
+# See docs/runbooks/local-setup-windows.md for the full guide.
+
+setup-windows: setup-node setup-python setup-db  ## One-shot setup for a local Windows PC (Path A/B)
+	@echo ""
+	@echo "Next: set HARDWARE_PROFILE in your env (e.g. rx_7900_xt), then run:"
+	@echo "  make pull-models"
+	@echo ""
+	@echo "See docs/runbooks/local-setup-windows.md for details."
+
+pull-models:  ## Pull every Ollama model required by HARDWARE_PROFILE (defaults to active profile)
+	@echo "Resolving models for active hardware profile..."
+	@uv run python -c "from packages.agents.model_profiles import all_models, active_profile; p = active_profile(); print(f'Profile: {p.name} ({p.description})'); [print(f'  - {m}') for m in all_models()]"
+	@echo ""
+	@uv run python -c "from packages.agents.model_profiles import all_models; print('\n'.join(all_models()))" | while read model; do \
+		echo ">>> ollama pull $$model"; \
+		ollama pull $$model || exit 1; \
+	done
+	@echo ""
+	@echo "All models pulled. Quick smoke test:"
+	@echo "  ollama run $$(uv run python -c 'from packages.agents.model_profiles import all_models; print(all_models()[0])') 'Reply with OK.'"
+
+pull-models-7900xt:  ## Convenience: force the rx_7900_xt profile and pull its models
+	@HARDWARE_PROFILE=rx_7900_xt $(MAKE) pull-models
 
 # ---------- Run ----------
 dev: up  ## Start full local stack

@@ -8,31 +8,37 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import dataclass
 
 import httpx
 
+from packages.agents.model_profiles import LLMChain, chain_for
 from packages.shared.otel import span
+
+# Re-exported so existing call sites that imported LLMChain from here keep
+# working.
+__all__ = ["LLMChain", "LLMError", "LLMRouter"]
 
 
 class LLMError(RuntimeError):
     """Raised when every model in the chain fails."""
 
 
-@dataclass(frozen=True)
-class LLMChain:
-    primary: str
-    backup: str
-    quantized: str  # last-resort, e.g. ``qwen2.5:7b-q4_K_M``
+# Backwards-compat shim: callers that imported ``CHAINS`` get the active
+# profile's chains lazily on every access (so HARDWARE_PROFILE env changes
+# take effect without a re-import).
+class _ChainsView:
+    def __getitem__(self, agent: str) -> LLMChain:
+        return chain_for(agent)
+
+    def __contains__(self, agent: str) -> bool:
+        try:
+            chain_for(agent)
+        except KeyError:
+            return False
+        return True
 
 
-# Per §5 table — paired with §18 hardware-too-weak mitigation.
-CHAINS: dict[str, LLMChain] = {
-    "research":  LLMChain("deepseek-r1:70b", "qwen2.5:72b",     "qwen2.5:7b-instruct-q4_K_M"),
-    "strategy":  LLMChain("qwen2.5:72b",     "llama3.3:70b",    "qwen2.5:7b-instruct-q4_K_M"),
-    "risk":      LLMChain("deepseek-r1:70b", "mistral-large",   "deepseek-r1:7b-q4_K_M"),
-    "execution": LLMChain("llama3.3:70b",    "mistral-large",   "llama3.2:3b-q4_K_M"),
-}
+CHAINS = _ChainsView()
 
 
 class LLMRouter:
@@ -59,7 +65,7 @@ class LLMRouter:
         timeout_seconds: int = 30,
     ) -> dict:
         """Walk the chain until one model returns parseable JSON."""
-        chain = CHAINS[agent]
+        chain = chain_for(agent)
         models = (chain.primary, chain.backup, chain.quantized)
         last_err: Exception | None = None
 
