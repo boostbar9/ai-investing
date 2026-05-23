@@ -1,0 +1,178 @@
+[
+  {
+    "strategy": "trend-following",
+    "panel_bars": 1100,
+    "panel_names": 11,
+    "tier1": {
+      "passed": false,
+      "reasons": [
+        "history < 10y (1100 bars)",
+        "OOS Sharpe 0.02 < 1.0",
+        "turnover 9.41/yr > 2.0",
+        "MC positive ratio 49.00% < 95%"
+      ],
+      "metrics": {
+        "strategy": "trend-following",
+        "sharpe": 0.0162,
+        "max_drawdown": -0.1872,
+        "turnover_annual": 9.4112,
+        "cagr": -0.0014,
+        "n_days": 1100,
+        "mc_positive_ratio": 0.49
+      }
+    },
+    "tier2": {
+      "passed": true,
+      "reasons": [],
+      "metrics": {
+        "stress_drawdowns": {}
+      }
+    },
+    "tier3": {
+      "passed": false,
+      "reasons": [
+        "synthetic positive ratio 45.40% < 95%"
+      ],
+      "metrics": {
+        "synthetic_paths": 500,
+        "block_size": 20,
+        "synthetic_positive_ratio": 0.454,
+        "synthetic_median_return": -0.0119,
+        "synthetic_p05_return": -0.2015
+      }
+    }
+  },
+  {
+    "strategy": "sector-rotation",
+    "panel_bars": 1993,
+    "panel_names": 11,
+    "tier1": {
+      "passed": false,
+      "reasons": [
+        "history < 10y (1993 bars)",
+        "OOS Sharpe 0.63 < 1.0",
+        "turnover 6.79/yr > 2.0",
+        "MC positive ratio 81.40% < 95%"
+      ],
+      "metrics": {
+        "strategy": "sector-rotation",
+        "sharpe": 0.6256,
+        "max_drawdown": -0.292,
+        "turnover_annual": 6.7858,
+        "cagr": 0.1053,
+        "n_days": 1993,
+        "mc_positive_ratio": 0.814
+      }
+    },
+    "tier2": {
+      "passed": true,
+      "reasons": [],
+      "metrics": {
+        "stress_drawdowns": {
+          "2018": 0.0,
+          "2020": 0.0,
+          "2022": -0.1391
+        }
+      }
+    },
+    "tier3": {
+      "passed": false,
+      "reasons": [
+        "synthetic positive ratio 84.40% < 95%"
+      ],
+      "metrics": {
+        "synthetic_paths": 500,
+        "block_size": 20,
+        "synthetic_positive_ratio": 0.844,
+        "synthetic_median_return": 0.3501,
+        "synthetic_p05_return": -0.1871
+      }
+    }
+  },
+  {
+    "strategy": "mean-reversion",
+    "panel_bars": 1100,
+    "panel_names": 11,
+    "tier1": {
+      "passed": false,
+      "reasons": [
+        "history < 10y (1100 bars)",
+        "OOS Sharpe 0.68 < 1.0",
+        "turnover 2.02/yr > 2.0",
+        "MC positive ratio 87.80% < 95%"
+      ],
+      "metrics": {
+        "strategy": "mean-reversion",
+        "sharpe": 0.6839,
+        "max_drawdown": -0.2033,
+        "turnover_annual": 2.0202,
+        "cagr": 0.0675,
+        "n_days": 1100,
+        "mc_positive_ratio": 0.878
+      }
+    },
+    "tier2": {
+      "passed": true,
+      "reasons": [],
+      "metrics": {
+        "stress_drawdowns": {}
+      }
+    },
+    "tier3": {
+      "passed": false,
+      "reasons": [
+        "synthetic positive ratio 90.40% < 95%"
+      ],
+      "metrics": {
+        "synthetic_paths": 500,
+        "block_size": 20,
+        "synthetic_positive_ratio": 0.904,
+        "synthetic_median_return": 0.2194,
+        "synthetic_p05_return": -0.065
+      }
+    }
+  },
+  {
+    "strategy": "sentiment-overlay",
+    "panel_bars": 1100,
+    "panel_names": 11,
+    "tier1": {
+      "passed": false,
+      "reasons": [
+        "history < 10y (1100 bars)",
+        "OOS Sharpe 0.02 < 1.0",
+        "turnover 9.41/yr > 2.0",
+        "MC positive ratio 49.00% < 95%"
+      ],
+      "metrics": {
+        "strategy": "trend-following+sentiment",
+        "sharpe": 0.0162,
+        "max_drawdown": -0.1872,
+        "turnover_annual": 9.4112,
+        "cagr": -0.0014,
+        "n_days": 1100,
+        "mc_positive_ratio": 0.49
+      }
+    },
+    "tier2": {
+      "passed": true,
+      "reasons": [],
+      "metrics": {
+        "stress_drawdowns": {}
+      }
+    },
+    "tier3": {
+      "passed": false,
+      "reasons": [
+        "synthetic positive ratio 45.40% < 95%"
+      ],
+      "metrics": {
+        "synthetic_paths": 500,
+        "block_size": 20,
+        "synthetic_positive_ratio": 0.454,
+        "synthetic_median_return": -0.0119,
+        "synthetic_p05_return": -0.2015
+      }
+    }
+  }
+]
