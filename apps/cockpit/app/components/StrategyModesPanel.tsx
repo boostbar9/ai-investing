@@ -18,17 +18,24 @@ type AccountPayload = {
   status: string | null;
 };
 
-const MODE_COLORS: Record<Mode, string> = {
-  paper: "#3b82f6",   // blue
-  shadow: "#9ca3af",  // gray
-  live: "#22c55e",    // green
-};
-
 const MODE_HELP: Record<Mode, string> = {
   paper: "Trades on the fake account. Counts toward the 60-day promotion gate.",
   shadow: "Generates signals only. No orders sent anywhere.",
   live: "Real money. Gated: requires ENABLE_LIVE_TRADING + promotion clearance.",
 };
+
+const MODE_ACTIVE_CLASS: Record<Mode, string> = {
+  paper: "bg-sky-500 text-neutral-950 border-sky-500",
+  shadow: "bg-neutral-300 text-neutral-950 border-neutral-300",
+  live: "bg-emerald-500 text-neutral-950 border-emerald-500",
+};
+
+function formatMoney(s: string | null | undefined): string {
+  if (s == null) return "—";
+  const n = Number(s);
+  if (Number.isNaN(n)) return s;
+  return n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+}
 
 export default function StrategyModesPanel() {
   const [data, setData] = useState<ModesPayload | null>(null);
@@ -73,101 +80,94 @@ export default function StrategyModesPanel() {
   };
 
   return (
-    <section
-      style={{
-        padding: 16,
-        borderRadius: 12,
-        background: "#0b1220",
-        color: "#e5e7eb",
-        marginTop: 16,
-      }}
-    >
-      <h2 style={{ margin: 0, fontSize: 18 }}>Strategies & training mode</h2>
-      <p style={{ marginTop: 4, marginBottom: 12, color: "#9ca3af", fontSize: 13 }}>
+    <section className="rounded-2xl bg-neutral-900 p-5">
+      <div className="flex items-baseline justify-between gap-4">
+        <div className="text-xs uppercase tracking-wider text-neutral-400">
+          Strategies & training mode
+        </div>
+        {account && (
+          <div className="text-xs text-neutral-500 font-mono">
+            {account.broker}
+          </div>
+        )}
+      </div>
+      <p className="mt-1 text-xs text-neutral-500">
         Paper trains on fake money. Shadow is observation-only. Live needs the promotion gate.
       </p>
 
       {account && (
-        <div
-          style={{
-            display: "flex",
-            gap: 24,
-            padding: "8px 12px",
-            background: "#111827",
-            borderRadius: 8,
-            marginBottom: 12,
-            fontSize: 14,
-          }}
-        >
-          <div>
-            <div style={{ color: "#9ca3af", fontSize: 11 }}>Broker</div>
-            <div>{account.broker}</div>
+        <div className="mt-4 grid grid-cols-3 gap-2">
+          <div className="rounded-xl bg-neutral-800/60 p-3">
+            <div className="text-[10px] uppercase tracking-wider text-neutral-500">
+              Equity
+            </div>
+            <div className="mt-1 text-lg font-medium tabular-nums">
+              {formatMoney(account.equity)}
+            </div>
           </div>
-          <div>
-            <div style={{ color: "#9ca3af", fontSize: 11 }}>Equity</div>
-            <div>${account.equity ?? "—"}</div>
+          <div className="rounded-xl bg-neutral-800/60 p-3">
+            <div className="text-[10px] uppercase tracking-wider text-neutral-500">
+              Cash
+            </div>
+            <div className="mt-1 text-lg font-medium tabular-nums">
+              {formatMoney(account.cash)}
+            </div>
           </div>
-          <div>
-            <div style={{ color: "#9ca3af", fontSize: 11 }}>Cash</div>
-            <div>${account.cash ?? "—"}</div>
-          </div>
-          <div>
-            <div style={{ color: "#9ca3af", fontSize: 11 }}>Buying power</div>
-            <div>${account.buying_power ?? "—"}</div>
+          <div className="rounded-xl bg-neutral-800/60 p-3">
+            <div className="text-[10px] uppercase tracking-wider text-neutral-500">
+              Buying power
+            </div>
+            <div className="mt-1 text-lg font-medium tabular-nums">
+              {formatMoney(account.buying_power)}
+            </div>
           </div>
         </div>
       )}
       {accountErr && (
-        <div style={{ color: "#f87171", fontSize: 12, marginBottom: 8 }}>
-          Paper account unreachable — set ALPACA_PAPER_KEY_ID / ALPACA_PAPER_SECRET in .env.
+        <div className="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          Paper account unreachable — set <code className="font-mono">ALPACA_PAPER_KEY_ID</code> and{" "}
+          <code className="font-mono">ALPACA_PAPER_SECRET</code> in your <code className="font-mono">.env</code>.
         </div>
       )}
 
-      {err && <div style={{ color: "#f87171", fontSize: 12 }}>{err}</div>}
-      {!data && !err && <div style={{ color: "#9ca3af" }}>Loading…</div>}
+      {err && <div className="mt-3 text-xs text-red-400">{err}</div>}
+      {!data && !err && <div className="mt-3 text-sm text-neutral-500">Loading…</div>}
 
       {data && (
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead>
-            <tr style={{ color: "#9ca3af", fontSize: 12, textAlign: "left" }}>
-              <th style={{ padding: "6px 0" }}>Strategy</th>
-              <th style={{ padding: "6px 0" }}>Mode</th>
-            </tr>
-          </thead>
-          <tbody>
-            {Object.entries(data.modes).map(([name, mode]) => (
-              <tr key={name} style={{ borderTop: "1px solid #1f2937" }}>
-                <td style={{ padding: "8px 0", fontFamily: "monospace" }}>{name}</td>
-                <td style={{ padding: "8px 0" }}>
-                  <div style={{ display: "flex", gap: 6 }}>
-                    {data.available.map((m) => {
-                      const active = mode === m;
-                      return (
-                        <button
-                          key={m}
-                          disabled={busy === name}
-                          onClick={() => setMode(name, m)}
-                          title={MODE_HELP[m]}
-                          style={{
-                            padding: "4px 10px",
-                            borderRadius: 6,
-                            border: "1px solid " + (active ? MODE_COLORS[m] : "#374151"),
-                            background: active ? MODE_COLORS[m] : "transparent",
-                            color: active ? "#0b1220" : "#e5e7eb",
-                            fontSize: 12,
-                            cursor: busy === name ? "wait" : "pointer",
-                          }}
-                        >
-                          {m}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <ul className="mt-4 divide-y divide-neutral-800">
+          {Object.entries(data.modes).map(([name, mode]) => (
+            <li
+              key={name}
+              className="flex items-center justify-between gap-3 py-2.5"
+            >
+              <span className="font-mono text-sm text-neutral-200 truncate">{name}</span>
+              <div className="flex gap-1">
+                {data.available.map((m) => {
+                  const active = mode === m;
+                  return (
+                    <button
+                      key={m}
+                      type="button"
+                      disabled={busy === name}
+                      onClick={() => setMode(name, m)}
+                      title={MODE_HELP[m]}
+                      aria-pressed={active}
+                      className={[
+                        "px-3 py-1 rounded-lg text-xs font-medium border transition-colors",
+                        active
+                          ? MODE_ACTIVE_CLASS[m]
+                          : "border-neutral-700 text-neutral-300 hover:border-neutral-500 hover:text-neutral-100",
+                        busy === name ? "cursor-wait opacity-60" : "cursor-pointer",
+                      ].join(" ")}
+                    >
+                      {m}
+                    </button>
+                  );
+                })}
+              </div>
+            </li>
+          ))}
+        </ul>
       )}
     </section>
   );
