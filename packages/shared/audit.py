@@ -5,7 +5,7 @@ DELETE / UPDATE are forbidden at the DB level via a trigger (see migration).
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -18,7 +18,7 @@ class AuditEvent(BaseModel):
     actor: str  # "research" | "strategy" | "risk" | "execution" | "operator"
     event_type: str  # "agent_call" | "approval" | "order" | "fill" | "halt"
     payload: dict[str, Any]
-    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    ts: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 def to_row(evt: AuditEvent) -> dict[str, Any]:

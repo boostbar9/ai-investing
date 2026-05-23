@@ -1,4 +1,4 @@
-from packages.risk.engine import Candidate, PER_NAME_CAP, PER_SECTOR_CAP, drawdown_halt, size_orders
+from packages.risk.engine import PER_NAME_CAP, PER_SECTOR_CAP, Candidate, drawdown_halt, size_orders
 
 
 def test_per_name_cap_enforced():

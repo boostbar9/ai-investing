@@ -66,7 +66,7 @@ def detect_regime(spy: pd.Series, vix: pd.Series, breadth: pd.Series) -> RegimeR
     except ImportError:
         return _heuristic(features)
 
-    X = features.values
+    X = features.values  # noqa: N806 — ML convention for feature matrix
     model = GaussianHMM(n_components=4, covariance_type="diag", n_iter=200, random_state=0)
     model.fit(X)
     states = model.predict(X)

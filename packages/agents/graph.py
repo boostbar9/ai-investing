@@ -8,8 +8,8 @@ activities; the topology is identical.
 """
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
 from uuid import UUID, uuid4
 
 from packages.shared.audit import AuditEvent

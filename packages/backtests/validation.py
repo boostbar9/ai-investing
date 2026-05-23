@@ -18,7 +18,7 @@ import pandas as pd
 
 from packages.strategies.base import Strategy
 
-from .harness import BacktestResult, run_backtest
+from .harness import run_backtest
 
 # §8 thresholds — locked.
 SHARPE_MIN = 1.0

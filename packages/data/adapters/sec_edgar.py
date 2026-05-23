@@ -25,7 +25,7 @@ class SecEdgarAdapter(DataAdapter):
             try:
                 r = await self._client.get(f"{self.BASE}/submissions/CIK0000320193.json")
                 return {"ok": r.status_code == 200, "latency_ms": r.elapsed.total_seconds() * 1000}
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 return {"ok": False, "error": str(e)}
 
     async def get_submissions(self, cik: str) -> dict[str, Any]:

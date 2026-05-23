@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -26,7 +26,7 @@ class FinnhubAdapter(DataAdapter):
             try:
                 r = await self._client.get(f"{self.BASE}/quote", params={"symbol": "SPY", "token": self.api_key})
                 return {"ok": r.status_code == 200, "latency_ms": r.elapsed.total_seconds() * 1000}
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 return {"ok": False, "error": str(e)}
 
     async def get_company_news(self, symbol: str, frm: str, to: str) -> list[NewsItem]:
@@ -41,7 +41,7 @@ class FinnhubAdapter(DataAdapter):
             return [
                 NewsItem(
                     symbol=symbol,
-                    ts=datetime.fromtimestamp(row.get("datetime", 0), tz=timezone.utc),
+                    ts=datetime.fromtimestamp(row.get("datetime", 0), tz=UTC),
                     headline=row.get("headline", ""),
                     summary=row.get("summary"),
                     url=row.get("url", ""),

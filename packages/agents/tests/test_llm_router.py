@@ -1,10 +1,9 @@
-import asyncio
 import json
 
 import httpx
 import pytest
 
-from packages.agents.llm_router import LLMRouter, LLMError
+from packages.agents.llm_router import LLMError, LLMRouter
 
 
 class _FakeTransport(httpx.AsyncBaseTransport):

@@ -11,11 +11,9 @@ write, LangGraph signalling) happens server-side in apps/api.
 """
 from __future__ import annotations
 
-import asyncio
 import os
 
 import httpx
-
 
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -26,7 +24,7 @@ async def _api_health() -> bool:
     try:
         async with httpx.AsyncClient(timeout=3) as c:
             return (await c.get(f"{API_BASE}/health")).status_code == 200
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
 
 
@@ -35,7 +33,7 @@ async def _list_pending() -> list[dict]:
         async with httpx.AsyncClient(timeout=5) as c:
             r = await c.get(f"{API_BASE}/approvals/pending")
             return r.json().get("pending", [])
-    except Exception:  # noqa: BLE001
+    except Exception:
         return []
 
 

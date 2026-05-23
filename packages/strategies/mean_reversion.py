@@ -41,7 +41,7 @@ class MeanReversion(Strategy):
             sma = s.rolling(self.sma).mean()
             in_pos = False
             w = pd.Series(0.0, index=s.index)
-            for i, ts in enumerate(s.index):
+            for i, _ts in enumerate(s.index):
                 if not in_pos and rsi.iloc[i] < self.rsi_entry and s.iloc[i] > sma.iloc[i]:
                     in_pos = True
                 elif in_pos and rsi.iloc[i] > self.rsi_exit:

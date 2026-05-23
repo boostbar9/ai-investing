@@ -38,6 +38,6 @@ def test_mean_reversion_runs():
 def test_sentiment_overlay_caps_row_sum():
     prices = _fake_prices()
     base = TrendFollowing()
-    overlay = SentimentOverlay(base=base, sentiment={c: 1.25 for c in prices.columns})
+    overlay = SentimentOverlay(base=base, sentiment=dict.fromkeys(prices.columns, 1.25))
     w = overlay.generate_signals(prices)
     assert (w.sum(axis=1) <= 1.0 + 1e-9).all()

@@ -9,7 +9,6 @@ import pandas as pd
 
 from .base import Strategy, StrategyMeta
 
-
 SECTOR_ETFS = ["XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY", "XLRE", "XLC"]
 
 

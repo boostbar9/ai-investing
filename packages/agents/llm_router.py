@@ -74,7 +74,7 @@ class LLMRouter:
                     )
                     s.set_attribute("llm.chars_out", len(text))
                     return json.loads(text)
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     last_err = e
                     s.set_attribute("llm.error", str(e)[:200])
                     continue

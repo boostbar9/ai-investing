@@ -20,7 +20,6 @@ from packages.backtests.harness import run_backtest
 from packages.backtests.validation import tier1_standard
 from packages.strategies import all_strategies
 
-
 REGIME_PARAMS: dict[str, dict[str, float]] = {
     "bull":     {"mu": 0.0006, "sigma": 0.008},
     "bear":     {"mu": -0.0004, "sigma": 0.016},

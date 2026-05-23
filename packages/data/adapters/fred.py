@@ -27,7 +27,7 @@ class FredAdapter(DataAdapter):
                     f"{self.BASE}/series", params={"series_id": "GDP", "api_key": self.api_key, "file_type": "json"}
                 )
                 return {"ok": r.status_code == 200, "latency_ms": r.elapsed.total_seconds() * 1000}
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 return {"ok": False, "error": str(e)}
 
     async def get_series(self, series_id: str) -> list[dict[str, Any]]:

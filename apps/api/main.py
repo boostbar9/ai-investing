@@ -12,7 +12,7 @@ Phase 3 endpoints:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -33,7 +33,7 @@ class ApprovalDecision(BaseModel):
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "ts": datetime.now(UTC).isoformat()}
 
 
 @app.get("/version")
@@ -44,13 +44,13 @@ async def version() -> dict[str, str]:
 @app.get("/regime")
 async def regime() -> dict[str, Any]:
     # Stub: real impl reads cached HMM output from DragonflyDB.
-    return {"regime": "bull", "confidence": 0.78, "as_of": datetime.now(timezone.utc).isoformat()}
+    return {"regime": "bull", "confidence": 0.78, "as_of": datetime.now(UTC).isoformat()}
 
 
 @app.get("/positions")
 async def positions() -> dict[str, Any]:
     # Stub: real impl reads from broker (read-only key) and joins last marks.
-    return {"positions": [], "as_of": datetime.now(timezone.utc).isoformat()}
+    return {"positions": [], "as_of": datetime.now(UTC).isoformat()}
 
 
 @app.get("/agents/status")
@@ -79,7 +79,7 @@ async def approvals_decide(decision_id: UUID, body: ApprovalDecision) -> dict[st
             "event_type": "approval",
             "approve": body.approve,
             "note": body.note,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
         }
     )
     return {"ok": True, "decision_id": str(decision_id), "approved": body.approve}
@@ -104,6 +104,6 @@ async def dev_seed_approval() -> dict[str, Any]:
         "side": "buy",
         "qty": 1,
         "thesis": "20d momentum positive, regime bull",
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
     }
     return _PENDING[did]

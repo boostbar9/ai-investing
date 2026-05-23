@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -26,7 +26,7 @@ class PolygonAdapter(DataAdapter):
             try:
                 r = await self._client.get(f"{self.BASE}/v3/reference/tickers", params={"limit": 1, "apiKey": self.api_key})
                 return {"ok": r.status_code == 200, "latency_ms": r.elapsed.total_seconds() * 1000}
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 return {"ok": False, "error": str(e)}
 
     async def get_daily_bars(self, symbol: str, start: str, end: str) -> list[Bar]:
@@ -40,7 +40,7 @@ class PolygonAdapter(DataAdapter):
             return [
                 Bar(
                     symbol=symbol,
-                    ts=datetime.fromtimestamp(row["t"] / 1000, tz=timezone.utc),
+                    ts=datetime.fromtimestamp(row["t"] / 1000, tz=UTC),
                     open=row["o"],
                     high=row["h"],
                     low=row["l"],

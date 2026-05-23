@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +48,7 @@ def push_text(payload: BriefingInput) -> str:
 
 def main() -> None:
     sample = BriefingInput(
-        today=datetime.now(timezone.utc).date(),
+        today=datetime.now(UTC).date(),
         regime="bull",
         yesterday_pnl_pct=0.0042,
         approvals_count=3,

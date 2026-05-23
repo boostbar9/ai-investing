@@ -25,7 +25,7 @@ class AlphaVantageAdapter(DataAdapter):
             try:
                 r = await self._client.get(self.BASE, params={"function": "GLOBAL_QUOTE", "symbol": "SPY", "apikey": self.api_key})
                 return {"ok": r.status_code == 200, "latency_ms": r.elapsed.total_seconds() * 1000}
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 return {"ok": False, "error": str(e)}
 
     async def get_overview(self, symbol: str) -> dict[str, Any]:

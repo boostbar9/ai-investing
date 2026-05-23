@@ -72,7 +72,7 @@ class AlpacaPaperBroker(Broker):
             try:
                 r = await self._client.get(f"{self.base_url}/v2/account")
                 return r.status_code == 200
-            except Exception:  # noqa: BLE001
+            except Exception:
                 return False
 
     async def submit(self, req: OrderRequest) -> OrderAck:
@@ -123,7 +123,7 @@ class BrokerRouter:
                 if not await b.health():
                     continue
                 return await b.submit(req)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 last_err = e
                 continue
         raise BrokerError(f"all brokers down: {last_err}")

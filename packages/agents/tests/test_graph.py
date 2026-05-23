@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
@@ -15,7 +16,6 @@ from packages.shared.schemas import (
     StrategyInput,
     StrategyOutput,
 )
-from datetime import datetime, timezone
 
 
 async def _research(inp: ResearchInput) -> ResearchOutput:
@@ -54,7 +54,7 @@ async def _execute(inp: ExecutionInput) -> ExecutionOutput:
     return ExecutionOutput(
         decision_id=inp.decision_id,
         fills=[
-            Fill(symbol=o.symbol, side=o.side, qty=o.qty, price=100.0, timestamp=datetime.now(timezone.utc))
+            Fill(symbol=o.symbol, side=o.side, qty=o.qty, price=100.0, timestamp=datetime.now(UTC))
             for o in inp.approved_orders
         ],
         audit_id=uuid4(),
