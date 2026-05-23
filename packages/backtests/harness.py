@@ -43,13 +43,27 @@ class BacktestResult:
         }
 
 
+# Conservative default cost: 6 bps per side, applied to turnover.
+# This is realistic for SPY-class ETFs on a commission-free broker (Alpaca):
+# ~2bps slippage + 1bp spread per side = 3bps per side = 6bps per full
+# position change. Many published "alpha" disappears once this is honest.
+# Override only when you have evidence (TCA reports, live fills) supporting
+# lower numbers.
+DEFAULT_COST_BPS = 6.0
+
+
 def run_backtest(
     strategy: Strategy,
     prices: pd.DataFrame,
     *,
-    cost_bps: float = 1.0,
+    cost_bps: float = DEFAULT_COST_BPS,
 ) -> BacktestResult:
-    """Run a long-only weighted backtest. Cost charged on turnover."""
+    """Run a long-only weighted backtest. Cost charged on turnover.
+
+    The default is intentionally conservative — the goal is to fail strategies
+    that only "work" because the test was free. Pass ``cost_bps=0`` for
+    educational comparisons only.
+    """
     weights = strategy.generate_signals(prices).reindex(prices.index).fillna(0.0)
     returns = prices.pct_change().fillna(0.0)
 

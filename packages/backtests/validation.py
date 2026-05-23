@@ -99,3 +99,95 @@ def tier2_stress(strategy: Strategy, prices: pd.DataFrame) -> ValidationReport:
         reasons=reasons,
         metrics={"stress_drawdowns": per_window},
     )
+
+
+# Tier 3 — Synthetic: block bootstrap preserves autocorrelation, then
+# checks that ≥95% of synthetic 3-year paths end positive. This is the
+# credible MVP alternative to a generative model (e.g. GAN): cheap, fully
+# offline, no extra deps, and statistically valid on stationary returns.
+BLOCK_SIZE_DAYS = 20  # ~1 trading month, preserves short-term autocorr
+SYNTHETIC_PATHS_DEFAULT = 1000
+SYNTHETIC_HORIZON_DAYS = 252 * 3
+
+
+def _block_bootstrap(
+    daily_returns: np.ndarray,
+    *,
+    horizon: int,
+    block_size: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Sample a synthetic return path using moving-block bootstrap.
+
+    Preserves serial correlation up to block_size lags; iid bootstrap (as in
+    tier1_standard) destroys autocorrelation and can flatter strategies that
+    actually depend on momentum/mean-reversion structure.
+    """
+    n = len(daily_returns)
+    if n < block_size:
+        return rng.choice(daily_returns, size=horizon, replace=True)
+    num_blocks = (horizon + block_size - 1) // block_size
+    starts = rng.integers(0, n - block_size + 1, size=num_blocks)
+    pieces = [daily_returns[s : s + block_size] for s in starts]
+    out = np.concatenate(pieces)[:horizon]
+    return out
+
+
+def tier3_synthetic(
+    strategy: Strategy,
+    prices: pd.DataFrame,
+    *,
+    paths: int = SYNTHETIC_PATHS_DEFAULT,
+    block_size: int = BLOCK_SIZE_DAYS,
+    horizon: int | None = None,
+    seed: int = 7,
+) -> ValidationReport:
+    """Tier 3 — Synthetic paths via block bootstrap.
+
+    Generates `paths` synthetic equity trajectories of length `horizon` by
+    resampling blocks of strategy returns; passes when ≥ MC_POSITIVE_RATIO_MIN
+    of paths end positive.
+    """
+    reasons: list[str] = []
+    bt = run_backtest(strategy, prices)
+    daily = bt.equity_curve.pct_change().dropna().to_numpy()
+    if len(daily) < block_size * 2:
+        reasons.append(
+            f"too few return samples ({len(daily)}) for block size {block_size}"
+        )
+        return ValidationReport(
+            strategy=strategy.meta.name,
+            passed=False,
+            reasons=reasons,
+            metrics={"synthetic_paths": paths, "block_size": block_size},
+        )
+
+    rng = np.random.default_rng(seed)
+    h = horizon if horizon is not None else min(SYNTHETIC_HORIZON_DAYS, len(daily) * 3)
+    positive = 0
+    finals: list[float] = []
+    for _ in range(paths):
+        sample = _block_bootstrap(daily, horizon=h, block_size=block_size, rng=rng)
+        final = float(np.prod(1.0 + sample) - 1.0)
+        finals.append(final)
+        if final > 0:
+            positive += 1
+    ratio = positive / paths
+    if ratio < MC_POSITIVE_RATIO_MIN:
+        reasons.append(
+            f"synthetic positive ratio {ratio:.2%} < {MC_POSITIVE_RATIO_MIN:.0%}"
+        )
+
+    finals_arr = np.asarray(finals)
+    return ValidationReport(
+        strategy=strategy.meta.name,
+        passed=not reasons,
+        reasons=reasons,
+        metrics={
+            "synthetic_paths": paths,
+            "block_size": block_size,
+            "synthetic_positive_ratio": round(ratio, 4),
+            "synthetic_median_return": round(float(np.median(finals_arr)), 4),
+            "synthetic_p05_return": round(float(np.quantile(finals_arr, 0.05)), 4),
+        },
+    )

@@ -61,12 +61,63 @@ DEFAULT_GRID: tuple[ParamSet, ...] = tuple(
 )
 
 
-def equity_from_signal_strategy(prices: pd.Series, params: ParamSet) -> pd.Series:
+# ---------------------------------------------------------------------------
+# Transaction-cost model (CRITICAL: every reputable backtest-vs-live divergence
+# study names missing costs as the #1 reason live underperforms backtest).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CostModel:
+    """Round-trip transaction-cost model.
+
+    Defaults are conservative for liquid US equity ETFs on Alpaca:
+    - commission_bps: 0 (Alpaca is commission-free; non-zero for IBKR etc.)
+    - slippage_bps: 2 bps per side (4 bps round trip) for SPY-class names
+    - spread_bps: 1 bps per side (typical for top-of-book on liquid names)
+
+    Total impact per turnover unit ≈ (slippage + spread + commission) × 2.
+    For our default ≈ 6 bps round trip, applied to every change in target
+    weight (turnover).
+    """
+
+    commission_bps: float = 0.0
+    slippage_bps: float = 2.0  # per side
+    spread_bps: float = 1.0    # per side
+
+    @property
+    def per_side_bps(self) -> float:
+        return self.commission_bps + self.slippage_bps + self.spread_bps
+
+    def apply(self, returns: pd.Series, signal: pd.Series) -> pd.Series:
+        """Subtract costs proportional to turnover from each period's return.
+
+        Turnover at time t is |signal_t - signal_{t-1}|. Cost charged at
+        ``per_side_bps`` on each side of the trade, then converted to a
+        decimal drag on that period's return.
+        """
+        turnover = signal.diff().abs().fillna(signal.abs().fillna(0.0))
+        cost = turnover * (self.per_side_bps / 10000.0)
+        return returns - cost
+
+
+DEFAULT_COST_MODEL = CostModel()
+"""Conservative default applied to every walk-forward run.
+
+Operators can override with a per-strategy or per-asset model."""
+
+
+def equity_from_signal_strategy(
+    prices: pd.Series,
+    params: ParamSet,
+    *,
+    cost_model: CostModel | None = None,
+) -> pd.Series:
     """Simulate a tiny moving-average crossover with a z-score filter.
 
     Inputs: close-price series (positive floats), parameter set.
-    Output: equity curve (starts at 1.0). Designed to be cheap so the full
-    parameter grid can be evaluated in seconds.
+    Output: equity curve (starts at 1.0). Net of transaction costs by default.
+    Designed to be cheap so the full parameter grid can be evaluated in seconds.
     """
     if len(prices) < params.slow_window + 5:
         return pd.Series([1.0], index=prices.index[:1] if len(prices) else None)
@@ -80,9 +131,14 @@ def equity_from_signal_strategy(prices: pd.Series, params: ParamSet) -> pd.Serie
     signal = pd.Series(0.0, index=prices.index)
     signal[z > params.zscore_threshold] = 1.0
     signal[z < -params.zscore_threshold] = -1.0
+    # CRITICAL: execute on the bar AFTER the signal fires (no look-ahead).
+    executed_signal = signal.shift(1).fillna(0.0)
     rets = prices.pct_change().fillna(0.0)
-    strat_rets = signal.shift(1).fillna(0.0) * rets
-    equity = (1.0 + strat_rets).cumprod()
+    gross_rets = executed_signal * rets
+    # Apply transaction costs proportional to turnover.
+    cm = cost_model if cost_model is not None else DEFAULT_COST_MODEL
+    net_rets = cm.apply(gross_rets, executed_signal)
+    equity = (1.0 + net_rets).cumprod()
     return equity
 
 
