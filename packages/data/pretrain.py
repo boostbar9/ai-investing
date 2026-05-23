@@ -94,33 +94,53 @@ def _bars_to_parquet(bars: list[Bar], out: Path) -> int:
 
 
 async def _fetch_daily(symbol: str, alpaca: AlpacaDataAdapter, yf: YFinanceAdapter) -> list[Bar]:
-    """Try Alpaca first; fall back to yfinance on any failure."""
-    end = datetime.now(UTC)
-    start = end - timedelta(days=365 * 20 + 30)
-    try:
-        return await alpaca.get_bars(
-            symbol,
-            start.strftime("%Y-%m-%d"),
-            end.strftime("%Y-%m-%d"),
-            timeframe="1Day",
-        )
-    except DataAdapterError as e:
-        log.warning("alpaca_data %s failed (%s); falling back to yfinance", symbol, e)
-        return await yf.get_daily_bars(symbol, range_="20y")
+    """Try Alpaca first; fall back to yfinance on failure or missing keys."""
+    if alpaca.is_configured():
+        end = datetime.now(UTC)
+        start = end - timedelta(days=365 * 20 + 30)
+        try:
+            return await alpaca.get_bars(
+                symbol,
+                start.strftime("%Y-%m-%d"),
+                end.strftime("%Y-%m-%d"),
+                timeframe="1Day",
+            )
+        except DataAdapterError as e:
+            log.warning("alpaca daily %s failed (%s); falling back to yfinance", symbol, e)
+    return await yf.get_daily_bars(symbol, range_="20y")
 
 
-async def _fetch_intraday(symbol: str, alpaca: AlpacaDataAdapter) -> list[Bar]:
-    end = datetime.now(UTC)
-    start = end - timedelta(days=90)
+async def _fetch_intraday(
+    symbol: str,
+    alpaca: AlpacaDataAdapter,
+    yf: YFinanceAdapter,
+    *,
+    interval: str = "5m",
+) -> list[Bar]:
+    """Try Alpaca first (90d, 5-min, IEX adjusted); fall back to yfinance.
+
+    Yahoo's intraday endpoint is free and key-free, but its history depth is
+    capped (5m -> 60d, 1m -> 7d). For day-trading-quality training we'd
+    prefer Alpaca, but yfinance is good enough to bootstrap the bot on a
+    fresh install with zero setup.
+    """
+    if alpaca.is_configured():
+        end = datetime.now(UTC)
+        start = end - timedelta(days=90)
+        try:
+            return await alpaca.get_bars(
+                symbol,
+                start.isoformat(),
+                end.isoformat(),
+                timeframe="5Min",
+            )
+        except DataAdapterError as e:
+            log.warning("alpaca intraday %s failed (%s); trying yfinance", symbol, e)
+    # Free fallback: yfinance public chart endpoint, 60-day cap on 5-min.
     try:
-        return await alpaca.get_bars(
-            symbol,
-            start.isoformat(),
-            end.isoformat(),
-            timeframe="5Min",
-        )
+        return await yf.get_intraday_bars(symbol, interval=interval, range_="60d")
     except DataAdapterError as e:
-        log.warning("intraday %s failed (%s); skipping", symbol, e)
+        log.warning("yfinance intraday %s failed (%s); skipping", symbol, e)
         return []
 
 
@@ -153,10 +173,10 @@ async def run(
     if not alpaca.is_configured():
         log.info(
             "alpaca_data skipped: set ALPACA_PAPER_KEY_ID + ALPACA_PAPER_SECRET "
-            "(free paper account) to enable intraday bars. yfinance will still "
-            "provide daily history."
+            "(free paper account) to enable 90 days of IEX-adjusted intraday "
+            "bars. Falling back to yfinance (60-day intraday history, free)."
         )
-        summary["skipped_sources"].append("alpaca_data (no paper keys)")
+        summary["skipped_sources"].append("alpaca_data (using yfinance intraday fallback)")
     if not fred.is_configured():
         log.info(
             "fred skipped: set FRED_API_KEY (free) to enable macro series "
@@ -183,11 +203,10 @@ async def run(
                 log.warning("daily %s failed: %s", sym, e)
 
         # ---- Intraday (5-min) ----
-        # Skip the whole intraday phase if Alpaca isn't configured — yfinance
-        # can't return reliable intraday history beyond ~60 days and the
-        # operator already saw the actionable message above.
-        if include_intraday and not alpaca.is_configured():
-            include_intraday = False
+        # If Alpaca is configured we get ~90 days of IEX-adjusted bars; if not
+        # we fall back to yfinance (60-day cap, free, key-free). Both give
+        # the strategy layer enough intraday context for day-trading features
+        # (VWAP, opening range, time-of-day momentum).
         if include_intraday:
             for sym in universe:
                 out = root / "intraday" / f"{sym}.parquet"
@@ -195,10 +214,11 @@ async def run(
                     summary["intraday"]["skipped_recent"] += 1
                     continue
                 try:
-                    bars = await _fetch_intraday(sym, alpaca)
+                    bars = await _fetch_intraday(sym, alpaca, yf)
                     rows = _bars_to_parquet(bars, out)
-                    summary["intraday"]["symbols"] += 1
-                    summary["intraday"]["rows"] += rows
+                    if rows > 0:
+                        summary["intraday"]["symbols"] += 1
+                        summary["intraday"]["rows"] += rows
                 except Exception as e:
                     summary["errors"].append(f"intraday {sym}: {e}")
 

@@ -50,11 +50,40 @@ class YFinanceAdapter(DataAdapter):
 
     async def get_daily_bars(self, symbol: str, range_: str = "5y") -> list[Bar]:
         """Fetch ``range_`` of daily bars. Valid ranges: 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, 20y, max."""
+        return await self._get_bars(symbol, interval="1d", range_=range_)
+
+    async def get_intraday_bars(
+        self,
+        symbol: str,
+        *,
+        interval: str = "5m",
+        range_: str = "60d",
+    ) -> list[Bar]:
+        """Fetch intraday bars from Yahoo (no API key required).
+
+        Yahoo's documented limits per interval:
+            1m  -> max range 7d
+            2m  -> max range 60d
+            5m  -> max range 60d
+            15m -> max range 60d
+            30m -> max range 60d
+            60m -> max range 730d
+            90m -> max range 60d
+        Caller is responsible for picking a (interval, range) pair that
+        respects Yahoo's caps; we just forward the request.
+        """
+        if interval not in _VALID_INTRADAY_INTERVALS:
+            raise DataAdapterError(
+                f"yfinance intraday: interval={interval!r} not in {_VALID_INTRADAY_INTERVALS}"
+            )
+        return await self._get_bars(symbol, interval=interval, range_=range_)
+
+    async def _get_bars(self, symbol: str, *, interval: str, range_: str) -> list[Bar]:
         await BUCKETS["yfinance"].acquire()
-        with span("data.yfinance.daily_bars", {"symbol": symbol, "range": range_}):
+        with span("data.yfinance.bars", {"symbol": symbol, "interval": interval, "range": range_}):
             r = await self._client.get(
                 f"{YAHOO_HOST}/v8/finance/chart/{symbol}",
-                params={"interval": "1d", "range": range_, "events": "div,split"},
+                params={"interval": interval, "range": range_, "events": "div,split"},
             )
             if r.status_code != 200:
                 raise DataAdapterError(f"yfinance {symbol}: {r.status_code} {r.text[:200]}")
@@ -62,6 +91,9 @@ class YFinanceAdapter(DataAdapter):
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+
+_VALID_INTRADAY_INTERVALS = ("1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h")
 
 
 def _parse_chart_response(symbol: str, payload: dict[str, Any]) -> list[Bar]:

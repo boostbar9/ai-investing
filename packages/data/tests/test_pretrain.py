@@ -50,6 +50,21 @@ class _FakeYF:
             )
         ]
 
+    async def get_intraday_bars(self, symbol, *, interval="5m", range_="60d"):
+        # Three 5-min bars is plenty for the fallback path.
+        return [
+            Bar(
+                symbol=symbol,
+                ts=datetime(2024, 1, 2, 14, 30 + i * 5, tzinfo=UTC),
+                open=100.0,
+                high=100.5,
+                low=99.5,
+                close=100.2,
+                volume=10_000,
+            )
+            for i in range(3)
+        ]
+
     async def aclose(self) -> None:
         return None
 
@@ -162,11 +177,14 @@ async def test_run_skips_cleanly_when_keys_missing(tmp_path, monkeypatch):
     )
     # Daily falls back to yfinance — still produces data.
     assert summary["daily"]["symbols"] == 1
-    # Intraday + macro skip cleanly (no FRED/Alpaca calls).
-    assert summary["intraday"]["symbols"] == 0
+    # Intraday now also falls back to yfinance instead of being skipped — the
+    # bot can train on real intraday bars with zero setup.
+    assert summary["intraday"]["symbols"] == 1
+    assert summary["intraday"]["rows"] == 3
+    # Macro still requires a FRED key (no good free fallback).
     assert summary["macro"]["series"] == 0
     # Skipped sources are surfaced so the operator knows what to enable next.
-    assert "alpaca_data (no paper keys)" in summary["skipped_sources"]
+    assert any("alpaca" in s for s in summary["skipped_sources"])
     assert "fred (no api key)" in summary["skipped_sources"]
     # No errors — missing-key is not an error.
     assert summary["errors"] == []
