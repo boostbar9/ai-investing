@@ -46,7 +46,7 @@ jobs:
       - name: Install deps
         run: |
           pip install --upgrade pip
-          pip install numpy pandas pydantic pydantic-settings httpx pytest pytest-asyncio pyjwt fastapi \
+          pip install numpy pandas pyarrow pydantic pydantic-settings httpx pytest pytest-asyncio pyjwt fastapi \
             opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp \
             ruff alembic sqlalchemy temporalio pillow
       - name: Lint
