@@ -39,6 +39,24 @@ class OrderAck:
     submitted_at: str
 
 
+@dataclass(frozen=True)
+class BrokerPosition:
+    symbol: str
+    qty: float
+    avg_price: float
+    last_price: float | None
+    pnl_pct: float | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "qty": self.qty,
+            "avg_price": self.avg_price,
+            "last_price": self.last_price,
+            "pnl_pct": self.pnl_pct,
+        }
+
+
 class Broker(ABC):
     name: str
 
@@ -47,6 +65,9 @@ class Broker(ABC):
 
     @abstractmethod
     async def submit(self, req: OrderRequest) -> OrderAck: ...
+
+    @abstractmethod
+    async def positions(self) -> list[BrokerPosition]: ...
 
 
 class AlpacaPaperBroker(Broker):
@@ -100,6 +121,31 @@ class AlpacaPaperBroker(Broker):
                 submitted_at=data.get("submitted_at", ""),
             )
 
+    async def positions(self) -> list[BrokerPosition]:
+        with span("broker.alpaca.positions"):
+            r = await self._client.get(f"{self.base_url}/v2/positions")
+            if r.status_code >= 300:
+                raise BrokerError(f"alpaca positions {r.status_code}: {r.text[:200]}")
+            out: list[BrokerPosition] = []
+            for p in r.json():
+                try:
+                    qty = float(p["qty"])
+                    avg = float(p["avg_entry_price"])
+                    last = float(p["current_price"]) if p.get("current_price") else None
+                    pnl = (last - avg) / avg if (last is not None and avg > 0) else None
+                    out.append(
+                        BrokerPosition(
+                            symbol=p["symbol"],
+                            qty=qty,
+                            avg_price=avg,
+                            last_price=last,
+                            pnl_pct=pnl,
+                        )
+                    )
+                except (KeyError, ValueError, TypeError):
+                    continue
+            return out
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -127,3 +173,17 @@ class BrokerRouter:
                 last_err = e
                 continue
         raise BrokerError(f"all brokers down: {last_err}")
+
+    async def positions(self) -> list[BrokerPosition]:
+        """Return positions from the first healthy broker (positions are
+        broker-local; we never merge across brokers)."""
+        last_err: Exception | None = None
+        for b in self.brokers:
+            try:
+                if not await b.health():
+                    continue
+                return await b.positions()
+            except Exception as e:
+                last_err = e
+                continue
+        raise BrokerError(f"all brokers down for positions: {last_err}")

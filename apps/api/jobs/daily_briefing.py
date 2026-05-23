@@ -11,6 +11,7 @@ Triggered by n8n cron or a GitHub Actions cron. Phase 4: stub PDF as JSON.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -46,6 +47,29 @@ def push_text(payload: BriefingInput) -> str:
     )
 
 
+async def send_briefing_push(payload: BriefingInput) -> dict[str, Any]:
+    """Send the briefing as a OneSignal push when configured (§12, issue #6).
+
+    Returns the provider response (``{"skipped": True}`` when no provider is
+    configured — a real env will set ``ONESIGNAL_APP_ID`` / API key).
+    """
+    from packages.shared.push import PushClient, PushPayload
+
+    client = PushClient()
+    try:
+        return await client.send(
+            PushPayload(
+                title="Daily briefing",
+                body=push_text(payload),
+                url="https://cockpit.local/",  # cockpit deep link
+                dedupe_key=f"briefing-{payload.today.isoformat()}",
+                data={"regime": payload.regime, "halts": len(payload.halts)},
+            )
+        )
+    finally:
+        await client.aclose()
+
+
 def main() -> None:
     sample = BriefingInput(
         today=datetime.now(UTC).date(),
@@ -60,6 +84,8 @@ def main() -> None:
     out = render(sample, Path("artifacts/briefings"))
     print(push_text(sample))
     print(f"wrote {out}")
+    push_result = asyncio.run(send_briefing_push(sample))
+    print(f"push: {push_result}")
 
 
 if __name__ == "__main__":

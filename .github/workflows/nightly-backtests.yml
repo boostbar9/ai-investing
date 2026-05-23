@@ -45,9 +45,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install runtime deps
+        run: pip install numpy pandas pydantic
+      - name: Download current run artifacts
+        uses: actions/download-artifact@v4
         with:
           path: artifacts/
-      - name: Block on >10% Sharpe drop vs main
+      - name: Pull last green baseline (best-effort)
+        # baselines/ is committed to the repo by the post-gate job below on
+        # successful nightly runs against main. First run on a fresh repo
+        # has no baselines, which the gate treats as a no-op.
         run: |
-          echo "TODO: implement Sharpe-drop gate per §10. Blocks merge when drop > 10%."
+          mkdir -p baselines
+          if [ -d baselines/main ]; then cp -r baselines/main/* baselines/; fi
+      - name: Run Sharpe-drop gate
+        run: |
+          python -m packages.backtests.nightly_gate \
+            --current artifacts/ \
+            --baseline baselines/ \
+            --max-drop 0.10
+      - name: Persist baseline (main only)
+        if: github.ref == 'refs/heads/main' && success()
+        run: |
+          rm -rf baselines/main && mkdir -p baselines/main
+          find artifacts -name "*.json" -exec cp {} baselines/main/ \;
+          if [ -n "$(git status --porcelain baselines/)" ]; then
+            git config user.name  "nightly-gate"
+            git config user.email "nightly-gate@users.noreply.github.com"
+            git add baselines/
+            git commit -m "chore(nightly): refresh Sharpe baselines [skip ci]"
+            git push
+          fi

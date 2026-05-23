@@ -53,8 +53,38 @@ async def regime() -> dict[str, Any]:
 
 @app.get("/positions")
 async def positions() -> dict[str, Any]:
-    # Stub: real impl reads from broker (read-only key) and joins last marks.
-    return {"positions": [], "as_of": datetime.now(UTC).isoformat()}
+    """Live positions from the broker, with PnL %% per name.
+
+    When ``ALPACA_PAPER_KEY_ID`` is unset (local dev / CI) we return an
+    empty list rather than 500ing — callers should see "no positions"
+    instead of a broken cockpit.
+    """
+    from packages.execution.broker import (
+        AlpacaPaperBroker,
+        BrokerError,
+        BrokerRouter,
+    )
+
+    if not os.getenv("ALPACA_PAPER_KEY_ID"):
+        return {"positions": [], "as_of": datetime.now(UTC).isoformat()}
+
+    broker = AlpacaPaperBroker()
+    try:
+        router = BrokerRouter([broker])
+        try:
+            ps = await router.positions()
+            return {
+                "positions": [p.to_dict() for p in ps],
+                "as_of": datetime.now(UTC).isoformat(),
+            }
+        except BrokerError as e:
+            return {
+                "positions": [],
+                "as_of": datetime.now(UTC).isoformat(),
+                "error": str(e),
+            }
+    finally:
+        await broker.aclose()
 
 
 @app.get("/agents/status")
@@ -118,6 +148,27 @@ async def dev_seed_approval() -> dict[str, Any]:
         }
     )
     return _PENDING[did]
+
+
+@app.post("/_dev/push-test")
+async def dev_push_test() -> dict[str, Any]:
+    """Send a test push so operators can verify OneSignal wiring (§12 / #6).
+
+    Returns ``{"skipped": true}`` when OneSignal isn't configured locally.
+    """
+    from packages.shared.push import PushClient, PushPayload
+
+    client = PushClient()
+    try:
+        return await client.send(
+            PushPayload(
+                title="ai-investing push test",
+                body="✅ cockpit ↔ OneSignal wiring works",
+                dedupe_key=f"push-test-{datetime.now(UTC).isoformat()}",
+            )
+        )
+    finally:
+        await client.aclose()
 
 
 # --- Strategies / Activity / Health Detail ---
