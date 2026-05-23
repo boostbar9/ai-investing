@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import ActivityFeed from "./components/ActivityFeed";
 import ApprovalsQueue from "./components/ApprovalsQueue";
 import HealthPanel from "./components/HealthPanel";
+import LivePromotionPanel from "./components/LivePromotionPanel";
 import PositionsHeatmap from "./components/PositionsHeatmap";
 import { getJSON } from "./components/api";
 
@@ -30,7 +31,7 @@ export default function Home() {
     <main className="min-h-screen bg-neutral-950 text-neutral-100 p-6">
       <header className="max-w-6xl mx-auto flex items-center justify-between">
         <h1 className="text-xl font-semibold tracking-tight">ai-investing</h1>
-        <span className="text-xs text-neutral-500">v3.1 · phase 4</span>
+        <span className="text-xs text-neutral-500">v3.1 · phase 5</span>
       </header>
 
       <section className="max-w-6xl mx-auto mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -81,6 +82,7 @@ export default function Home() {
         </div>
         <ApprovalsQueue />
 
+        <LivePromotionPanel />
         <div className="md:col-span-2">
           <ActivityFeed />
         </div>

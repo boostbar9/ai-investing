@@ -53,3 +53,36 @@ def test_health_detail_shape():
     r = TestClient(app).get("/health/detail").json()
     assert {"api", "broker", "llm", "regime", "db", "cache"} <= r.keys()
     assert all(v["ok"] is True for v in r.values())
+
+
+def test_live_promotion_empty_curves_fails_closed(tmp_path, monkeypatch):
+    # No env vars set → empty curves → gate fails closed.
+    monkeypatch.delenv("PAPER_EQUITY_PATH", raising=False)
+    monkeypatch.delenv("LIVE_EQUITY_PATH", raising=False)
+    monkeypatch.delenv("ENABLE_LIVE_TRADING", raising=False)
+    r = TestClient(app).get("/live/promotion").json()
+    assert r["live_enabled"] is False
+    assert r["capital_fraction"] == 0.0
+    assert r["readiness"]["ready"] is False
+    assert r["canary"] is None
+
+
+def test_live_promotion_ready_returns_canary(tmp_path, monkeypatch):
+    import json
+
+    import numpy as np
+
+    rng = np.random.default_rng(42)
+    eq = [100.0]
+    for r in rng.normal(0.002, 0.005, 60):
+        eq.append(eq[-1] * (1 + r))
+    p = tmp_path / "paper.json"
+    p.write_text(json.dumps({"equity": eq[1:]}))
+    monkeypatch.setenv("PAPER_EQUITY_PATH", str(p))
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "true")
+
+    r = TestClient(app).get("/live/promotion").json()
+    assert r["live_enabled"] is True
+    # Empty live curve → tier 0 → 5%
+    assert r["capital_fraction"] == 0.05
+    assert r["canary"]["tier_index"] == 0

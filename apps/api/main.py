@@ -12,6 +12,7 @@ Phase 3 endpoints:
 - GET  /strategies         — registered strategy catalogue
 - GET  /activity           — recent audit events (activity feed module)
 - GET  /health/detail      — broker, LLM router, regime cache, DB health panel
+- GET  /live/promotion     — Phase 5 live readiness + canary capital tier
 """
 from __future__ import annotations
 
@@ -201,6 +202,59 @@ async def activity_feed(limit: int = 50) -> dict[str, Any]:
             flat.append({**e, "decision_id": str(did)})
     flat.sort(key=lambda e: e.get("ts", ""), reverse=True)
     return {"events": flat[:limit]}
+
+
+@app.get("/live/promotion")
+async def live_promotion() -> dict[str, Any]:
+    """Phase 5 (§15) live-trading readiness + current canary capital tier.
+
+    Reads paper/live equity curves from optional JSON files pointed to by
+    ``PAPER_EQUITY_PATH`` and ``LIVE_EQUITY_PATH``. Each file is a JSON
+    object: ``{"equity": [100.0, 100.1, ...]}``. Missing files are treated
+    as empty curves — the gate fails closed.
+    """
+    import json
+    from pathlib import Path
+
+    import pandas as pd
+
+    from packages.backtests.live_promotion import decide_live_capital
+
+    def _load(env_key: str) -> pd.Series:
+        p = os.getenv(env_key)
+        if not p:
+            return pd.Series(dtype=float)
+        try:
+            data = json.loads(Path(p).read_text())
+            return pd.Series(data.get("equity", []), dtype=float)
+        except (OSError, json.JSONDecodeError):
+            return pd.Series(dtype=float)
+
+    paper = _load("PAPER_EQUITY_PATH")
+    live = _load("LIVE_EQUITY_PATH")
+    decision = decide_live_capital(paper, live)
+    canary_payload = (
+        {
+            "tier_index": decision.canary.tier_index,
+            "fraction": decision.canary.fraction,
+            "days_in_tier": decision.canary.days_in_tier,
+            "dwell_required": decision.canary.dwell_required,
+            "next_fraction": decision.canary.next_fraction,
+            "reasons": decision.canary.reasons,
+        }
+        if decision.canary is not None
+        else None
+    )
+    return {
+        "live_enabled": decision.live_enabled,
+        "capital_fraction": decision.capital_fraction,
+        "readiness": {
+            "ready": decision.readiness.ready,
+            "reasons": decision.readiness.reasons,
+            "metrics": decision.readiness.metrics,
+        },
+        "canary": canary_payload,
+    }
 
 
 @app.get("/health/detail")
