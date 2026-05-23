@@ -194,3 +194,46 @@ def test_passkey_authenticate_rejects_unknown_credential(monkeypatch):
     }
     r = c.post("/auth/passkey/authenticate/verify", json=body)
     assert r.status_code == 401
+
+
+def test_strategies_modes_default_paper():
+    from packages.execution.modes import _DEFAULTS
+
+    _DEFAULTS.clear()
+    c = TestClient(app)
+    r = c.get("/strategies/modes")
+    assert r.status_code == 200
+    body = r.json()
+    assert "modes" in body
+    assert body["available"] == ["paper", "shadow", "live"]
+    # Every registered strategy should default to paper.
+    assert all(v == "paper" for v in body["modes"].values())
+
+
+def test_set_strategy_mode_round_trip():
+    from packages.execution.modes import _DEFAULTS
+    from packages.strategies import all_strategies
+
+    _DEFAULTS.clear()
+    name = next(iter(all_strategies()))
+    c = TestClient(app)
+    r = c.post(f"/strategies/{name}/mode", json={"mode": "shadow"})
+    assert r.status_code == 200
+    assert r.json() == {"strategy": name, "mode": "shadow"}
+    r2 = c.get("/strategies/modes")
+    assert r2.json()["modes"][name] == "shadow"
+
+
+def test_set_strategy_mode_404_unknown():
+    c = TestClient(app)
+    r = c.post("/strategies/does-not-exist/mode", json={"mode": "paper"})
+    assert r.status_code == 404
+
+
+def test_set_strategy_mode_400_invalid():
+    from packages.strategies import all_strategies
+
+    name = next(iter(all_strategies()))
+    c = TestClient(app)
+    r = c.post(f"/strategies/{name}/mode", json={"mode": "moon"})
+    assert r.status_code == 400

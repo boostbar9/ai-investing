@@ -114,3 +114,69 @@ async def test_alpaca_positions_raises_on_http_error():
             await broker.positions()
     finally:
         await broker.aclose()
+
+
+@pytest.mark.asyncio
+async def test_alpaca_account_endpoint():
+    from packages.execution.broker import AlpacaPaperBroker
+
+    class _T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/v2/account"):
+                return httpx.Response(
+                    200,
+                    json={"equity": "100000.00", "cash": "100000.00", "buying_power": "200000.00"},
+                )
+            return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=_T(), base_url="http://x")
+    broker = AlpacaPaperBroker(key_id="k", secret="s", base_url="http://x", client=client)
+    try:
+        acct = await broker.account()
+        assert acct["equity"] == "100000.00"
+    finally:
+        await broker.aclose()
+
+
+def test_alpaca_live_uses_live_env(monkeypatch):
+    from packages.execution.broker import AlpacaLiveBroker
+
+    monkeypatch.setenv("ALPACA_LIVE_KEY_ID", "live-key")
+    monkeypatch.setenv("ALPACA_LIVE_SECRET", "live-secret")
+    b = AlpacaLiveBroker()
+    try:
+        assert b.name == "alpaca_live"
+        assert b.key_id == "live-key"
+        assert b.secret == "live-secret"
+        assert "paper" not in b.base_url
+    finally:
+        # close synchronously via the underlying client to avoid asyncio fixture
+        import asyncio
+
+        asyncio.get_event_loop().run_until_complete(b.aclose())
+
+
+@pytest.mark.asyncio
+async def test_ibkr_stub_is_unhealthy_and_unimplemented():
+    from packages.execution.broker import IBKRBroker, OrderRequest
+
+    b = IBKRBroker(paper=True)
+    assert b.name == "ibkr"
+    assert await b.health() is False
+    with pytest.raises(NotImplementedError):
+        await b.submit(OrderRequest(symbol="SPY", side="buy", qty=1))
+    with pytest.raises(NotImplementedError):
+        await b.positions()
+
+
+@pytest.mark.asyncio
+async def test_router_skips_unhealthy_ibkr_stub_falls_back_to_paper():
+    """End-to-end: configure router with [IBKR-stub, paper] — router skips IBKR (unhealthy)
+    and uses the healthy paper broker. This is the real production wiring."""
+    from packages.execution.broker import IBKRBroker
+
+    ibkr = IBKRBroker()
+    paper = _Healthy()
+    router = BrokerRouter([ibkr, paper])
+    ack = await router.submit(OrderRequest(symbol="SPY", side="buy", qty=1))
+    assert ack.broker == "healthy"

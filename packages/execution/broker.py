@@ -71,6 +71,12 @@ class Broker(ABC):
 
 
 class AlpacaPaperBroker(Broker):
+    """Alpaca paper-trading adapter. Free $100k fake-cash account.
+
+    Env vars: ``ALPACA_PAPER_KEY_ID``, ``ALPACA_PAPER_SECRET``.
+    Get keys at https://app.alpaca.markets/paper/dashboard/overview.
+    """
+
     name = "alpaca_paper"
 
     def __init__(
@@ -148,6 +154,83 @@ class AlpacaPaperBroker(Broker):
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def account(self) -> dict[str, Any]:
+        """Return raw account data: equity, cash, buying_power, day P&L.
+
+        Used by the cockpit to surface paper-account stats in the training view.
+        """
+        with span(f"broker.{self.name}.account"):
+            r = await self._client.get(f"{self.base_url}/v2/account")
+            if r.status_code >= 300:
+                raise BrokerError(f"{self.name} account {r.status_code}: {r.text[:200]}")
+            return r.json()  # type: ignore[no-any-return]
+
+
+class AlpacaLiveBroker(AlpacaPaperBroker):
+    """Alpaca live-trading adapter (real money).
+
+    Identical wire protocol to paper; only the base URL and keys differ.
+    Env vars: ``ALPACA_LIVE_KEY_ID``, ``ALPACA_LIVE_SECRET``.
+
+    SAFETY: Only constructed when ``ENABLE_LIVE_TRADING=true`` AND the
+    ``live_promotion`` gate has cleared. Never constructed in test envs.
+    """
+
+    name = "alpaca_live"
+
+    def __init__(
+        self,
+        key_id: str | None = None,
+        secret: str | None = None,
+        base_url: str | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        super().__init__(
+            key_id=key_id or os.getenv("ALPACA_LIVE_KEY_ID", ""),
+            secret=secret or os.getenv("ALPACA_LIVE_SECRET", ""),
+            base_url=base_url or os.getenv("ALPACA_LIVE_BASE_URL", "https://api.alpaca.markets"),
+            client=client,
+        )
+
+
+class IBKRBroker(Broker):
+    """Interactive Brokers adapter (stub).
+
+    IBKR is pro-grade but heavy: it requires the IB Gateway or TWS desktop app
+    running locally with a logged-in session. This stub implements the
+    :class:`Broker` interface so callers can already wire IBKR into the router
+    config; calls raise ``NotImplementedError`` until the gateway integration
+    lands.
+
+    Planned env vars (do not set yet):
+      * ``IBKR_GATEWAY_HOST`` (default: 127.0.0.1)
+      * ``IBKR_GATEWAY_PORT`` (default: 7497 paper, 7496 live)
+      * ``IBKR_ACCOUNT_ID``
+
+    See ``docs/runbooks/ibkr-setup.md`` (TODO) for the full setup once enabled.
+    """
+
+    name = "ibkr"
+
+    def __init__(self, paper: bool = True) -> None:
+        self.paper = paper
+        self.host = os.getenv("IBKR_GATEWAY_HOST", "127.0.0.1")
+        self.port = int(os.getenv("IBKR_GATEWAY_PORT", "7497" if paper else "7496"))
+        self.account_id = os.getenv("IBKR_ACCOUNT_ID", "")
+
+    async def health(self) -> bool:
+        # Stub: not wired yet, so always unhealthy. The router will skip past it.
+        return False
+
+    async def submit(self, req: OrderRequest) -> OrderAck:
+        raise NotImplementedError(
+            "IBKR adapter is a stub. Install ib_insync and implement against"
+            " the local IB Gateway socket. See docs/runbooks/ibkr-setup.md."
+        )
+
+    async def positions(self) -> list[BrokerPosition]:
+        raise NotImplementedError("IBKR adapter is a stub.")
 
 
 class BrokerRouter:

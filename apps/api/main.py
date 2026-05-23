@@ -10,6 +10,9 @@ Phase 3 endpoints:
 - POST /approvals/{id}     — operator approve/deny
 - GET  /audit/{decision_id} — Decision Trace (§20 "open Decision Trace")
 - GET  /strategies         — registered strategy catalogue
+- GET  /strategies/modes   — per-strategy execution mode (paper/shadow/live)
+- POST /strategies/{name}/mode — set a strategy's execution mode
+- GET  /broker/account     — paper broker account summary
 - GET  /activity           — recent audit events (activity feed module)
 - GET  /health/detail      — broker, LLM router, regime cache, DB health panel
 - GET  /live/promotion     — Phase 5 live readiness + canary capital tier
@@ -205,6 +208,72 @@ async def list_strategies() -> dict[str, Any]:
             }
             for name, cls in all_strategies().items()
         ]
+    }
+
+
+class StrategyModeUpdate(BaseModel):
+    mode: str  # "paper" | "shadow" | "live"
+
+
+@app.get("/strategies/modes")
+async def list_strategy_modes() -> dict[str, Any]:
+    """Per-strategy execution-mode snapshot for the cockpit toggle UI."""
+    from packages.execution.modes import ExecutionMode, all_modes, get_mode
+    from packages.strategies import all_strategies
+
+    modes: dict[str, str] = {}
+    for name in all_strategies():
+        modes[name] = get_mode(name).value
+    # Include any non-strategy entries the operator may have set explicitly.
+    for k, v in all_modes().items():
+        modes.setdefault(k, v.value)
+    return {"modes": modes, "available": [m.value for m in ExecutionMode]}
+
+
+@app.post("/strategies/{name}/mode")
+async def set_strategy_mode(name: str, body: StrategyModeUpdate) -> dict[str, Any]:
+    """Update a strategy's execution mode.
+
+    Setting ``live`` is permitted, but the runner will still downgrade to
+    ``paper`` at execution time unless the live-promotion gate has cleared
+    AND ``ENABLE_LIVE_TRADING=true``. See :mod:`packages.execution.modes`.
+    """
+    from packages.execution.modes import ExecutionMode, set_mode
+    from packages.strategies import all_strategies
+
+    if name not in all_strategies():
+        raise HTTPException(status_code=404, detail=f"unknown strategy: {name}")
+    try:
+        mode = ExecutionMode(body.mode.lower())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"invalid mode: {body.mode}") from e
+    set_mode(name, mode)
+    return {"strategy": name, "mode": mode.value}
+
+
+@app.get("/broker/account")
+async def broker_account() -> dict[str, Any]:
+    """Paper broker account summary — equity, cash, buying power.
+
+    Used by the cockpit training view to show how the agents are doing on
+    the fake account at a glance.
+    """
+    from packages.execution.broker import AlpacaPaperBroker, BrokerError
+
+    broker = AlpacaPaperBroker()
+    try:
+        try:
+            data = await broker.account()
+        except BrokerError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+    finally:
+        await broker.aclose()
+    return {
+        "broker": broker.name,
+        "equity": data.get("equity"),
+        "cash": data.get("cash"),
+        "buying_power": data.get("buying_power"),
+        "status": data.get("status"),
     }
 
 

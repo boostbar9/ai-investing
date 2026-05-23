@@ -6,6 +6,7 @@ import ApprovalsQueue from "./components/ApprovalsQueue";
 import HealthPanel from "./components/HealthPanel";
 import LivePromotionPanel from "./components/LivePromotionPanel";
 import PositionsHeatmap from "./components/PositionsHeatmap";
+import StrategyModesPanel from "./components/StrategyModesPanel";
 import { getJSON } from "./components/api";
 
 type Regime = { regime: string; confidence: number; as_of: string };
@@ -87,6 +88,9 @@ export default function Home() {
           <ActivityFeed />
         </div>
         <HealthPanel />
+        <div className="md:col-span-3">
+          <StrategyModesPanel />
+        </div>
       </section>
 
       <footer className="max-w-6xl mx-auto mt-8 text-xs text-neutral-600">
