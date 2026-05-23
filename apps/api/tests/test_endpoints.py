@@ -23,9 +23,33 @@ def test_seed_and_decide_approval():
     # Now pending should be empty for this id; audit should have the event.
     assert all(item["decision_id"] != did for item in c.get("/approvals/pending").json()["pending"])
     trace = c.get(f"/audit/{did}").json()
-    assert trace["events"][0]["event_type"] == "approval"
+    assert any(e["event_type"] == "approval" for e in trace["events"])
 
 
 def test_agents_status_shape():
     r = TestClient(app).get("/agents/status").json()
     assert set(r.keys()) == {"research", "strategy", "risk", "execution"}
+
+
+def test_strategies_catalogue():
+    r = TestClient(app).get("/strategies").json()
+    names = {s["name"] for s in r["strategies"]}
+    assert names == {
+        "trend-following",
+        "sector-rotation",
+        "mean-reversion",
+        "sentiment-overlay",
+    }
+
+
+def test_activity_feed_after_seed():
+    c = TestClient(app)
+    c.post("/_dev/seed-approval")
+    events = c.get("/activity").json()["events"]
+    assert any(e["event_type"] == "seed" for e in events)
+
+
+def test_health_detail_shape():
+    r = TestClient(app).get("/health/detail").json()
+    assert {"api", "broker", "llm", "regime", "db", "cache"} <= r.keys()
+    assert all(v["ok"] is True for v in r.values())

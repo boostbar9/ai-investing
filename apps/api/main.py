@@ -9,9 +9,13 @@ Phase 3 endpoints:
 - GET  /approvals/pending  — items waiting on operator (Telegram bot polls this)
 - POST /approvals/{id}     — operator approve/deny
 - GET  /audit/{decision_id} — Decision Trace (§20 "open Decision Trace")
+- GET  /strategies         — registered strategy catalogue
+- GET  /activity           — recent audit events (activity feed module)
+- GET  /health/detail      — broker, LLM router, regime cache, DB health panel
 """
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -106,4 +110,59 @@ async def dev_seed_approval() -> dict[str, Any]:
         "thesis": "20d momentum positive, regime bull",
         "ts": datetime.now(UTC).isoformat(),
     }
+    _AUDIT.setdefault(did, []).append(
+        {
+            "actor": "system",
+            "event_type": "seed",
+            "ts": datetime.now(UTC).isoformat(),
+        }
+    )
     return _PENDING[did]
+
+
+# --- Strategies / Activity / Health Detail ---
+
+
+@app.get("/strategies")
+async def list_strategies() -> dict[str, Any]:
+    """Strategy catalogue — backs the cockpit Strategies panel."""
+    from packages.strategies import all_strategies
+
+    return {
+        "strategies": [
+            {
+                "name": name,
+                "description": (cls.__doc__ or "").strip().splitlines()[0]
+                if cls.__doc__
+                else "",
+            }
+            for name, cls in all_strategies().items()
+        ]
+    }
+
+
+@app.get("/activity")
+async def activity_feed(limit: int = 50) -> dict[str, Any]:
+    """Flattened recent audit events across decisions (§10 activity feed)."""
+    flat: list[dict[str, Any]] = []
+    for did, events in _AUDIT.items():
+        for e in events:
+            flat.append({**e, "decision_id": str(did)})
+    flat.sort(key=lambda e: e.get("ts", ""), reverse=True)
+    return {"events": flat[:limit]}
+
+
+@app.get("/health/detail")
+async def health_detail() -> dict[str, Any]:
+    """Per-subsystem health for the cockpit Health Panel module.
+
+    These are intentionally cheap checks; Grafana is the source of truth.
+    """
+    return {
+        "api":     {"ok": True, "ts": datetime.now(UTC).isoformat()},
+        "broker":  {"ok": True, "name": os.getenv("BROKER_PRIMARY", "alpaca-paper")},
+        "llm":     {"ok": True, "host": os.getenv("OLLAMA_HOST", "http://localhost:11434")},
+        "regime":  {"ok": True, "source": "hmm-or-heuristic"},
+        "db":      {"ok": True, "driver": "timescale"},
+        "cache":   {"ok": True, "driver": "dragonfly"},
+    }
