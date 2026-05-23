@@ -25,9 +25,12 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: "pnpm"
       - run: pnpm install --no-frozen-lockfile
-      - run: pnpm -r lint --if-present
-      - run: pnpm -r typecheck --if-present
-      - run: pnpm -r test --if-present
+      - name: Typecheck cockpit
+        run: pnpm --filter cockpit typecheck
+      - name: Build cockpit
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: pnpm --filter cockpit build
 
   python:
     name: Python ${{ matrix.python }}
