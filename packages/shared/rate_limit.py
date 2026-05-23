@@ -44,4 +44,10 @@ BUCKETS: dict[str, TokenBucket] = {
     "sec_edgar": TokenBucket(rate_per_second=10, capacity=10),       # SEC asks <10 req/s
     "fred": TokenBucket(rate_per_second=5, capacity=20),             # generous default
     "reddit": TokenBucket(rate_per_second=1, capacity=10),
+    # yfinance unofficial endpoint — stay polite, 2 req/s, burst 10.
+    "yfinance": TokenBucket(rate_per_second=2, capacity=10),
+    # Alpaca market data free tier: ~200 req/min for IEX feed.
+    "alpaca_data": TokenBucket(rate_per_second=200 / 60, capacity=20),
+    # Generic RSS poller — 1 req/sec per feed is plenty.
+    "rss": TokenBucket(rate_per_second=1, capacity=5),
 }

@@ -237,3 +237,45 @@ def test_set_strategy_mode_400_invalid():
     c = TestClient(app)
     r = c.post(f"/strategies/{name}/mode", json={"mode": "moon"})
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Data sources panel endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_data_sources_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_PARQUET_ROOT", str(tmp_path))
+    r = TestClient(app).get("/data/sources")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body["sources"].keys()) == {
+        "daily_bars",
+        "intraday_bars",
+        "macro",
+        "sentiment",
+    }
+    for src in body["sources"].values():
+        assert src["files"] == 0
+        assert src["ok"] is False
+    assert "yfinance" in body["free_tier"]
+
+
+def test_data_sources_reports_files(tmp_path, monkeypatch):
+    import pandas as pd
+
+    monkeypatch.setenv("DATA_PARQUET_ROOT", str(tmp_path))
+    (tmp_path / "daily").mkdir()
+    pd.DataFrame({"ts": [1, 2], "close": [100, 101]}).to_parquet(
+        tmp_path / "daily" / "SPY.parquet"
+    )
+    pd.DataFrame({"ts": [1], "close": [200]}).to_parquet(
+        tmp_path / "daily" / "QQQ.parquet"
+    )
+    (tmp_path / "sentiment").mkdir()
+    (tmp_path / "sentiment" / "latest.json").write_text('{"by_symbol": {}}')
+
+    body = TestClient(app).get("/data/sources").json()
+    assert body["sources"]["daily_bars"]["files"] == 2
+    assert body["sources"]["daily_bars"]["ok"] is True
+    assert body["sources"]["sentiment"]["ok"] is True

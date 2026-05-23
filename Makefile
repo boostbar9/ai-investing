@@ -5,7 +5,7 @@
         setup-windows pull-models pull-models-7900xt \
         dev up down logs ps \
         test test-node test-python lint format typecheck \
-        backtest nightly \
+        backtest nightly pretrain retune schedules \
         clean reset
 
 help:  ## Show this help
@@ -107,6 +107,15 @@ backtest:  ## Run the standard backtest matrix locally
 
 nightly:  ## Mirror the GH Actions nightly job locally
 	uv run python -m packages.backtests.run --matrix nightly --strategies all --regimes all
+
+pretrain:  ## First-install bootstrap: pull 20yr daily + 90d intraday + FRED macro into data/parquet
+	uv run python -m packages.data.pretrain
+
+retune:  ## Walk-forward retune of strategy params (writes data/params/champion.json)
+	uv run python -m packages.data.jobs.weekly_retune
+
+schedules:  ## Install Temporal schedules for nightly_refresh + weekly_retune
+	uv run python -m packages.data.jobs.scheduler
 
 # ---------- House-keeping ----------
 clean:

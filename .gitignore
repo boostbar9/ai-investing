@@ -70,3 +70,4 @@ temporal-data/
 # ---- OS / misc ----
 Thumbs.db
 *.bak
+data/parquet/

@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import ActivityFeed from "./components/ActivityFeed";
 import ApprovalsQueue from "./components/ApprovalsQueue";
+import DataSourcesPanel from "./components/DataSourcesPanel";
 import HealthPanel from "./components/HealthPanel";
 import LivePromotionPanel from "./components/LivePromotionPanel";
 import PositionsHeatmap from "./components/PositionsHeatmap";
@@ -88,6 +89,9 @@ export default function Home() {
           <ActivityFeed />
         </div>
         <HealthPanel />
+        <div className="md:col-span-2">
+          <DataSourcesPanel />
+        </div>
         <div className="md:col-span-3">
           <StrategyModesPanel />
         </div>

@@ -390,6 +390,63 @@ async def health_detail() -> dict[str, Any]:
     }
 
 
+@app.get("/data/sources")
+async def data_sources() -> dict[str, Any]:
+    """Status of every data source (free-tier first).
+
+    Reads the Parquet cache mtimes to report freshness without re-fetching
+    upstream APIs. The cockpit polls this every ~15s.
+    """
+    from pathlib import Path
+
+    from packages.data.registry import FREE_ADAPTER_NAMES
+
+    parquet_root = Path(os.getenv("DATA_PARQUET_ROOT", "data/parquet"))
+
+    def _scan(subdir: str) -> dict[str, Any]:
+        d = parquet_root / subdir
+        if not d.exists():
+            return {"ok": False, "files": 0, "last_update": None, "path": str(d)}
+        files = list(d.glob("*.parquet"))
+        if not files:
+            return {"ok": False, "files": 0, "last_update": None, "path": str(d)}
+        latest = max(f.stat().st_mtime for f in files)
+        return {
+            "ok": True,
+            "files": len(files),
+            "last_update": datetime.fromtimestamp(latest, tz=UTC).isoformat(),
+            "path": str(d),
+        }
+
+    daily = _scan("daily")
+    intraday = _scan("intraday")
+    macro = _scan("macro")
+
+    # Sentiment lives as a single JSON snapshot, not Parquet.
+    sent_path = parquet_root / "sentiment" / "latest.json"
+    if sent_path.exists():
+        sent = {
+            "ok": True,
+            "files": 1,
+            "last_update": datetime.fromtimestamp(
+                sent_path.stat().st_mtime, tz=UTC
+            ).isoformat(),
+            "path": str(sent_path),
+        }
+    else:
+        sent = {"ok": False, "files": 0, "last_update": None, "path": str(sent_path)}
+
+    return {
+        "sources": {
+            "daily_bars":    {**daily,    "adapter": "alpaca_data / yfinance"},
+            "intraday_bars": {**intraday, "adapter": "alpaca_data"},
+            "macro":         {**macro,    "adapter": "fred"},
+            "sentiment":     {**sent,     "adapter": "sentiment (reddit + rss)"},
+        },
+        "free_tier": list(FREE_ADAPTER_NAMES),
+    }
+
+
 # ---------------------------------------------------------------------------
 # §12 Phase 4 — passkey biometric login (issue #7)
 # ---------------------------------------------------------------------------

@@ -1,0 +1,298 @@
+"""Reddit + RSS sentiment adapter — free, no API key required.
+
+Pulls recent posts from finance subreddits via Reddit's public JSON API and
+matching RSS feeds, then scores each headline with a tiny lexicon-based
+sentiment model (good enough for a noisy signal — agents downstream can
+re-score with an LLM if they want).
+
+The Sentiment Overlay strategy consumes these. The agent treats the output
+as a *contrarian* signal when retail euphoria is high; the LLM-Sentiment
+agent re-scores selectively when the signal-to-noise warrants it.
+
+No external deps beyond ``httpx`` + ``feedparser`` (already in the stack).
+"""
+from __future__ import annotations
+
+import contextlib
+import os
+import re
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import httpx
+
+from packages.shared.otel import span
+from packages.shared.rate_limit import BUCKETS
+
+from .base import DataAdapter, DataAdapterError, NewsItem
+
+# ---------------------------------------------------------------------------
+# Lexicon-based sentiment scoring
+# ---------------------------------------------------------------------------
+
+# Tiny finance-aware lexicon. Not a substitute for FinBERT, but free, fast,
+# deterministic, and surprisingly useful on retail-investor language.
+_POSITIVE = {
+    "moon", "rocket", "bullish", "buy", "calls", "long", "gain", "gains",
+    "rally", "surge", "breakout", "upgrade", "beat", "beats", "strong",
+    "outperform", "tendies", "rip", "rips", "pump", "green", "all-time-high",
+    "ath", "uptrend",
+}
+_NEGATIVE = {
+    "crash", "bearish", "sell", "puts", "short", "loss", "losses", "dump",
+    "plunge", "collapse", "downgrade", "miss", "misses", "weak", "underperform",
+    "bagholder", "red", "rug", "rugpull", "drawdown", "bloodbath", "tank",
+    "tanks", "downtrend",
+}
+_NEGATORS = {"not", "no", "never", "isn't", "won't", "doesn't", "ain't"}
+
+_TICKER_RE = re.compile(r"\$([A-Z]{1,5})\b")
+_WORD_RE = re.compile(r"[A-Za-z']+")
+
+
+def score_headline(text: str) -> float:
+    """Score ``text`` in [-1, 1]. 0 = neutral, +1 = strongly positive.
+
+    Counts polarized words with a simple negation flip-over-N-words rule.
+    Robust to empty / non-ascii input.
+    """
+    if not text:
+        return 0.0
+    tokens = [w.lower() for w in _WORD_RE.findall(text)]
+    if not tokens:
+        return 0.0
+    pos = neg = 0
+    flip_until = -1
+    for i, tok in enumerate(tokens):
+        if tok in _NEGATORS:
+            flip_until = i + 3  # negation flips the next ~3 tokens
+            continue
+        flipped = i <= flip_until
+        if tok in _POSITIVE:
+            if flipped:
+                neg += 1
+            else:
+                pos += 1
+        elif tok in _NEGATIVE:
+            if flipped:
+                pos += 1
+            else:
+                neg += 1
+    total = pos + neg
+    if total == 0:
+        return 0.0
+    return (pos - neg) / total
+
+
+def extract_tickers(text: str) -> list[str]:
+    """Extract ``$TICKER`` mentions, deduplicated, uppercase."""
+    if not text:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _TICKER_RE.finditer(text):
+        sym = m.group(1).upper()
+        if sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Adapter
+# ---------------------------------------------------------------------------
+
+# Default sources: pure JSON, no auth.
+DEFAULT_SUBREDDITS = (
+    "wallstreetbets",
+    "stocks",
+    "investing",
+    "options",
+    "stockmarket",
+)
+
+DEFAULT_RSS = (
+    # Yahoo Finance top news.
+    "https://finance.yahoo.com/news/rssindex",
+    # MarketWatch top stories.
+    "https://feeds.marketwatch.com/marketwatch/topstories/",
+)
+
+
+class SentimentAdapter(DataAdapter):
+    """Headline + post collector with a built-in sentiment score."""
+
+    name = "sentiment"
+
+    def __init__(
+        self,
+        subreddits: tuple[str, ...] = DEFAULT_SUBREDDITS,
+        rss_feeds: tuple[str, ...] = DEFAULT_RSS,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self.subreddits = subreddits
+        self.rss_feeds = rss_feeds
+        self._client = client or httpx.AsyncClient(
+            timeout=20,
+            headers={"User-Agent": os.getenv("SENTIMENT_USER_AGENT", "ai-investing/0.1")},
+        )
+
+    async def health(self) -> dict[str, Any]:
+        with span("data.sentiment.health"):
+            try:
+                r = await self._client.get("https://www.reddit.com/r/stocks/hot.json?limit=1")
+                return {"ok": r.status_code == 200, "latency_ms": r.elapsed.total_seconds() * 1000}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+    async def fetch_reddit(self, subreddit: str, limit: int = 25) -> list[NewsItem]:
+        """Pull the top ``limit`` hot posts from ``r/<subreddit>``."""
+        await BUCKETS["reddit"].acquire()
+        with span("data.sentiment.reddit", {"subreddit": subreddit}):
+            r = await self._client.get(
+                f"https://www.reddit.com/r/{subreddit}/hot.json",
+                params={"limit": limit},
+            )
+            if r.status_code != 200:
+                raise DataAdapterError(f"reddit {subreddit}: {r.status_code}")
+            children = (r.json().get("data") or {}).get("children") or []
+            out: list[NewsItem] = []
+            for ch in children:
+                d = ch.get("data") or {}
+                title = d.get("title") or ""
+                if not title:
+                    continue
+                ts = d.get("created_utc")
+                try:
+                    ts_dt = datetime.fromtimestamp(float(ts), tz=UTC) if ts else datetime.now(UTC)
+                except (TypeError, ValueError):
+                    ts_dt = datetime.now(UTC)
+                tickers = extract_tickers(title + " " + (d.get("selftext") or ""))
+                # If multiple tickers mentioned, emit one item per ticker so
+                # the downstream aggregator can aggregate per-symbol.
+                if not tickers:
+                    out.append(
+                        NewsItem(
+                            symbol=None,
+                            ts=ts_dt,
+                            headline=title,
+                            summary=(d.get("selftext") or "")[:280] or None,
+                            url=f"https://www.reddit.com{d.get('permalink', '')}",
+                            source=f"reddit/{subreddit}",
+                        )
+                    )
+                else:
+                    for sym in tickers:
+                        out.append(
+                            NewsItem(
+                                symbol=sym,
+                                ts=ts_dt,
+                                headline=title,
+                                summary=(d.get("selftext") or "")[:280] or None,
+                                url=f"https://www.reddit.com{d.get('permalink', '')}",
+                                source=f"reddit/{subreddit}",
+                            )
+                        )
+            return out
+
+    async def fetch_rss(self, feed_url: str) -> list[NewsItem]:
+        """Pull headlines from an RSS feed (uses tiny inline parser, no feedparser dep)."""
+        await BUCKETS["rss"].acquire()
+        with span("data.sentiment.rss", {"feed": feed_url}):
+            r = await self._client.get(feed_url)
+            if r.status_code != 200:
+                raise DataAdapterError(f"rss {feed_url}: {r.status_code}")
+            return _parse_rss(r.text, feed_url)
+
+    async def fetch_all(self, max_per_source: int = 25) -> list[NewsItem]:
+        """Pull from every configured subreddit + RSS feed. Best-effort: a
+        single failing source does not abort the whole call."""
+        out: list[NewsItem] = []
+        for sub in self.subreddits:
+            try:
+                out.extend(await self.fetch_reddit(sub, limit=max_per_source))
+            except DataAdapterError:
+                continue
+        for feed in self.rss_feeds:
+            try:
+                out.extend(await self.fetch_rss(feed))
+            except DataAdapterError:
+                continue
+        return out
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+
+
+def aggregate_sentiment(items: list[NewsItem], window_hours: int = 24) -> dict[str, dict[str, Any]]:
+    """Aggregate per-symbol sentiment over the trailing ``window_hours``.
+
+    Returns ``{symbol: {"score": float in [-1, 1], "n": int, "headlines": [...] }}``
+    """
+    cutoff = datetime.now(UTC) - timedelta(hours=window_hours)
+    by_sym: dict[str, list[NewsItem]] = {}
+    for it in items:
+        if it.symbol is None:
+            continue
+        if it.ts < cutoff:
+            continue
+        by_sym.setdefault(it.symbol, []).append(it)
+
+    out: dict[str, dict[str, Any]] = {}
+    for sym, items_for_sym in by_sym.items():
+        scores = [score_headline(it.headline) for it in items_for_sym]
+        avg = sum(scores) / len(scores) if scores else 0.0
+        out[sym] = {
+            "score": avg,
+            "n": len(items_for_sym),
+            "headlines": [it.headline for it in items_for_sym[:5]],
+        }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Minimal RSS parser (no external deps)
+# ---------------------------------------------------------------------------
+
+_RSS_ITEM_RE = re.compile(r"<item>(.*?)</item>", re.DOTALL | re.IGNORECASE)
+_RSS_TITLE_RE = re.compile(r"<title>(.*?)</title>", re.DOTALL | re.IGNORECASE)
+_RSS_LINK_RE = re.compile(r"<link>(.*?)</link>", re.DOTALL | re.IGNORECASE)
+_RSS_DATE_RE = re.compile(r"<pubDate>(.*?)</pubDate>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_cdata(s: str) -> str:
+    s = s.strip()
+    if s.startswith("<![CDATA[") and s.endswith("]]>"):
+        return s[9:-3].strip()
+    return s
+
+
+def _parse_rss(xml: str, feed_url: str) -> list[NewsItem]:
+    out: list[NewsItem] = []
+    for item_xml in _RSS_ITEM_RE.findall(xml):
+        title_m = _RSS_TITLE_RE.search(item_xml)
+        link_m = _RSS_LINK_RE.search(item_xml)
+        date_m = _RSS_DATE_RE.search(item_xml)
+        if not title_m or not link_m:
+            continue
+        title = _strip_cdata(title_m.group(1))
+        link = _strip_cdata(link_m.group(1))
+        # Parse RFC-822 dates; fall back to now() on failure.
+        ts = datetime.now(UTC)
+        if date_m:
+            from email.utils import parsedate_to_datetime
+
+            with contextlib.suppress(TypeError, ValueError):
+                ts = parsedate_to_datetime(_strip_cdata(date_m.group(1))).astimezone(UTC)
+        tickers = extract_tickers(title)
+        if not tickers:
+            out.append(NewsItem(symbol=None, ts=ts, headline=title, url=link, source=feed_url))
+        else:
+            for sym in tickers:
+                out.append(NewsItem(symbol=sym, ts=ts, headline=title, url=link, source=feed_url))
+    return out

@@ -140,11 +140,29 @@ async def execution_activity(payload: dict[str, Any]) -> dict[str, Any]:
         await router.aclose()
 
 
+@activity.defn(name="data.nightly_refresh")
+async def nightly_refresh_activity() -> dict[str, Any]:
+    """Nightly data refresh — bars + sentiment snapshot."""
+    from packages.data.jobs.nightly_refresh import run
+
+    return await run()
+
+
+@activity.defn(name="data.weekly_retune")
+async def weekly_retune_activity() -> dict[str, Any]:
+    """Weekly walk-forward parameter retune."""
+    from packages.data.jobs.weekly_retune import run
+
+    return await run()
+
+
 ALL_ACTIVITIES = [
     research_activity,
     strategy_activity,
     risk_activity,
     execution_activity,
+    nightly_refresh_activity,
+    weekly_retune_activity,
 ]
 
 
@@ -314,13 +332,35 @@ class TradeCycleWorkflow:
 # ---------------------------------------------------------------------------
 
 
-ALL_WORKFLOWS = [TradeCycleWorkflow]
+@workflow.defn(name="DataJobWorkflow")
+class DataJobWorkflow:
+    """Thin workflow that runs a single named data activity.
+
+    Used by the scheduler to invoke ``data.nightly_refresh`` and
+    ``data.weekly_retune`` on cron without giving the cron job direct
+    access to the trade-cycle workflow.
+    """
+
+    @workflow.run
+    async def run(self, activity_name: str) -> dict[str, Any]:
+        return await workflow.execute_activity(
+            activity_name,
+            start_to_close_timeout=timedelta(minutes=30),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=5),
+                maximum_attempts=2,
+            ),
+        )
+
+
+ALL_WORKFLOWS = [TradeCycleWorkflow, DataJobWorkflow]
 
 
 # Silence unused-import warnings for runtime types referenced via schemas.
 __all__ = [
     "ALL_ACTIVITIES",
     "ALL_WORKFLOWS",
+    "DataJobWorkflow",
     "ExecutionInput",
     "ExecutionOutput",
     "Order",
@@ -336,7 +376,9 @@ __all__ = [
     "TradeCycleResult",
     "TradeCycleWorkflow",
     "execution_activity",
+    "nightly_refresh_activity",
     "research_activity",
     "risk_activity",
     "strategy_activity",
+    "weekly_retune_activity",
 ]
