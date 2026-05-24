@@ -2,7 +2,7 @@
 # Acceptance criterion §16: clone -> first backtest in < 30 min
 
 .PHONY: help setup setup-node setup-python setup-llms setup-db \
-        setup-windows pull-models pull-models-7900xt \
+        setup-windows pull-models pull-models-7900xt ollama-auto \
         dev up down logs ps \
         test test-node test-python lint format typecheck \
         backtest nightly pretrain retune schedules doctor first-run \
@@ -60,6 +60,9 @@ pull-models:  ## Pull every Ollama model required by HARDWARE_PROFILE (defaults 
 
 pull-models-7900xt:  ## Convenience: force the rx_7900_xt profile and pull its models
 	@HARDWARE_PROFILE=rx_7900_xt $(MAKE) pull-models
+
+ollama-auto:  ## One-shot: start the daemon, pull any missing models, verify. Idempotent.
+	@uv run python tools/check_ollama.py --auto
 
 # ---------- Run ----------
 dev: up  ## Start full local stack
