@@ -235,6 +235,52 @@ def pull_model(host: str, model: str, *, verbose: bool = True) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Status snapshot (used by the cockpit GUI)
+# ---------------------------------------------------------------------------
+
+
+def status_snapshot(host: str | None = None, profile_name: str | None = None) -> dict:
+    """Read-only inventory for the cockpit's Ollama panel.
+
+    Pure function: never spawns the daemon, never pulls, never writes.
+    Safe to call on every page poll. Returns a JSON-serializable dict the
+    frontend can render directly.
+    """
+    h = host or DEFAULT_HOST
+    profile = active_profile(env_value=profile_name)
+    required = all_models(profile)
+
+    alive = _daemon_alive(h)
+    if not alive:
+        return {
+            "host": h,
+            "daemon_alive": False,
+            "profile": {"name": profile.name, "description": profile.description},
+            "required": required,
+            "installed": [],
+            "missing": required,  # we can't verify, so report worst case
+            "ready": False,
+            "cli_on_path": bool(shutil.which("ollama")),
+        }
+
+    try:
+        installed = _list_installed(h)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        installed = []
+    missing = [r for r in required if not _matches(r, installed)]
+    return {
+        "host": h,
+        "daemon_alive": True,
+        "profile": {"name": profile.name, "description": profile.description},
+        "required": required,
+        "installed": installed,
+        "missing": missing,
+        "ready": len(missing) == 0,
+        "cli_on_path": bool(shutil.which("ollama")),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 

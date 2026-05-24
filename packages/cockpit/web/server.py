@@ -763,6 +763,51 @@ def api_models_stop(kind: str) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Ollama setup (GUI wrapper around tools/check_ollama.py --auto)
+# --------------------------------------------------------------------------
+
+OLLAMA_SETUP_KIND = "ollama_setup"
+
+
+@app.get("/api/ollama/status")
+def api_ollama_status() -> dict[str, Any]:
+    """Read-only inventory for the cockpit's Ollama panel.
+
+    Cheap enough to poll every few seconds — never starts the daemon and
+    never pulls. The UI uses this to decide whether to show the Setup
+    button vs. a green 'ready' badge.
+    """
+    # Import lazily so cockpit can still boot if tools/ path is funny.
+    from tools.check_ollama import status_snapshot
+
+    snap = status_snapshot()
+    # Surface the currently-tracked job so the UI can pick up an in-progress
+    # setup after a page reload without having to remember it client-side.
+    snap["job"] = job_mgr.status(OLLAMA_SETUP_KIND).to_dict()
+    return snap
+
+
+@app.post("/api/ollama/setup")
+def api_ollama_setup() -> dict[str, Any]:
+    """Kick off ``tools/check_ollama.py --auto`` as a managed background job.
+
+    Reusing the proc registry means the existing /api/jobs/{kind}/stream
+    SSE endpoint streams live pull progress to the UI for free, and a
+    page reload mid-pull picks the stream back up.
+    """
+    cmd = [_python_exe(), "tools/check_ollama.py", "--auto"]
+    info = job_mgr.start(OLLAMA_SETUP_KIND, cmd)
+    return info.to_dict()
+
+
+@app.post("/api/ollama/stop")
+def api_ollama_stop() -> dict[str, Any]:
+    """Cancel an in-flight setup. The daemon itself is left running because
+    other tools may depend on it; we only kill the pull driver."""
+    return job_mgr.stop(OLLAMA_SETUP_KIND).to_dict()
+
+
+# --------------------------------------------------------------------------
 # Paper-trade loop control
 # --------------------------------------------------------------------------
 

@@ -38,6 +38,36 @@
       <p class="text-sm text-gray-400">Pretrain on historical data and retune on a schedule. Output streams live below.</p>
     </header>
 
+    <section class="card p-5 mb-6" id="ollama-card">
+      <div class="flex items-start justify-between mb-3 flex-wrap gap-2">
+        <div>
+          <div class="font-medium">Local LLMs (Ollama)
+            <span class="tt" data-tt="Starts the Ollama daemon if needed and downloads any required models for the active hardware profile. Safe to re-run.">?</span>
+          </div>
+          <div class="text-xs text-gray-400" id="ollama-sub">checking...</div>
+        </div>
+        <div class="flex items-center gap-2">
+          <span id="pill-ollama" class="pill pill-gray">checking</span>
+          <button id="ollama-setup-btn" class="btn btn-primary" data-tt="Starts the daemon (if needed) and downloads any missing models. Streams progress to the log below.">Auto-setup</button>
+          <button id="ollama-stop-btn" class="btn btn-danger" data-tt="Stops the setup process. The daemon itself keeps running." style="display:none">Stop</button>
+        </div>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+        <div>
+          <div class="text-gray-400 mb-1">Profile</div>
+          <div id="ollama-profile" class="mono">-</div>
+        </div>
+        <div>
+          <div class="text-gray-400 mb-1">Required</div>
+          <ul id="ollama-required" class="mono space-y-0.5"></ul>
+        </div>
+        <div>
+          <div class="text-gray-400 mb-1">Missing</div>
+          <ul id="ollama-missing" class="mono space-y-0.5"></ul>
+        </div>
+      </div>
+    </section>
+
     <section class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-6">
       <div class="card p-4 flex flex-col gap-2">
         <div class="flex items-start justify-between">
@@ -85,6 +115,7 @@
             <option value="pretrain">pretrain</option>
             <option value="retune_nightly">retune_nightly</option>
             <option value="retune_weekly">retune_weekly</option>
+            <option value="ollama_setup">ollama_setup</option>
           </select>
           <button id="clear-log" class="btn btn-ghost btn-sm">Clear view</button>
         </div>
@@ -173,18 +204,102 @@
       currentSource.onerror = () => {};
     }
 
+    async function refreshOllama() {
+      const subEl = document.getElementById('ollama-sub');
+      const pillEl = document.getElementById('pill-ollama');
+      const profEl = document.getElementById('ollama-profile');
+      const reqEl = document.getElementById('ollama-required');
+      const missEl = document.getElementById('ollama-missing');
+      const setupBtn = document.getElementById('ollama-setup-btn');
+      const stopBtn = document.getElementById('ollama-stop-btn');
+      try {
+        const s = await Cockpit.api.get('/api/ollama/status');
+        profEl.textContent = (s.profile && s.profile.name) ? `${s.profile.name} \u2014 ${s.profile.description}` : '(none)';
+        reqEl.innerHTML = (s.required || []).map(m => {
+          const ok = (s.installed || []).some(t => t === m || t.startsWith(m.split(':')[0] + ':' + (m.split(':')[1] || '')));
+          const cls = ok ? 'text-emerald-400' : 'text-gray-300';
+          return `<li class="${cls}">${ok ? '\u2713' : '\u2022'} ${m}</li>`;
+        }).join('') || '<li class="text-gray-500">(none)</li>';
+        missEl.innerHTML = (s.missing && s.missing.length) ? s.missing.map(m => `<li class="text-amber-400">${m}</li>`).join('') : '<li class="text-emerald-400">none</li>';
+
+        const job = s.job || {};
+        const running = !!job.running;
+        if (running) {
+          pillEl.textContent = 'setting up';
+          pillEl.className = 'pill pill-blue';
+          subEl.textContent = `pulling models on ${s.host}`;
+          setupBtn.disabled = true;
+          setupBtn.style.display = 'none';
+          stopBtn.style.display = '';
+        } else if (!s.daemon_alive) {
+          pillEl.textContent = 'daemon down';
+          pillEl.className = 'pill pill-red';
+          subEl.textContent = `Ollama not reachable at ${s.host}. Click Auto-setup to start it.`;
+          setupBtn.disabled = false;
+          setupBtn.style.display = '';
+          stopBtn.style.display = 'none';
+        } else if (s.ready) {
+          pillEl.textContent = 'ready';
+          pillEl.className = 'pill pill-green';
+          subEl.textContent = `${(s.installed || []).length} model(s) installed at ${s.host}`;
+          setupBtn.disabled = false;
+          setupBtn.style.display = '';
+          stopBtn.style.display = 'none';
+        } else {
+          pillEl.textContent = `${(s.missing || []).length} missing`;
+          pillEl.className = 'pill pill-yellow';
+          subEl.textContent = `Daemon up but ${(s.missing || []).length} model(s) missing. Click Auto-setup to pull.`;
+          setupBtn.disabled = false;
+          setupBtn.style.display = '';
+          stopBtn.style.display = 'none';
+        }
+      } catch (e) {
+        pillEl.textContent = 'error';
+        pillEl.className = 'pill pill-red';
+        subEl.textContent = 'status check failed: ' + e.message;
+      }
+    }
+
+    async function startOllamaSetup() {
+      try {
+        await Cockpit.api.post('/api/ollama/setup', {});
+        Cockpit.toastSuccess('Ollama auto-setup started');
+        document.getElementById('log-pick').value = 'ollama_setup';
+        switchStream('ollama_setup');
+        refreshOllama();
+        refreshStatus();
+      } catch (e) {
+        Cockpit.toastError('Failed to start setup: ' + e.message);
+      }
+    }
+
+    async function stopOllamaSetup() {
+      if (!confirm('Stop the Ollama setup? The daemon itself will keep running.')) return;
+      try {
+        await Cockpit.api.post('/api/ollama/stop', {});
+        Cockpit.toastSuccess('Stopped Ollama setup');
+        refreshOllama();
+      } catch (e) {
+        Cockpit.toastError('Failed to stop: ' + e.message);
+      }
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
       document.querySelectorAll('[data-start]').forEach(b => b.addEventListener('click', () => start(b.dataset.start)));
       document.querySelectorAll('[data-stop]').forEach(b => b.addEventListener('click', () => stop(b.dataset.stop)));
       document.getElementById('log-pick').addEventListener('change', e => switchStream(e.target.value));
       document.getElementById('clear-log').addEventListener('click', () => { document.getElementById('log').textContent = ''; });
       document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
+      document.getElementById('ollama-setup-btn').addEventListener('click', startOllamaSetup);
+      document.getElementById('ollama-stop-btn').addEventListener('click', stopOllamaSetup);
 
       refreshStatus();
       switchStream(currentKind);
       refreshTopbar();
+      refreshOllama();
       setInterval(refreshStatus, 3000);
       setInterval(refreshTopbar, 5000);
+      setInterval(refreshOllama, 4000);
     });
   </script>
 </body>

@@ -204,3 +204,60 @@ def test_pull_model_both_paths_fail_returns_false() -> None:
     with patch.object(check_ollama, "_pull_via_http", return_value=False), \
          patch.object(check_ollama, "_pull_via_cli", return_value=False):
         assert check_ollama.pull_model("http://x", "deepseek-r1:32b", verbose=False) is False
+
+
+# ---------------------------------------------------------------------------
+# status_snapshot — read-only inventory used by the cockpit GUI
+# ---------------------------------------------------------------------------
+
+
+def test_status_snapshot_daemon_down() -> None:
+    """When the daemon is unreachable, every required model is reported as missing."""
+    with patch.object(check_ollama, "_daemon_alive", return_value=False):
+        snap = check_ollama.status_snapshot(host="http://nope")
+    assert snap["daemon_alive"] is False
+    assert snap["ready"] is False
+    assert snap["installed"] == []
+    # Worst-case reporting: required == missing when we can't verify.
+    assert snap["missing"] == snap["required"]
+    assert isinstance(snap["profile"]["name"], str)
+
+
+def test_status_snapshot_daemon_up_all_present() -> None:
+    """When every required model is installed, ready=True and missing is empty."""
+    fake_required = ["deepseek-r1:32b", "qwen2.5:14b"]
+    with patch.object(check_ollama, "_daemon_alive", return_value=True), \
+         patch.object(check_ollama, "_list_installed", return_value=list(fake_required)), \
+         patch.object(check_ollama, "all_models", return_value=fake_required):
+        snap = check_ollama.status_snapshot(host="http://x")
+    assert snap["daemon_alive"] is True
+    assert snap["ready"] is True
+    assert snap["missing"] == []
+    assert set(snap["installed"]) == set(fake_required)
+
+
+def test_status_snapshot_daemon_up_some_missing() -> None:
+    """Partial install: only truly-missing tags appear in `missing`."""
+    with patch.object(check_ollama, "_daemon_alive", return_value=True), \
+         patch.object(check_ollama, "_list_installed", return_value=["deepseek-r1:32b"]), \
+         patch.object(check_ollama, "all_models", return_value=["deepseek-r1:32b", "qwen2.5:14b"]):
+        snap = check_ollama.status_snapshot(host="http://x")
+    assert snap["daemon_alive"] is True
+    assert snap["ready"] is False
+    assert snap["missing"] == ["qwen2.5:14b"]
+
+
+def test_status_snapshot_handles_list_errors_gracefully() -> None:
+    """If /api/tags blows up after the alive-probe says yes, fall back to empty
+    installed list — never propagate the exception to the cockpit."""
+    import urllib.error
+
+    with patch.object(check_ollama, "_daemon_alive", return_value=True), \
+         patch.object(check_ollama, "_list_installed",
+                       side_effect=urllib.error.URLError("boom")), \
+         patch.object(check_ollama, "all_models", return_value=["deepseek-r1:32b"]):
+        snap = check_ollama.status_snapshot(host="http://x")
+    assert snap["daemon_alive"] is True
+    assert snap["installed"] == []
+    assert snap["missing"] == ["deepseek-r1:32b"]
+    assert snap["ready"] is False

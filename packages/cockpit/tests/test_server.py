@@ -882,3 +882,116 @@ def test_scorecard_limit_clamps_returned_rows(
     data = r.json()
     assert len(data["runs"]) == 2
     assert data["runs"][0]["decision_id"] == "r4"
+
+
+# ---------------------------------------------------------------------------
+# Ollama setup GUI (status panel + auto-setup launcher)
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_status_endpoint_reports_daemon_down(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the daemon is unreachable, /api/ollama/status must still respond
+    cleanly with daemon_alive=False so the panel can show the Auto-setup CTA.
+    """
+    import tools.check_ollama as co
+
+    monkeypatch.setattr(co, "_daemon_alive", lambda host, timeout=2.0: False)
+
+    r = client.get("/api/ollama/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["daemon_alive"] is False
+    assert body["ready"] is False
+    # Job slot is reported so the UI can disambiguate "never run" vs "in flight".
+    assert body["job"]["kind"] == "ollama_setup"
+    assert body["job"]["running"] is False
+
+
+def test_ollama_status_endpoint_reports_ready(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All required models installed -> ready=True, no missing entries."""
+    import tools.check_ollama as co
+
+    fake_required = ["deepseek-r1:32b", "qwen2.5:14b"]
+    monkeypatch.setattr(co, "_daemon_alive", lambda host, timeout=2.0: True)
+    monkeypatch.setattr(co, "_list_installed", lambda host, timeout=5.0: list(fake_required))
+    monkeypatch.setattr(co, "all_models", lambda profile=None: fake_required)
+
+    r = client.get("/api/ollama/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["daemon_alive"] is True
+    assert body["ready"] is True
+    assert body["missing"] == []
+
+
+def test_ollama_setup_endpoint_starts_managed_job(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POST /api/ollama/setup must invoke proc.start with the auto-setup
+    command. We stub the proc registry so no real subprocess is launched.
+    """
+    captured: dict[str, object] = {}
+
+    class _FakeInfo:
+        def to_dict(self) -> dict[str, object]:
+            return {"kind": "ollama_setup", "running": True, "pid": 99}
+
+    def fake_start(kind: str, command: list[str]) -> _FakeInfo:
+        captured["kind"] = kind
+        captured["command"] = command
+        return _FakeInfo()
+
+    monkeypatch.setattr(srv.job_mgr, "start", fake_start)
+
+    r = client.post("/api/ollama/setup")
+    assert r.status_code == 200
+    j = r.json()
+    assert j["kind"] == "ollama_setup"
+    assert j["running"] is True
+    # The command must drive the auto-setup path of check_ollama.py.
+    assert captured["kind"] == "ollama_setup"
+    cmd = captured["command"]
+    assert any("check_ollama.py" in arg for arg in cmd)
+    assert "--auto" in cmd
+
+
+def test_ollama_stop_endpoint_only_stops_setup_job(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POST /api/ollama/stop must target the ollama_setup kind only, never
+    other jobs (we don't want it accidentally killing pretrain).
+    """
+    captured: dict[str, object] = {}
+
+    class _FakeInfo:
+        def to_dict(self) -> dict[str, object]:
+            return {"kind": "ollama_setup", "running": False, "exit_code": -15}
+
+    def fake_stop(kind: str, timeout: float = 5.0) -> _FakeInfo:
+        captured["kind"] = kind
+        return _FakeInfo()
+
+    monkeypatch.setattr(srv.job_mgr, "stop", fake_stop)
+
+    r = client.post("/api/ollama/stop")
+    assert r.status_code == 200
+    assert captured["kind"] == "ollama_setup"
+
+
+def test_models_page_includes_ollama_panel(client: TestClient) -> None:
+    """The Models page HTML must render the new Ollama card so the operator
+    has a visible entry point. Pin a couple of distinctive markers so future
+    refactors don't silently drop the panel.
+    """
+    r = client.get("/models")
+    assert r.status_code == 200
+    html = r.text
+    assert "Local LLMs (Ollama)" in html
+    assert 'id="pill-ollama"' in html
+    assert 'id="ollama-setup-btn"' in html
+    assert "/api/ollama/status" in html
+    assert "/api/ollama/setup" in html
