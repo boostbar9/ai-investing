@@ -50,6 +50,7 @@ from packages.regime.ensemble import (
     RegimeWeights,
     detect_regime_series,
 )
+from packages.shared.dotenv import load_dotenv
 from packages.shared.schemas import Position
 from packages.strategies import (
     MeanReversion,
@@ -57,6 +58,10 @@ from packages.strategies import (
     SentimentOverlay,
     TrendFollowing,
 )
+
+# Auto-load .env from the current working directory so users don't have to
+# manually `export` Alpaca keys before running. Existing shell exports win.
+load_dotenv()
 
 log = logging.getLogger("paper_trade")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

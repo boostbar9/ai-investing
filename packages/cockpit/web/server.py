@@ -45,6 +45,11 @@ from packages.cockpit.state import (
 )
 from packages.execution.broker import AlpacaPaperBroker, BrokerError, OrderRequest
 from packages.paper.streak import compute_paper_streak
+from packages.shared.dotenv import load_dotenv
+
+# Auto-load .env so the cockpit and any subprocesses it spawns inherit the
+# Alpaca paper keys without the user having to set them manually first.
+load_dotenv()
 
 log = logging.getLogger("cockpit")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

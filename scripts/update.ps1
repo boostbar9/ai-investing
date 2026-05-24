@@ -41,6 +41,15 @@ function Fail([string]$msg) {
   exit 1
 }
 
+# Run a command, capture stdout as a single trimmed string. Returns "" on
+# null/empty so downstream string ops don't blow up under iwr|iex.
+function Get-Output([scriptblock]$action) {
+  $out = & $action 2>$null
+  if ($null -eq $out) { return "" }
+  if ($out -is [array]) { $out = $out -join "`n" }
+  return [string]$out
+}
+
 # ----------------------------------------------------------------------
 # 1. Verify we're in a real install
 # ----------------------------------------------------------------------
@@ -64,7 +73,7 @@ Write-Ok "Using $InstallDir"
 # ----------------------------------------------------------------------
 Write-Section "Safety checks"
 
-$branch = (git rev-parse --abbrev-ref HEAD).Trim()
+$branch = (Get-Output { git rev-parse --abbrev-ref HEAD }).Trim()
 if ($branch -ne "main") {
   if (-not $Force) {
     Fail "On branch '$branch', not 'main'. Switch with 'git switch main' or re-run with -Force."
@@ -72,7 +81,7 @@ if ($branch -ne "main") {
   Write-Warn "On branch '$branch' (continuing because -Force was set)"
 }
 
-$dirty = (git status --porcelain).Trim()
+$dirty = (Get-Output { git status --porcelain }).Trim()
 if ($dirty) {
   if (-not $Force) {
     Write-Host ""
@@ -87,7 +96,7 @@ Write-Ok "Working tree clean, on main"
 # ----------------------------------------------------------------------
 # 3. Capture pre-pull state for diff detection
 # ----------------------------------------------------------------------
-$preHash      = (git rev-parse HEAD).Trim()
+$preHash      = (Get-Output { git rev-parse HEAD }).Trim()
 $preToml      = if (Test-Path "pyproject.toml") { (Get-FileHash pyproject.toml).Hash } else { "" }
 $preEnvExample = if (Test-Path ".env.example") { (Get-FileHash .env.example).Hash } else { "" }
 
@@ -97,7 +106,9 @@ $preEnvExample = if (Test-Path ".env.example") { (Get-FileHash .env.example).Has
 Write-Section "Fetching updates"
 
 git fetch origin main --quiet
-$behindCount = [int]((git rev-list --count "HEAD..origin/main").Trim())
+$behindStr = (Get-Output { git rev-list --count "HEAD..origin/main" }).Trim()
+if (-not $behindStr) { $behindStr = "0" }
+$behindCount = [int]$behindStr
 if ($behindCount -eq 0) {
   Write-Ok "Already up to date - nothing to pull"
 } else {
@@ -105,7 +116,7 @@ if ($behindCount -eq 0) {
   git pull --ff-only origin main
 }
 
-$postHash = (git rev-parse HEAD).Trim()
+$postHash = (Get-Output { git rev-parse HEAD }).Trim()
 
 # ----------------------------------------------------------------------
 # 5. Update Python deps if pyproject.toml changed
