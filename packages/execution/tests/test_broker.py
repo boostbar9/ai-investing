@@ -180,3 +180,23 @@ async def test_router_skips_unhealthy_ibkr_stub_falls_back_to_paper():
     router = BrokerRouter([ibkr, paper])
     ack = await router.submit(OrderRequest(symbol="SPY", side="buy", qty=1))
     assert ack.broker == "healthy"
+
+
+# --------------------------------------------------------------------------
+# Regression: ALPACA_BASE_URL pasted with trailing /v2 (or trailing slash)
+# was producing requests to /v2/v2/account. The broker now strips both.
+# --------------------------------------------------------------------------
+
+
+def test_base_url_strips_trailing_v2(monkeypatch):
+    from packages.execution.broker import AlpacaPaperBroker
+
+    for raw in (
+        "https://paper-api.alpaca.markets/v2",
+        "https://paper-api.alpaca.markets/v2/",
+        "https://paper-api.alpaca.markets/",
+        "https://paper-api.alpaca.markets",
+    ):
+        monkeypatch.setenv("ALPACA_BASE_URL", raw)
+        b = AlpacaPaperBroker()
+        assert b.base_url == "https://paper-api.alpaca.markets", f"failed for {raw!r}"

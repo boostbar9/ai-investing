@@ -88,7 +88,13 @@ class AlpacaPaperBroker(Broker):
     ) -> None:
         self.key_id = key_id or os.getenv("ALPACA_PAPER_KEY_ID", "")
         self.secret = secret or os.getenv("ALPACA_PAPER_SECRET", "")
-        self.base_url = base_url or os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+        raw_base = base_url or os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+        # Be tolerant: users frequently paste the docs URL which includes /v2.
+        # We always append /v2/<endpoint> ourselves, so strip any trailing /v2
+        # or slashes before storing.
+        self.base_url = raw_base.rstrip("/")
+        if self.base_url.endswith("/v2"):
+            self.base_url = self.base_url[: -len("/v2")]
         self._client = client or httpx.AsyncClient(
             timeout=15,
             headers={"APCA-API-KEY-ID": self.key_id, "APCA-API-SECRET-KEY": self.secret},
