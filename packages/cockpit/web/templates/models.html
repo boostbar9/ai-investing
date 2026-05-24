@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Models - ai-investing</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; }
+    .pill { padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+    .pill-green { background: #064e3b; color: #6ee7b7; }
+    .pill-blue { background: #1e3a8a; color: #93c5fd; }
+    .pill-gray { background: #1f2937; color: #9ca3af; }
+    .pill-red { background: #7f1d1d; color: #fca5a5; }
+    .btn { padding: 8px 14px; border-radius: 8px; font-weight: 500; font-size: 13px; cursor: pointer; transition: all .15s; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
+    .btn-ghost { background: #1f2937; color: #d1d5db; }
+    .btn-ghost:hover:not(:disabled) { background: #374151; }
+    .btn-danger { background: #dc2626; color: white; }
+    .log-box { background: #050810; border: 1px solid #1f2937; border-radius: 8px; padding: 12px; max-height: 480px; overflow-y: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; color: #d1d5db; }
+    .nav-link { padding: 6px 12px; border-radius: 6px; color: #9ca3af; text-decoration: none; font-size: 13px; }
+    .nav-link:hover { background: #1f2937; color: #f9fafb; }
+    .nav-active { background: #1f2937; color: #f9fafb; }
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="max-w-5xl mx-auto p-6">
+    <nav class="flex items-center gap-1 mb-4 text-sm">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/trading" class="nav-link">Trading</a>
+      <a href="/models" class="nav-link nav-active">Models</a>
+      <a href="/settings" class="nav-link">Settings</a>
+      <a href="/updates" class="nav-link">Updates</a>
+    </nav>
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold">Models</h1>
+      <p class="text-sm text-gray-400">Pretrain on historical data and retune on a schedule. Output streams live below.</p>
+    </header>
+
+    <section class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-6">
+      <div class="card p-4 flex flex-col gap-2">
+        <div class="flex items-start justify-between">
+          <div class="font-medium">Full pretrain</div>
+          <span id="pill-pretrain" class="pill pill-gray">idle</span>
+        </div>
+        <div class="text-xs text-gray-400">20yr daily + 90d intraday. ~20-40 min first run.</div>
+        <div class="flex gap-2 mt-1">
+          <button class="btn btn-primary flex-1" data-start="pretrain">Run</button>
+          <button class="btn btn-danger" data-stop="pretrain">Stop</button>
+        </div>
+      </div>
+
+      <div class="card p-4 flex flex-col gap-2">
+        <div class="flex items-start justify-between">
+          <div class="font-medium">Nightly retune</div>
+          <span id="pill-retune_nightly" class="pill pill-gray">idle</span>
+        </div>
+        <div class="text-xs text-gray-400">Last 90 days only. ~3-5 min.</div>
+        <div class="flex gap-2 mt-1">
+          <button class="btn btn-primary flex-1" data-start="retune_nightly">Run</button>
+          <button class="btn btn-danger" data-stop="retune_nightly">Stop</button>
+        </div>
+      </div>
+
+      <div class="card p-4 flex flex-col gap-2">
+        <div class="flex items-start justify-between">
+          <div class="font-medium">Weekly retune</div>
+          <span id="pill-retune_weekly" class="pill pill-gray">idle</span>
+        </div>
+        <div class="text-xs text-gray-400">Last 2 years. ~10 min.</div>
+        <div class="flex gap-2 mt-1">
+          <button class="btn btn-primary flex-1" data-start="retune_weekly">Run</button>
+          <button class="btn btn-danger" data-stop="retune_weekly">Stop</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card p-5">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium">Live log</div>
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-gray-400">viewing:</span>
+          <select id="log-pick" class="bg-gray-800 text-sm rounded px-2 py-1 border border-gray-700">
+            <option value="pretrain">pretrain</option>
+            <option value="retune_nightly">retune_nightly</option>
+            <option value="retune_weekly">retune_weekly</option>
+          </select>
+          <button id="clear-log" class="btn btn-ghost">Clear view</button>
+        </div>
+      </div>
+      <div id="log" class="log-box">Pick a job and click Run to stream output here.</div>
+    </section>
+  </div>
+
+  <script>
+    let currentSource = null;
+    let currentKind = 'pretrain';
+
+    function pill(kind, label, cls) {
+      const el = document.getElementById('pill-' + kind);
+      if (!el) return;
+      el.textContent = label;
+      el.className = 'pill ' + cls;
+    }
+
+    async function refreshStatus() {
+      const r = await fetch('/api/jobs');
+      const jobs = await r.json();
+      const byKind = Object.fromEntries(jobs.map(j => [j.kind, j]));
+      for (const k of ['pretrain', 'retune_nightly', 'retune_weekly']) {
+        const j = byKind[k];
+        if (!j) { pill(k, 'idle', 'pill-gray'); continue; }
+        if (j.running) pill(k, 'running', 'pill-blue');
+        else if (j.exit_code === 0) pill(k, 'done', 'pill-green');
+        else if (j.exit_code !== null) pill(k, 'failed', 'pill-red');
+        else pill(k, 'idle', 'pill-gray');
+      }
+    }
+
+    async function start(kind) {
+      const route = kind === 'pretrain' ? '/api/models/pretrain'
+        : kind === 'retune_nightly' ? '/api/models/retune-nightly'
+        : '/api/models/retune-weekly';
+      const r = await fetch(route, {method: 'POST'});
+      if (!r.ok) { alert('Failed to start ' + kind); return; }
+      // Switch the log viewer to this job.
+      document.getElementById('log-pick').value = kind;
+      switchStream(kind);
+      refreshStatus();
+    }
+
+    async function stop(kind) {
+      if (!confirm(`Stop the ${kind} job?`)) return;
+      await fetch(`/api/models/${kind}/stop`, {method: 'POST'});
+      refreshStatus();
+    }
+
+    function switchStream(kind) {
+      currentKind = kind;
+      const logEl = document.getElementById('log');
+      logEl.textContent = '';
+      if (currentSource) { try { currentSource.close(); } catch (e) {} }
+      currentSource = new EventSource(`/api/jobs/${kind}/stream`);
+      currentSource.onmessage = (e) => {
+        logEl.textContent += e.data + '\n';
+        logEl.scrollTop = logEl.scrollHeight;
+      };
+      currentSource.addEventListener('end', () => {
+        logEl.textContent += '\n--- job finished ---\n';
+        refreshStatus();
+        currentSource.close();
+      });
+      currentSource.onerror = () => {
+        // EventSource auto-retries; show nothing unless the user is staring at it.
+      };
+    }
+
+    document.querySelectorAll('[data-start]').forEach(b => b.addEventListener('click', () => start(b.dataset.start)));
+    document.querySelectorAll('[data-stop]').forEach(b => b.addEventListener('click', () => stop(b.dataset.stop)));
+    document.getElementById('log-pick').addEventListener('change', e => switchStream(e.target.value));
+    document.getElementById('clear-log').addEventListener('click', () => { document.getElementById('log').textContent = ''; });
+
+    refreshStatus();
+    switchStream(currentKind);
+    setInterval(refreshStatus, 3000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trading - ai-investing</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; }
+    .pill { padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+    .pill-green { background: #064e3b; color: #6ee7b7; }
+    .pill-blue { background: #1e3a8a; color: #93c5fd; }
+    .pill-gray { background: #1f2937; color: #9ca3af; }
+    .pill-red { background: #7f1d1d; color: #fca5a5; }
+    .pill-yellow { background: #78350f; color: #fcd34d; }
+    .btn { padding: 8px 14px; border-radius: 8px; font-weight: 500; font-size: 13px; cursor: pointer; transition: all .15s; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
+    .btn-ghost { background: #1f2937; color: #d1d5db; }
+    .btn-danger { background: #dc2626; color: white; }
+    .log-box { background: #050810; border: 1px solid #1f2937; border-radius: 8px; padding: 12px; max-height: 520px; overflow-y: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; color: #d1d5db; }
+    .nav-link { padding: 6px 12px; border-radius: 6px; color: #9ca3af; text-decoration: none; font-size: 13px; }
+    .nav-link:hover { background: #1f2937; color: #f9fafb; }
+    .nav-active { background: #1f2937; color: #f9fafb; }
+    select, input[type=checkbox] { accent-color: #2563eb; }
+    .select { background: #0b1220; border: 1px solid #1f2937; border-radius: 6px; padding: 8px 10px; color: #f9fafb; font-size: 13px; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="max-w-5xl mx-auto p-6">
+    <nav class="flex items-center gap-1 mb-4 text-sm">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/trading" class="nav-link nav-active">Trading</a>
+      <a href="/models" class="nav-link">Models</a>
+      <a href="/settings" class="nav-link">Settings</a>
+      <a href="/updates" class="nav-link">Updates</a>
+    </nav>
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold">Paper trading loop</h1>
+      <p class="text-sm text-gray-400">Start the continuous paper-trade loop and watch it execute cycles every 15 minutes. Honors the global pause flag from the dashboard.</p>
+    </header>
+
+    <section class="card p-5 mb-4">
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Strategy</label>
+          <select id="strategy" class="select w-full">
+            <option value="ensemble">ensemble (recommended)</option>
+            <option value="mean-reversion">mean-reversion</option>
+            <option value="momentum">momentum</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Mode</label>
+          <label class="flex items-center gap-2 mt-2">
+            <input id="dry-run" type="checkbox" />
+            <span class="text-sm">Dry run (no real orders)</span>
+          </label>
+        </div>
+        <div class="flex gap-2 justify-end">
+          <button id="start-btn" class="btn btn-primary">Start loop</button>
+          <button id="stop-btn" class="btn btn-danger">Stop loop</button>
+        </div>
+      </div>
+      <div class="mt-4 flex items-center gap-3">
+        <span id="status-pill" class="pill pill-gray">idle</span>
+        <span id="status-meta" class="text-xs text-gray-400"></span>
+      </div>
+    </section>
+
+    <section class="card p-5">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium">Live log</div>
+        <button id="clear-log" class="btn btn-ghost">Clear view</button>
+      </div>
+      <div id="log" class="log-box">Click Start loop to begin. Logs will stream here.</div>
+    </section>
+  </div>
+
+  <script>
+    let source = null;
+
+    async function refreshStatus() {
+      const r = await fetch('/api/trading/status');
+      const j = await r.json();
+      const pill = document.getElementById('status-pill');
+      const meta = document.getElementById('status-meta');
+      if (j.running) {
+        pill.textContent = 'running';
+        pill.className = 'pill pill-blue';
+        meta.textContent = `pid ${j.pid} - started ${j.started_at || '?'}`;
+      } else if (j.exit_code === 0) {
+        pill.textContent = 'stopped';
+        pill.className = 'pill pill-gray';
+        meta.textContent = `last finished ${j.finished_at || ''}`;
+      } else if (j.exit_code !== null && j.exit_code !== undefined) {
+        pill.textContent = 'crashed';
+        pill.className = 'pill pill-red';
+        meta.textContent = `exit ${j.exit_code} at ${j.finished_at || ''}`;
+      } else {
+        pill.textContent = 'idle';
+        pill.className = 'pill pill-gray';
+        meta.textContent = 'no loop running yet';
+      }
+    }
+
+    async function start() {
+      const strategy = document.getElementById('strategy').value;
+      const dryRun = document.getElementById('dry-run').checked;
+      if (!dryRun) {
+        if (!confirm('Start LIVE paper-trading? Orders will be submitted to Alpaca paper account.')) return;
+      }
+      const r = await fetch('/api/trading/start', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({strategy, dry_run: dryRun}),
+      });
+      if (!r.ok) { alert('Failed to start trading loop'); return; }
+      attachStream();
+      refreshStatus();
+    }
+
+    async function stop() {
+      if (!confirm('Stop the paper-trade loop?')) return;
+      await fetch('/api/trading/stop', {method: 'POST'});
+      refreshStatus();
+    }
+
+    function attachStream() {
+      const logEl = document.getElementById('log');
+      logEl.textContent = '';
+      if (source) { try { source.close(); } catch (e) {} }
+      source = new EventSource('/api/jobs/paper_loop/stream');
+      source.onmessage = (e) => {
+        logEl.textContent += e.data + '\n';
+        logEl.scrollTop = logEl.scrollHeight;
+      };
+      source.addEventListener('end', () => {
+        logEl.textContent += '\n--- loop stopped ---\n';
+        refreshStatus();
+        source.close();
+      });
+    }
+
+    document.getElementById('start-btn').addEventListener('click', start);
+    document.getElementById('stop-btn').addEventListener('click', stop);
+    document.getElementById('clear-log').addEventListener('click', () => { document.getElementById('log').textContent = ''; });
+
+    refreshStatus();
+    attachStream();
+    setInterval(refreshStatus, 3000);
+  </script>
+</body>
+</html>

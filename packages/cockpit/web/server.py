@@ -34,9 +34,11 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from packages.cockpit import proc as job_mgr
+from packages.cockpit import updater
 from packages.cockpit.state import (
     VALID_OVERRIDES,
     load_state,
@@ -45,11 +47,14 @@ from packages.cockpit.state import (
 )
 from packages.execution.broker import AlpacaPaperBroker, BrokerError, OrderRequest
 from packages.paper.streak import compute_paper_streak
+from packages.shared import conn_checks, secrets
 from packages.shared.dotenv import load_dotenv
 
 # Auto-load .env so the cockpit and any subprocesses it spawns inherit the
 # Alpaca paper keys without the user having to set them manually first.
 load_dotenv()
+# Hydrate any secrets stored in the OS keystore (Windows Credential Manager).
+secrets.hydrate_environment()
 
 log = logging.getLogger("cockpit")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -69,6 +74,19 @@ class OverrideRequest(BaseModel):
     """Manual regime override payload."""
 
     regime: str
+
+
+class SecretsUpdate(BaseModel):
+    """Bulk secrets update payload from the Settings page."""
+
+    values: dict[str, str]
+
+
+class StartTradingRequest(BaseModel):
+    """Start a paper-trade loop."""
+
+    strategy: str = "ensemble"
+    dry_run: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -216,9 +234,34 @@ app = FastAPI(title="ai-investing cockpit", version="0.1.0")
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     """Serve the dashboard shell."""
-    if not INDEX_HTML.exists():
-        return HTMLResponse("<h1>cockpit template missing</h1>", status_code=500)
-    return HTMLResponse(INDEX_HTML.read_text(encoding="utf-8"))
+    return _render("index.html")
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page() -> HTMLResponse:
+    return _render("settings.html")
+
+
+@app.get("/updates", response_class=HTMLResponse)
+def updates_page() -> HTMLResponse:
+    return _render("updates.html")
+
+
+@app.get("/models", response_class=HTMLResponse)
+def models_page() -> HTMLResponse:
+    return _render("models.html")
+
+
+@app.get("/trading", response_class=HTMLResponse)
+def trading_page() -> HTMLResponse:
+    return _render("trading.html")
+
+
+def _render(name: str) -> HTMLResponse:
+    path = Path(__file__).parent / "templates" / name
+    if not path.exists():
+        return HTMLResponse(f"<h1>template missing: {name}</h1>", status_code=500)
+    return HTMLResponse(path.read_text(encoding="utf-8"))
 
 
 @app.get("/api/state")
@@ -406,6 +449,209 @@ async def _flatten_async() -> None:
     finally:
         with contextlib.suppress(Exception):
             await broker.aclose()
+
+
+# --------------------------------------------------------------------------
+# Settings (API keys / secrets)
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/secrets")
+def api_secrets_get() -> dict[str, Any]:
+    """Return per-provider status + masked values for the Settings UI."""
+    return {
+        "backend": secrets.backend(),
+        "providers": secrets.provider_status(),
+    }
+
+
+@app.post("/api/secrets")
+def api_secrets_post(req: SecretsUpdate) -> dict[str, Any]:
+    """Persist secrets. Empty string deletes a key."""
+    secrets.set_secrets(req.values)
+    return {
+        "backend": secrets.backend(),
+        "providers": secrets.provider_status(),
+    }
+
+
+@app.post("/api/secrets/test/{provider}")
+def api_secrets_test(provider: str) -> dict[str, Any]:
+    ok, msg = conn_checks.check_provider(provider)
+    return {"provider": provider, "ok": ok, "message": msg}
+
+
+# --------------------------------------------------------------------------
+# Updates (git pull + reinstall)
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/updates/check")
+def api_updates_check() -> dict[str, Any]:
+    return updater.check_updates()
+
+
+@app.get("/api/updates/current")
+def api_updates_current() -> dict[str, Any]:
+    return updater.current_commit()
+
+
+@app.post("/api/updates/apply")
+def api_updates_apply() -> dict[str, Any]:
+    """Synchronously pull + reinstall. Returns the log + new HEAD.
+
+    Note: the UI typically POSTs and waits up to ~5 min for pip. Page should
+    show a spinner. After this returns ok, the user is expected to click the
+    'Restart cockpit' button to load the new code.
+    """
+    return updater.apply_update()
+
+
+@app.post("/api/updates/restart")
+def api_updates_restart(background_tasks: BackgroundTasks) -> dict[str, Any]:
+    """Schedule a cockpit restart shortly after this request returns."""
+    background_tasks.add_task(_restart_self)
+    return {
+        "ok": True,
+        "message": "Cockpit restarting. This window will reconnect automatically.",
+    }
+
+
+def _restart_self() -> None:
+    """Exec the current Python interpreter with the same argv to reload code."""
+    import time
+
+    time.sleep(1.0)  # give the HTTP response time to flush
+    try:
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+    except Exception:
+        log.exception("restart failed")
+        os._exit(1)
+
+
+# --------------------------------------------------------------------------
+# Models (pretrain / retune)
+# --------------------------------------------------------------------------
+
+
+PRETRAIN_KIND = "pretrain"
+RETUNE_NIGHTLY_KIND = "retune_nightly"
+RETUNE_WEEKLY_KIND = "retune_weekly"
+PAPER_LOOP_KIND = "paper_loop"
+
+_MODEL_KINDS = (PRETRAIN_KIND, RETUNE_NIGHTLY_KIND, RETUNE_WEEKLY_KIND)
+
+
+@app.get("/api/jobs")
+def api_jobs() -> list[dict[str, Any]]:
+    return job_mgr.all_status()
+
+
+@app.get("/api/jobs/{kind}")
+def api_job(kind: str) -> dict[str, Any]:
+    return job_mgr.status(kind).to_dict()
+
+
+@app.get("/api/jobs/{kind}/log")
+def api_job_log(kind: str) -> dict[str, Any]:
+    return {"kind": kind, "tail": job_mgr.tail_log(kind)}
+
+
+@app.get("/api/jobs/{kind}/stream")
+async def api_job_stream(kind: str) -> StreamingResponse:
+    """Server-Sent Events stream of the job's log file as it grows."""
+    return StreamingResponse(_log_stream(kind), media_type="text/event-stream")
+
+
+async def _log_stream(kind: str):
+    """Yield SSE chunks of the log as it appends. Stops 10s after process exits."""
+    path = job_mgr.log_path(kind)
+    # Wait briefly for the file to appear if the job just started.
+    for _ in range(20):
+        if path.exists():
+            break
+        await asyncio.sleep(0.1)
+    if not path.exists():
+        yield "data: (no log yet)\n\n"
+        return
+
+    # Stream existing content first, then tail forever.
+    pos = 0
+    idle_after_exit = 0.0
+    while True:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as f:
+                f.seek(pos)
+                chunk = f.read()
+                pos = f.tell()
+        except OSError:
+            chunk = ""
+        if chunk:
+            for raw_line in chunk.splitlines():
+                yield f"data: {raw_line}\n\n"
+        info = job_mgr.status(kind)
+        if not info.is_running():
+            idle_after_exit += 0.5
+            if idle_after_exit > 10.0:
+                yield "event: end\ndata: done\n\n"
+                return
+        else:
+            idle_after_exit = 0.0
+        await asyncio.sleep(0.5)
+
+
+@app.post("/api/models/pretrain")
+def api_models_pretrain() -> dict[str, Any]:
+    cmd = [_python_exe(), "-m", "packages.data.pretrain"]
+    info = job_mgr.start(PRETRAIN_KIND, cmd)
+    return info.to_dict()
+
+
+@app.post("/api/models/retune-nightly")
+def api_models_retune_nightly() -> dict[str, Any]:
+    # Tolerate the module not yet existing; fall back to a stub command that
+    # writes a friendly message so the UI still streams something.
+    cmd = [_python_exe(), "-m", "packages.data.retune", "--cadence", "nightly"]
+    info = job_mgr.start(RETUNE_NIGHTLY_KIND, cmd)
+    return info.to_dict()
+
+
+@app.post("/api/models/retune-weekly")
+def api_models_retune_weekly() -> dict[str, Any]:
+    cmd = [_python_exe(), "-m", "packages.data.retune", "--cadence", "weekly"]
+    info = job_mgr.start(RETUNE_WEEKLY_KIND, cmd)
+    return info.to_dict()
+
+
+@app.post("/api/models/{kind}/stop")
+def api_models_stop(kind: str) -> dict[str, Any]:
+    if kind not in _MODEL_KINDS:
+        raise HTTPException(status_code=400, detail=f"unknown job kind: {kind}")
+    return job_mgr.stop(kind).to_dict()
+
+
+# --------------------------------------------------------------------------
+# Paper-trade loop control
+# --------------------------------------------------------------------------
+
+
+@app.post("/api/trading/start")
+def api_trading_start(req: StartTradingRequest) -> dict[str, Any]:
+    cmd = [_python_exe(), "tools/paper_trade.py", "--strategy", req.strategy, "--loop"]
+    if req.dry_run:
+        cmd.append("--dry-run")
+    info = job_mgr.start(PAPER_LOOP_KIND, cmd)
+    return info.to_dict()
+
+
+@app.post("/api/trading/stop")
+def api_trading_stop() -> dict[str, Any]:
+    return job_mgr.stop(PAPER_LOOP_KIND).to_dict()
+
+
+@app.get("/api/trading/status")
+def api_trading_status() -> dict[str, Any]:
+    return job_mgr.status(PAPER_LOOP_KIND).to_dict()
 
 
 # --------------------------------------------------------------------------

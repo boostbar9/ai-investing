@@ -45,6 +45,8 @@ dependencies = [
   "alpaca-py>=0.33",
   # Auth
   "pyjwt>=2.9",
+  # Secrets storage (Windows Credential Manager + cross-platform fallback)
+  "keyring>=25.0",
 ]
 
 [project.optional-dependencies]

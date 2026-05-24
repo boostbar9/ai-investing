@@ -534,24 +534,20 @@ async def run(
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--strategy", choices=STRATEGY_CHOICES, default="mean-reversion")
-    ap.add_argument("--dry-run", action="store_true", help="Plan orders but do not submit.")
-    ap.add_argument("--use-sentiment", action="store_true", help="Apply real sentiment overlay.")
-    args = ap.parse_args()
-
+def _one_run(args) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     sentiment_scores = None
     if args.use_sentiment:
-        # Pull live sentiment (best-effort).
         try:
             from tools.fetch_sentiment import fetch_scores  # late import to avoid hard dep
-            sentiment_scores = asyncio.run(fetch_scores(list(set().union(*STRATEGY_UNIVERSE.values()))))
+
+            sentiment_scores = asyncio.run(
+                fetch_scores(list(set().union(*STRATEGY_UNIVERSE.values())))
+            )
             log.info("loaded %d sentiment scores", len(sentiment_scores))
         except Exception as e:
             log.warning("sentiment fetch failed (%s); falling back to neutral", e)
 
-    result = asyncio.run(
+    return asyncio.run(
         run(
             args.strategy,
             dry_run=args.dry_run,
@@ -559,8 +555,53 @@ def main() -> int:
             sentiment_scores=sentiment_scores,
         )
     )
-    print(json.dumps(result, indent=2, default=str))
-    return 0 if not result.get("halted") else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--strategy", choices=STRATEGY_CHOICES, default="mean-reversion")
+    ap.add_argument("--dry-run", action="store_true", help="Plan orders but do not submit.")
+    ap.add_argument("--use-sentiment", action="store_true", help="Apply real sentiment overlay.")
+    ap.add_argument(
+        "--loop",
+        action="store_true",
+        help="Run continuously, sleeping --interval seconds between cycles. Honors cockpit pause flag.",
+    )
+    ap.add_argument(
+        "--interval",
+        type=int,
+        default=900,
+        help="Seconds between cycles in --loop mode (default 900 = 15 minutes).",
+    )
+    args = ap.parse_args()
+
+    if not args.loop:
+        result = _one_run(args)
+        print(json.dumps(result, indent=2, default=str))
+        return 0 if not result.get("halted") else 1
+
+    # Loop mode: run every --interval seconds, log results, honor pause flag.
+    import time
+
+    log.info(
+        "paper-trade loop starting: strategy=%s dry_run=%s interval=%ds",
+        args.strategy,
+        args.dry_run,
+        args.interval,
+    )
+    while True:
+        try:
+            result = _one_run(args)
+            print(json.dumps(result, default=str), flush=True)
+        except KeyboardInterrupt:
+            log.info("loop interrupted, exiting")
+            return 0
+        except Exception:
+            log.exception("cycle failed; sleeping then retrying")
+        try:
+            time.sleep(args.interval)
+        except KeyboardInterrupt:
+            return 0
 
 
 if __name__ == "__main__":

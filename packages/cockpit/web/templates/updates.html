@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Updates - ai-investing</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; }
+    .pill { padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+    .pill-green { background: #064e3b; color: #6ee7b7; }
+    .pill-yellow { background: #78350f; color: #fcd34d; }
+    .pill-gray { background: #1f2937; color: #9ca3af; }
+    .btn { padding: 8px 14px; border-radius: 8px; font-weight: 500; font-size: 13px; cursor: pointer; transition: all .15s; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
+    .btn-ghost { background: #1f2937; color: #d1d5db; }
+    .btn-ghost:hover:not(:disabled) { background: #374151; }
+    .btn-warn { background: #d97706; color: white; }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+    .log-box { background: #050810; border: 1px solid #1f2937; border-radius: 8px; padding: 12px; max-height: 320px; overflow-y: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; color: #d1d5db; }
+    .nav-link { padding: 6px 12px; border-radius: 6px; color: #9ca3af; text-decoration: none; font-size: 13px; }
+    .nav-link:hover { background: #1f2937; color: #f9fafb; }
+    .nav-active { background: #1f2937; color: #f9fafb; }
+    .toast { position: fixed; bottom: 24px; right: 24px; padding: 12px 20px; border-radius: 8px; font-size: 13px; font-weight: 500; z-index: 50; opacity: 0; transform: translateY(8px); transition: all .2s; pointer-events: none; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast-ok { background: #064e3b; color: #6ee7b7; border: 1px solid #065f46; }
+    .toast-err { background: #7f1d1d; color: #fca5a5; border: 1px solid #991b1b; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="max-w-4xl mx-auto p-6">
+    <nav class="flex items-center gap-1 mb-4 text-sm">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/trading" class="nav-link">Trading</a>
+      <a href="/models" class="nav-link">Models</a>
+      <a href="/settings" class="nav-link">Settings</a>
+      <a href="/updates" class="nav-link nav-active">Updates</a>
+    </nav>
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold">Updates</h1>
+      <p class="text-sm text-gray-400">Pull the latest code from GitHub and reinstall packages without leaving the browser.</p>
+    </header>
+
+    <section class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <div class="text-xs text-gray-400 uppercase tracking-wide">Current version</div>
+          <div id="current-commit" class="mono text-lg mt-1">loading...</div>
+        </div>
+        <button id="check-btn" class="btn btn-ghost">Check for updates</button>
+      </div>
+      <div id="current-meta" class="text-xs text-gray-500 mono"></div>
+    </section>
+
+    <section id="update-pane" class="card p-5 mb-4 hidden">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-lg font-medium">
+          <span id="behind-count">0</span> new commit<span id="behind-plural"></span> available
+        </div>
+        <button id="apply-btn" class="btn btn-primary">Update now</button>
+      </div>
+      <div id="commit-list" class="space-y-2"></div>
+    </section>
+
+    <section id="up-to-date" class="card p-5 mb-4 hidden">
+      <div class="flex items-center gap-2">
+        <span class="pill pill-green">up to date</span>
+        <span class="text-sm text-gray-300">No new commits on origin.</span>
+      </div>
+    </section>
+
+    <section id="log-section" class="card p-5 mb-4 hidden">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium">Update log</div>
+        <button id="restart-btn" class="btn btn-warn hidden">Restart cockpit</button>
+      </div>
+      <div id="update-log" class="log-box">waiting...</div>
+    </section>
+
+    <div class="text-xs text-gray-500 mt-6">
+      After a successful update, click Restart cockpit to load the new code.
+      The page will lose connection for a few seconds then reconnect automatically.
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    function toast(msg, ok = true) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.className = 'toast show ' + (ok ? 'toast-ok' : 'toast-err');
+      setTimeout(() => el.classList.remove('show'), 2800);
+    }
+
+    async function loadCurrent() {
+      const r = await fetch('/api/updates/current');
+      const c = await r.json();
+      document.getElementById('current-commit').textContent = `${c.short || '?'}  ${c.subject || ''}`;
+      document.getElementById('current-meta').textContent = `${c.branch || 'main'} - ${c.date || ''}`;
+    }
+
+    async function check() {
+      const btn = document.getElementById('check-btn');
+      btn.disabled = true; btn.textContent = 'checking...';
+      try {
+        const r = await fetch('/api/updates/check');
+        const data = await r.json();
+        if (!data.ok) {
+          toast('Check failed: ' + (data.error || 'unknown'), false);
+          return;
+        }
+        const pane = document.getElementById('update-pane');
+        const uptodate = document.getElementById('up-to-date');
+        if (data.behind === 0) {
+          pane.classList.add('hidden');
+          uptodate.classList.remove('hidden');
+          return;
+        }
+        uptodate.classList.add('hidden');
+        pane.classList.remove('hidden');
+        document.getElementById('behind-count').textContent = data.behind;
+        document.getElementById('behind-plural').textContent = data.behind === 1 ? '' : 's';
+        const list = document.getElementById('commit-list');
+        list.innerHTML = '';
+        for (const c of data.commits) {
+          const row = document.createElement('div');
+          row.className = 'flex gap-3 text-sm border-l-2 border-blue-700 pl-3';
+          row.innerHTML = `
+            <span class="mono text-blue-400 shrink-0">${c.short}</span>
+            <span class="text-gray-200 flex-1">${escapeHtml(c.subject)}</span>
+            <span class="text-xs text-gray-500 shrink-0">${c.author}</span>`;
+          list.appendChild(row);
+        }
+      } finally {
+        btn.disabled = false; btn.textContent = 'Check for updates';
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    }
+
+    async function apply() {
+      if (!confirm('Pull latest code and reinstall dependencies? This usually takes 30-90 seconds.')) return;
+      const btn = document.getElementById('apply-btn');
+      btn.disabled = true; btn.textContent = 'updating...';
+      document.getElementById('log-section').classList.remove('hidden');
+      const logEl = document.getElementById('update-log');
+      logEl.textContent = 'Running git pull and pip install -e ...\nThis may take a couple of minutes.';
+      try {
+        const r = await fetch('/api/updates/apply', {method: 'POST'});
+        const data = await r.json();
+        logEl.textContent = data.log || '(no output)';
+        if (data.ok) {
+          toast('Update applied. Click Restart cockpit to load new code.');
+          document.getElementById('restart-btn').classList.remove('hidden');
+          await loadCurrent();
+        } else {
+          toast('Update failed at: ' + data.step, false);
+        }
+      } catch (e) {
+        logEl.textContent += '\nERROR: ' + e.message;
+        toast('Request failed: ' + e.message, false);
+      } finally {
+        btn.disabled = false; btn.textContent = 'Update now';
+      }
+    }
+
+    async function restart() {
+      if (!confirm('Restart the cockpit now? You will lose connection for ~5 seconds.')) return;
+      const btn = document.getElementById('restart-btn');
+      btn.disabled = true; btn.textContent = 'restarting...';
+      try {
+        await fetch('/api/updates/restart', {method: 'POST'});
+      } catch (e) { /* expected - server is restarting */ }
+      // Poll until the server comes back up.
+      const start = Date.now();
+      const probe = async () => {
+        try {
+          const r = await fetch('/api/updates/current', {cache: 'no-store'});
+          if (r.ok) { location.reload(); return; }
+        } catch (e) {}
+        if (Date.now() - start > 60000) {
+          toast('Restart taking longer than expected. Try reloading manually.', false);
+          btn.disabled = false; btn.textContent = 'Restart cockpit';
+          return;
+        }
+        setTimeout(probe, 1000);
+      };
+      setTimeout(probe, 2000);
+    }
+
+    document.getElementById('check-btn').addEventListener('click', check);
+    document.getElementById('apply-btn').addEventListener('click', apply);
+    document.getElementById('restart-btn').addEventListener('click', restart);
+
+    loadCurrent();
+    check();  // auto-check on page load
+  </script>
+</body>
+</html>
