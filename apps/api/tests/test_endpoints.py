@@ -39,6 +39,7 @@ def test_strategies_catalogue():
         "sector-rotation",
         "mean-reversion",
         "sentiment-overlay",
+        "intraday-trend",
     }
 
 

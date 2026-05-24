@@ -1,5 +1,6 @@
 """Strategy stack (§6)."""
 from .base import Strategy, StrategyMeta  # noqa: F401
+from .intraday_trend import IntradayTrendFollowing
 from .mean_reversion import MeanReversion
 from .sector_rotation import SectorRotation
 from .sentiment_overlay import SentimentOverlay
@@ -12,4 +13,5 @@ def all_strategies() -> dict[str, type[Strategy]]:
         "sector-rotation": SectorRotation,
         "mean-reversion": MeanReversion,
         "sentiment-overlay": SentimentOverlay,
+        "intraday-trend": IntradayTrendFollowing,
     }

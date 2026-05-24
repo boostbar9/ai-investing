@@ -36,11 +36,13 @@ from typing import Any
 
 import pandas as pd
 
+from packages.agents.paper_bridge import advise as agent_advise
 from packages.execution.broker import (
     AlpacaPaperBroker,
     BrokerError,
     OrderRequest,
 )
+from packages.shared.schemas import Position
 from packages.strategies import (
     MeanReversion,
     SectorRotation,
@@ -324,6 +326,57 @@ async def run(
             target = compute_target_weights(strategy_name)
         log.info("target weights for %s: %s", strategy_name, target)
 
+        # ------------------------------------------------------------------
+        # LangGraph advisory pass (Research -> Strategy -> Risk -> Approval).
+        # Runs in advisory mode: never submits orders itself, but can halt
+        # the run via the risk agent or veto specific concentration breaches.
+        # ------------------------------------------------------------------
+        symbols = STRATEGY_UNIVERSE.get(strategy_name, list(target.keys()))
+        agent_positions: list[Position] = []
+        try:
+            for p in await broker.positions():
+                agent_positions.append(
+                    Position(symbol=p.symbol, qty=float(p.qty), avg_price=float(p.avg_price))
+                )
+        except Exception as e:
+            log.warning("could not fetch positions for agent advisory: %s", e)
+
+        agent_result = await agent_advise(
+            symbols=symbols,
+            regime="bull",  # placeholder; regime agent lands later
+            positions=agent_positions,
+            target_weights=target,
+            sentiment_scores=sentiment_scores,
+        )
+        agent_audit = [
+            {"actor": a.actor, "event_type": a.event_type, "payload": a.payload}
+            for a in agent_result.audit
+        ]
+        if agent_result.halted:
+            reason = agent_result.risk.halt_reason or "risk-agent halted"
+            log.warning("AGENT HALT: %s", reason)
+            record = {
+                "ts": started.isoformat(),
+                "strategy": strategy_name,
+                "halted": True,
+                "reasons": [f"agent_halt: {reason}"],
+                "account_equity": equity,
+                "agent_audit": agent_audit,
+                "agent_decision_id": str(agent_result.decision_id),
+                "agent_sentiment": agent_result.research.sentiment,
+            }
+            log_run(record)
+            return record
+
+        # Filter target weights by the symbols the risk agent approved.
+        approved_syms = {s.symbol for s in agent_result.risk.approved}
+        if approved_syms:
+            target = {
+                sym: (w if sym in approved_syms else 0.0)
+                for sym, w in target.items()
+            }
+            log.info("agent-approved symbols: %s", sorted(approved_syms))
+
         planned = await plan_orders(target, broker, equity)
         log.info("planned %d orders", len(planned))
 
@@ -370,6 +423,10 @@ async def run(
             ],
             "orders_submitted": submitted,
             "errors": errors,
+            "agent_decision_id": str(agent_result.decision_id),
+            "agent_sentiment": agent_result.research.sentiment,
+            "agent_thesis": agent_result.research.thesis,
+            "agent_audit": agent_audit,
             "duration_sec": (datetime.now(UTC) - started).total_seconds(),
         }
         log_run(record)

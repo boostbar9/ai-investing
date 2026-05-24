@@ -21,6 +21,8 @@ out/
 
 # ---- Python ----
 __pycache__/
+# Generated paper-trading dashboard (rebuilt from data/paper_log/runs.jsonl)
+docs/paper-dashboard.html
 *.py[cod]
 *$py.class
 *.so
