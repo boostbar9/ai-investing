@@ -93,6 +93,27 @@ PYTHONPATH=. python tools/paper_trade.py --strategy ensemble --dry-run
 PYTHONPATH=. python tools/cockpit.py                      # local web GUI at http://127.0.0.1:8765
 ```
 
+### One-click launch (Windows)
+
+After the initial install, you can start the whole platform with a single
+double-click on `scripts\launch.cmd`. The launcher activates the venv,
+validates `.env`, syncs the latest code from GitHub, and opens the cockpit
+in your browser. To put an icon on your desktop:
+
+```powershell
+.\scripts\install-shortcut.ps1                    # creates 'ai-investing' on Desktop
+.\scripts\install-shortcut.ps1 -WithDocker        # full-stack version (Docker required)
+```
+
+Launcher options:
+
+- `-WithDocker` - also start Postgres, Dragonfly, Temporal, Ollama, Grafana
+- `-NoPull`     - skip the git pull step (offline use)
+- `-Port 9000`  - bind the cockpit to a custom port
+- `-NoBrowser`  - don't auto-open the browser
+
+The equivalent on macOS/Linux is `scripts/launch.sh --with-docker`.
+
 The **cockpit** is a Python-only FastAPI dashboard that runs at
 `http://127.0.0.1:8765` and auto-opens in your browser. It shows live account
 equity, target positions, regime classification, the §16 promotion-gate
