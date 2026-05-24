@@ -129,7 +129,7 @@ def evaluate_window(
     equity = (1.0 + net).cumprod()
 
     if len(equity) < 2:
-        return {"n_days": int(len(equity)), "note": "insufficient bars"}
+        return {"n_days": len(equity), "note": "insufficient bars"}
 
     years = max((equity.index[-1] - equity.index[0]).days / 365.25, 1e-6)
     cagr = float(equity.iloc[-1] ** (1.0 / years) - 1.0)
@@ -141,7 +141,7 @@ def evaluate_window(
     avg_gross = float(exec_w.abs().sum(axis=1).mean())
 
     return {
-        "n_days": int(len(equity)),
+        "n_days": len(equity),
         "sharpe": float(annualized_sharpe(equity)),
         "max_dd": float(-max_drawdown(equity)),  # negative = drawdown
         "cagr": cagr,
@@ -285,7 +285,7 @@ def main() -> None:
         "## Verdicts",
         "",
         f"- **Survival gate**: {verdict}",
-        f"- **§16 v1.0 acceptance**: " + "; ".join(v16_verdict),
+        "- **§16 v1.0 acceptance**: " + "; ".join(v16_verdict),
         "",
         "## Reading this report",
         "",

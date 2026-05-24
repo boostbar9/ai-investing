@@ -214,7 +214,7 @@ class RegimeGatedEnsemble:
             gates = regime_daily.map(
                 lambda r, n=name: self.regime_weights.get(n, r)
             ).astype(float)
-            # Broadcast (T,) × (T, N) along axis 0.
+            # Broadcast (T,) x (T, N) along axis 0.
             combined = combined.add(w.mul(gates, axis=0), fill_value=0.0)
 
         # Crisis hard-halt: any bar tagged crisis goes to flat regardless
@@ -310,7 +310,7 @@ def backtest_ensemble(
     net = gross - cost
     equity = (1.0 + net).cumprod()
     if len(equity) < 2:
-        return {"sharpe": 0.0, "max_dd": 0.0, "cagr": 0.0, "n_days": int(len(equity))}
+        return {"sharpe": 0.0, "max_dd": 0.0, "cagr": 0.0, "n_days": len(equity)}
     from packages.backtests.champion_challenger import (
         annualized_sharpe,
         max_drawdown,

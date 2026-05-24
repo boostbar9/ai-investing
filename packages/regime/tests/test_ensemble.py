@@ -132,7 +132,7 @@ def test_explain_returns_one_row_per_active_strategy_symbol():
         }
     )
     explanation = ensemble.explain(prices, regimes)
-    # 2 strategies × 3 symbols (all non-zero) = 6 rows.
+    # 2 strategies x 3 symbols (all non-zero) = 6 rows.
     assert len(explanation) == 6
     assert set(explanation["strategy"]) == {"trend-following", "mean-reversion"}
     assert set(explanation["symbol"]) == {"SPY", "QQQ", "IWM"}
