@@ -26,6 +26,14 @@
     .nav-active { background: #1f2937; color: #f9fafb; }
     select, input[type=checkbox] { accent-color: #2563eb; }
     .select { background: #0b1220; border: 1px solid #1f2937; border-radius: 6px; padding: 8px 10px; color: #f9fafb; font-size: 13px; }
+    .nav-badge { display: inline-block; margin-left: 4px; padding: 1px 7px; font-size: 10px; font-weight: 700; border-radius: 999px; background: #7f1d1d; color: #fecaca; vertical-align: 1px; }
+    .mode-banner { padding: 14px 18px; border-radius: 12px; margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    .mode-paper { background: linear-gradient(135deg, #064e3b 0%, #065f46 100%); border: 1px solid #10b981; color: #d1fae5; }
+    .mode-live { background: linear-gradient(135deg, #7f1d1d 0%, #991b1b 100%); border: 2px solid #ef4444; color: #fecaca; animation: pulse-live 2.4s ease-in-out infinite; box-shadow: 0 0 0 0 rgba(239,68,68,.5); }
+    @keyframes pulse-live { 0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,.45);} 50% { box-shadow: 0 0 0 12px rgba(239,68,68,0);} }
+    .mode-dot { display:inline-block; width:10px; height:10px; border-radius:999px; margin-right:8px; }
+    .mode-dot-paper { background:#34d399; box-shadow:0 0 8px #34d399; }
+    .mode-dot-live { background:#fca5a5; box-shadow:0 0 10px #ef4444; }
   </style>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
@@ -36,7 +44,20 @@
       <a href="/models" class="nav-link">Models</a>
       <a href="/settings" class="nav-link">Settings</a>
       <a href="/updates" class="nav-link">Updates</a>
+      <a href="/errors" class="nav-link">Errors<span id="nav-err-badge" class="nav-badge" style="display:none">0</span></a>
     </nav>
+
+    <div id="mode-banner" class="mode-banner mode-paper">
+      <div>
+        <div class="text-xs uppercase tracking-wider opacity-80">Current trading mode</div>
+        <div class="text-xl font-bold mt-1"><span class="mode-dot mode-dot-paper" id="mode-dot"></span><span id="mode-label">PAPER MODE</span></div>
+        <div class="text-xs opacity-80 mt-1" id="mode-sub">Orders go to Alpaca paper account ($100k simulated). No real money at risk.</div>
+      </div>
+      <div class="flex flex-col items-end gap-2">
+        <button id="mode-toggle-btn" class="btn btn-ghost">Switch to LIVE mode</button>
+        <span class="text-xs opacity-70" id="mode-keys"></span>
+      </div>
+    </div>
 
     <header class="mb-6">
       <h1 class="text-2xl font-semibold">Paper trading loop</h1>
@@ -145,13 +166,112 @@
       });
     }
 
+    let currentMode = 'paper';
+    let liveKeysPresent = false;
+
+    function applyModeUI(j) {
+      currentMode = j.mode || 'paper';
+      liveKeysPresent = !!j.live_keys_present;
+      const banner = document.getElementById('mode-banner');
+      const label = document.getElementById('mode-label');
+      const sub = document.getElementById('mode-sub');
+      const dot = document.getElementById('mode-dot');
+      const btn = document.getElementById('mode-toggle-btn');
+      const keys = document.getElementById('mode-keys');
+      if (currentMode === 'live') {
+        banner.className = 'mode-banner mode-live';
+        label.textContent = 'LIVE MODE - REAL MONEY';
+        sub.textContent = 'Orders route to your live Alpaca account. The bot is auto-paused; review carefully before resuming.';
+        dot.className = 'mode-dot mode-dot-live';
+        btn.textContent = 'Switch back to PAPER';
+        btn.className = 'btn btn-ghost';
+      } else {
+        banner.className = 'mode-banner mode-paper';
+        label.textContent = 'PAPER MODE';
+        sub.textContent = 'Orders go to Alpaca paper account ($100k simulated). No real money at risk.';
+        dot.className = 'mode-dot mode-dot-paper';
+        btn.textContent = 'Switch to LIVE mode';
+        btn.className = liveKeysPresent ? 'btn btn-danger' : 'btn btn-ghost';
+      }
+      keys.textContent = liveKeysPresent
+        ? 'Live API keys configured.'
+        : 'No live keys yet (add ALPACA_LIVE_KEY_ID / ALPACA_LIVE_SECRET on Settings to enable live).';
+    }
+
+    async function loadMode() {
+      try {
+        const r = await fetch('/api/mode');
+        if (!r.ok) return;
+        const j = await r.json();
+        applyModeUI(j);
+      } catch (e) { /* ignore */ }
+    }
+
+    async function toggleMode() {
+      if (currentMode === 'paper') {
+        if (!liveKeysPresent) {
+          alert('Live Alpaca keys are not configured.\n\nGo to Settings and add ALPACA_LIVE_KEY_ID and ALPACA_LIVE_SECRET first.');
+          return;
+        }
+        const phrase = prompt(
+          'WARNING: Switching to LIVE mode.\n\nReal orders will be submitted to your real Alpaca brokerage account using REAL MONEY.\n\nThe bot will be auto-paused for safety.\n\nType exactly:  I UNDERSTAND  to confirm.'
+        );
+        if (phrase !== 'I UNDERSTAND') {
+          if (phrase !== null) alert('Phrase did not match. Switch cancelled.');
+          return;
+        }
+        const r = await fetch('/api/mode', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({mode: 'live', confirm_live: true}),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          alert('Switch failed: ' + (j.detail || r.status));
+          return;
+        }
+        await loadMode();
+        alert('Switched to LIVE. Bot is paused. Resume from the Dashboard when ready.');
+      } else {
+        if (!confirm('Switch back to PAPER mode? The bot will be paused.')) return;
+        const r = await fetch('/api/mode', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({mode: 'paper', confirm_live: false}),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          alert('Switch failed: ' + (j.detail || r.status));
+          return;
+        }
+        await loadMode();
+      }
+    }
+
+    async function refreshErrBadge() {
+      try {
+        const r = await fetch('/api/errors');
+        if (!r.ok) return;
+        const j = await r.json();
+        const c = j.counts || {};
+        const open = (c.error || 0) + (c.warning || 0);
+        const b = document.getElementById('nav-err-badge');
+        if (open > 0) { b.textContent = String(open); b.style.display = 'inline-block'; }
+        else { b.style.display = 'none'; }
+      } catch (e) {}
+    }
+
+    document.getElementById('mode-toggle-btn').addEventListener('click', toggleMode);
     document.getElementById('start-btn').addEventListener('click', start);
     document.getElementById('stop-btn').addEventListener('click', stop);
     document.getElementById('clear-log').addEventListener('click', () => { document.getElementById('log').textContent = ''; });
 
     refreshStatus();
     attachStream();
+    loadMode();
+    refreshErrBadge();
     setInterval(refreshStatus, 3000);
+    setInterval(refreshErrBadge, 15000);
   </script>
 </body>
 </html>

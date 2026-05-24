@@ -22,6 +22,9 @@ STATE_PATH = Path(os.getenv("COCKPIT_STATE_PATH", "data/cockpit/state.json"))
 RegimeOverride = Literal["bull", "chop", "bear", "crisis", "auto"]
 VALID_OVERRIDES: tuple[RegimeOverride, ...] = ("bull", "chop", "bear", "crisis", "auto")
 
+TradingMode = Literal["paper", "live"]
+VALID_MODES: tuple[TradingMode, ...] = ("paper", "live")
+
 
 @dataclass
 class CockpitState:
@@ -29,6 +32,8 @@ class CockpitState:
 
     paused: bool = False
     regime_override: RegimeOverride = "auto"
+    # 'paper' (Alpaca paper account, safe) or 'live' (real money - gated).
+    trading_mode: TradingMode = "paper"
     # Strategies the user has explicitly paused. Empty means all active.
     paused_strategies: list[str] = field(default_factory=list)
     # Free-form note set on the last action (shown in the GUI).
@@ -47,9 +52,12 @@ def load_state(path: Path = STATE_PATH) -> CockpitState:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return CockpitState()
+    mode_raw = raw.get("trading_mode", "paper")
+    mode: TradingMode = mode_raw if mode_raw in VALID_MODES else "paper"
     return CockpitState(
         paused=bool(raw.get("paused", False)),
         regime_override=raw.get("regime_override", "auto"),
+        trading_mode=mode,
         paused_strategies=list(raw.get("paused_strategies", [])),
         last_action=str(raw.get("last_action", "")),
         last_action_at=str(raw.get("last_action_at", "")),

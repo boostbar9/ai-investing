@@ -37,9 +37,11 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from packages.cockpit import errors as err_log
 from packages.cockpit import proc as job_mgr
 from packages.cockpit import updater
 from packages.cockpit.state import (
+    VALID_MODES,
     VALID_OVERRIDES,
     load_state,
     record_action,
@@ -74,6 +76,13 @@ class OverrideRequest(BaseModel):
     """Manual regime override payload."""
 
     regime: str
+
+
+class ModeRequest(BaseModel):
+    """Trading mode toggle payload."""
+
+    mode: str
+    confirm_live: bool = False
 
 
 class SecretsUpdate(BaseModel):
@@ -255,6 +264,11 @@ def models_page() -> HTMLResponse:
 @app.get("/trading", response_class=HTMLResponse)
 def trading_page() -> HTMLResponse:
     return _render("trading.html")
+
+
+@app.get("/errors", response_class=HTMLResponse)
+def errors_page() -> HTMLResponse:
+    return _render("errors.html")
 
 
 def _render(name: str) -> HTMLResponse:
@@ -655,6 +669,75 @@ def api_trading_status() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Trading mode (paper vs live)
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/mode")
+def api_mode_get() -> dict[str, Any]:
+    state = load_state()
+    return {
+        "mode": state.trading_mode,
+        "live_keys_present": bool(
+            os.getenv("ALPACA_LIVE_KEY_ID") and os.getenv("ALPACA_LIVE_SECRET")
+        ),
+        "paper_keys_present": bool(
+            os.getenv("ALPACA_PAPER_KEY_ID") and os.getenv("ALPACA_PAPER_SECRET")
+        ),
+    }
+
+
+@app.post("/api/mode")
+def api_mode_set(req: ModeRequest) -> dict[str, Any]:
+    if req.mode not in VALID_MODES:
+        raise HTTPException(
+            status_code=400, detail=f"mode must be one of {VALID_MODES}; got {req.mode!r}"
+        )
+    if req.mode == "live":
+        if not req.confirm_live:
+            raise HTTPException(
+                status_code=400,
+                detail="Switching to live requires confirm_live=true. Real money will be at risk.",
+            )
+        if not (os.getenv("ALPACA_LIVE_KEY_ID") and os.getenv("ALPACA_LIVE_SECRET")):
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot switch to live: ALPACA_LIVE_KEY_ID / ALPACA_LIVE_SECRET are not configured. Add them on the Settings page first.",
+            )
+    state = load_state()
+    state.trading_mode = req.mode  # type: ignore[assignment]
+    # Switching mode pauses the bot defensively so the user can review.
+    state.paused = True
+    state = record_action(state, f"Trading mode -> {req.mode} (bot auto-paused)")
+    save_state(state)
+    return {"mode": state.trading_mode, "paused": state.paused}
+
+
+# --------------------------------------------------------------------------
+# Errors log
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/errors")
+def api_errors_list(limit: int = 200, severity: str | None = None) -> dict[str, Any]:
+    return {
+        "counts": err_log.count_unresolved(),
+        "entries": err_log.list_errors(limit=limit, severity=severity),
+    }
+
+
+@app.get("/api/errors/markdown")
+def api_errors_markdown(limit: int = 50) -> dict[str, Any]:
+    return {"markdown": err_log.to_markdown(limit=limit)}
+
+
+@app.post("/api/errors/clear")
+def api_errors_clear() -> dict[str, Any]:
+    n = err_log.clear()
+    return {"cleared": n}
+
+
+# --------------------------------------------------------------------------
 # Error handlers
 # --------------------------------------------------------------------------
 
@@ -662,6 +745,13 @@ def api_trading_status() -> dict[str, Any]:
 @app.exception_handler(Exception)
 async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
     log.exception("unhandled error on %s", request.url.path)
+    with contextlib.suppress(Exception):
+        err_log.record_exception(
+            source="cockpit.api",
+            exc=exc,
+            path=str(request.url.path),
+            method=request.method,
+        )
     return JSONResponse(
         status_code=500,
         content={"error": str(exc) or exc.__class__.__name__},

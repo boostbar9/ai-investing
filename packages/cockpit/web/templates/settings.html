@@ -39,6 +39,7 @@
       <a href="/models" class="nav-link">Models</a>
       <a href="/settings" class="nav-link nav-active">Settings</a>
       <a href="/updates" class="nav-link">Updates</a>
+      <a href="/errors" class="nav-link">Errors<span id="nav-err-badge" style="display:none;margin-left:4px;padding:1px 7px;font-size:10px;font-weight:700;border-radius:999px;background:#7f1d1d;color:#fecaca;vertical-align:1px;">0</span></a>
     </nav>
 
     <header class="flex items-center justify-between mb-6">
@@ -190,6 +191,26 @@
     }
 
     load();
+  
+    // --- error badge sync ---
+    (function() {
+      async function _syncErrBadge() {
+        try {
+          const r = await fetch('/api/errors');
+          if (!r.ok) return;
+          const j = await r.json();
+          const c = j.counts || {};
+          const open = (c.error || 0) + (c.warning || 0);
+          const b = document.getElementById('nav-err-badge');
+          if (!b) return;
+          if (open > 0) { b.textContent = String(open); b.style.display = 'inline-block'; }
+          else { b.style.display = 'none'; }
+        } catch (e) {}
+      }
+      _syncErrBadge();
+      setInterval(_syncErrBadge, 15000);
+    })();
+
   </script>
 </body>
 </html>

@@ -189,6 +189,25 @@ def _watch(kind: str) -> None:
             info.exit_code = rc
             info.finished_at = datetime.now(UTC).isoformat(timespec="seconds")
         _persist()
+    # Surface failures to the cockpit error log. Import lazily to avoid a
+    # circular import at module load (errors module is tiny but independent).
+    if rc not in (0, None):
+        try:
+            from packages.cockpit import errors as err_log
+
+            log_file = str(LOG_DIR / f"{kind}.log")
+            tail = ""
+            with contextlib.suppress(OSError):
+                tail = (LOG_DIR / f"{kind}.log").read_text(encoding="utf-8", errors="replace")[-2000:]
+            err_log.record_error(
+                source=f"job.{kind}",
+                message=f"{kind} exited with code {rc}",
+                severity="error",
+                detail=tail or None,
+                context={"exit_code": rc, "log_file": log_file},
+            )
+        except Exception:
+            pass
 
 
 def stop(kind: str, timeout: float = 5.0) -> JobInfo:
