@@ -1121,3 +1121,82 @@ def test_favicon_returns_no_content_when_file_missing(client: TestClient) -> Non
     r = client.get("/favicon.ico")
     assert r.status_code == 204
     assert r.content == b""
+
+
+# ---------------------------------------------------------------------------
+# /health page + /api/health/full + /api/health/fix
+# ---------------------------------------------------------------------------
+
+
+def test_health_page_renders(client: TestClient) -> None:
+    """The Health UI page must render successfully so the user has a
+    one-click entry point for diagnostics and Fix-It actions."""
+    r = client.get("/health")
+    assert r.status_code == 200
+    html = r.text
+    assert "Health" in html
+    # The page polls /api/health/full -- guard against accidental refactors
+    # that would silently break the dashboard.
+    assert "/api/health/full" in html
+
+
+def test_api_health_full_shape(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``/api/health/full`` proxies :func:`diagnostics.summary` 1:1.
+
+    We stub ``summary`` so the test stays fast and platform-independent.
+    """
+    from packages.cockpit import diagnostics as diag
+
+    monkeypatch.setattr(
+        diag,
+        "summary",
+        lambda: {
+            "status": "ok",
+            "counts": {"ok": 7, "warn": 0, "error": 0, "info": 0},
+            "checks": [],
+            "now": "2026-05-24T00:00:00+00:00",
+        },
+    )
+    r = client.get("/api/health/full")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["counts"]["ok"] == 7
+    assert "checks" in body
+    assert "now" in body
+
+
+def test_api_health_fix_dispatches(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``POST /api/health/fix/{name}`` returns the auto-heal result.
+
+    The route is a thin pass-through: we just verify the dispatch reaches
+    :func:`diagnostics.auto_heal` with the right check name.
+    """
+    from packages.cockpit import diagnostics as diag
+
+    seen: list[str] = []
+
+    def _fake_heal(name: str) -> dict[str, object]:
+        seen.append(name)
+        return {"ok": True, "message": f"healed {name}"}
+
+    monkeypatch.setattr(diag, "auto_heal", _fake_heal)
+    r = client.post("/api/health/fix/orphan_pythons")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["message"] == "healed orphan_pythons"
+    assert seen == ["orphan_pythons"]
+
+
+def test_api_health_fix_unknown_name(client: TestClient) -> None:
+    """Unknown check names return ``ok=False`` rather than a server error.
+
+    The Health page surfaces this as a red toast so the operator sees an
+    actionable message instead of a stack trace.
+    """
+    r = client.post("/api/health/fix/this_is_not_a_check")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "this_is_not_a_check" in body["message"]

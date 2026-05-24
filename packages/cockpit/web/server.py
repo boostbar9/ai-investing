@@ -37,9 +37,9 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+from packages.cockpit import diagnostics, updater
 from packages.cockpit import errors as err_log
 from packages.cockpit import proc as job_mgr
-from packages.cockpit import updater
 from packages.cockpit.state import (
     VALID_MODES,
     VALID_OVERRIDES,
@@ -356,6 +356,11 @@ def agents_page() -> HTMLResponse:
     return _render("agents.html")
 
 
+@app.get("/health", response_class=HTMLResponse)
+def health_page() -> HTMLResponse:
+    return _render("health.html")
+
+
 def _render(name: str) -> HTMLResponse:
     path = Path(__file__).parent / "templates" / name
     if not path.exists():
@@ -411,6 +416,28 @@ def api_health() -> dict[str, Any]:
         "jobs": job_states,
         "commit": commit,
     }
+
+
+@app.get("/api/health/full")
+def api_health_full() -> dict[str, Any]:
+    """Comprehensive diagnostics for the /health UI page.
+
+    Runs every check in :mod:`packages.cockpit.diagnostics` and returns a
+    rollup with per-check status, remediation commands, and which checks
+    are auto-fixable from the Health page.
+    """
+    return diagnostics.summary()
+
+
+@app.post("/api/health/fix/{name}")
+def api_health_fix(name: str) -> dict[str, Any]:
+    """Run the auto-heal action for a single diagnostic check.
+
+    The Health page exposes a "Fix it" button for any check whose
+    ``auto_fixable`` flag is true. This endpoint dispatches that action
+    and returns a plain ``{ok, message}`` payload for the toast UI.
+    """
+    return diagnostics.auto_heal(name)
 
 
 @app.get("/api/state")

@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Health - ai-investing</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/cockpit.css" />
+  <script src="/static/cockpit.js" defer></script>
+  <style>
+    .health-row { border: 1px solid #1f2937; border-radius: 10px; padding: 14px 16px; background: #0b1220; transition: border-color .15s; }
+    .health-row:hover { border-color: #374151; }
+    .health-row.sev-ok    { border-left: 4px solid #22c55e; }
+    .health-row.sev-warn  { border-left: 4px solid #f59e0b; }
+    .health-row.sev-error { border-left: 4px solid #ef4444; }
+    .health-row.sev-info  { border-left: 4px solid #6b7280; }
+    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 999px; margin-right: 8px; flex-shrink: 0; }
+    .dot.ok    { background: #22c55e; box-shadow: 0 0 8px #22c55e80; }
+    .dot.warn  { background: #f59e0b; box-shadow: 0 0 8px #f59e0b80; }
+    .dot.error { background: #ef4444; box-shadow: 0 0 8px #ef444480; }
+    .dot.info  { background: #6b7280; }
+    .cmd { background: #050810; border: 1px solid #1f2937; border-radius: 6px; padding: 8px 10px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; color: #d1d5db; white-space: pre-wrap; overflow-x: auto; }
+    .summary-tile { background: #0b1220; border: 1px solid #1f2937; border-radius: 10px; padding: 14px 18px; text-align: center; }
+    .summary-tile .n { font-size: 28px; font-weight: 600; }
+    .empty-state { background: #0b1220; border: 1px dashed #1f2937; border-radius: 12px; padding: 48px 24px; text-align: center; }
+    button[disabled] { opacity: 0.5; cursor: not-allowed; }
+    .toast { position: fixed; bottom: 20px; right: 20px; background: #0b1220; border: 1px solid #1f2937; border-left: 4px solid #22c55e; padding: 12px 16px; border-radius: 8px; font-size: 13px; max-width: 360px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); z-index: 50; }
+    .toast.error { border-left-color: #ef4444; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="topbar"><div class="topbar-inner">
+    <a href="/" class="topbar-brand">
+      <span id="cockpit-conn-dot" class="topbar-brand-dot idle"></span>
+      <span>ai-investing</span>
+    </a>
+    <div id="cockpit-topbar"></div>
+  </div></div>
+
+  <div class="max-w-5xl mx-auto p-6">
+    <nav class="nav flex items-center gap-1 mb-4 text-sm">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/trading" class="nav-link">Trading</a>
+      <a href="/agents" class="nav-link">Agents</a>
+      <a href="/models" class="nav-link">Models</a>
+      <a href="/settings" class="nav-link">Settings</a>
+      <a href="/updates" class="nav-link">Updates</a>
+      <a href="/health" class="nav-link nav-active">Health</a>
+      <a href="/errors" class="nav-link">Errors<span id="nav-err-badge" class="nav-badge" data-err-badge style="display:none">0</span></a>
+    </nav>
+
+    <header class="flex items-center justify-between mb-5 flex-wrap gap-3">
+      <div>
+        <h1 class="text-2xl font-semibold tracking-tight">System health</h1>
+        <p class="text-sm text-gray-400">Plain-English status with one-click fixes for the boring stuff.</p>
+      </div>
+      <div class="flex gap-2">
+        <button id="run-all-btn" class="btn btn-primary">Run all auto-fixes</button>
+        <button id="refresh-btn" class="btn btn-ghost">Refresh</button>
+      </div>
+    </header>
+
+    <!-- Summary tiles -->
+    <section id="summary" class="grid grid-cols-4 gap-3 mb-5">
+      <div class="summary-tile"><div class="n text-green-400" id="sum-ok">-</div><div class="text-xs text-gray-500 uppercase">OK</div></div>
+      <div class="summary-tile"><div class="n text-yellow-400" id="sum-warn">-</div><div class="text-xs text-gray-500 uppercase">Warnings</div></div>
+      <div class="summary-tile"><div class="n text-red-400" id="sum-error">-</div><div class="text-xs text-gray-500 uppercase">Errors</div></div>
+      <div class="summary-tile"><div class="n text-gray-400" id="sum-info">-</div><div class="text-xs text-gray-500 uppercase">Info</div></div>
+    </section>
+
+    <!-- Check rows -->
+    <section id="checks" class="flex flex-col gap-3">
+      <div class="empty-state text-gray-500">Loading checks…</div>
+    </section>
+
+    <p class="text-xs text-gray-500 mt-6">
+      Auto-fix actions are conservative: the cockpit only kills processes it
+      can prove belong to this repo, only starts services that are already
+      installed, and never edits your <code>.env</code> file. For anything else
+      you get a copy-pasteable command.
+    </p>
+  </div>
+
+  <div id="toast-container"></div>
+
+  <script>
+    (function () {
+      const checksEl = document.getElementById("checks");
+      const refreshBtn = document.getElementById("refresh-btn");
+      const runAllBtn = document.getElementById("run-all-btn");
+
+      function toast(msg, kind) {
+        const t = document.createElement("div");
+        t.className = "toast" + (kind === "error" ? " error" : "");
+        t.textContent = msg;
+        document.body.appendChild(t);
+        setTimeout(function () { t.remove(); }, 5000);
+      }
+
+      function statusLabel(s) {
+        return { ok: "Healthy", warn: "Needs attention", error: "Action required", info: "Info" }[s] || s;
+      }
+
+      function renderCheck(c) {
+        const div = document.createElement("div");
+        div.className = "health-row sev-" + c.status;
+        const title = document.createElement("div");
+        title.className = "flex items-center justify-between gap-3 flex-wrap";
+        title.innerHTML =
+          '<div class="flex items-center min-w-0">' +
+            '<span class="dot ' + c.status + '"></span>' +
+            '<span class="font-medium">' + escapeHtml(c.title) + '</span>' +
+            '<span class="ml-3 text-xs text-gray-500 uppercase tracking-wide">' + statusLabel(c.status) + '</span>' +
+          '</div>';
+        const actions = document.createElement("div");
+        actions.className = "flex gap-2 items-center";
+        if (c.auto_fixable) {
+          const btn = document.createElement("button");
+          btn.className = "btn btn-primary btn-sm";
+          btn.textContent = "Fix it";
+          btn.onclick = function () { applyFix(c.name, btn); };
+          actions.appendChild(btn);
+        }
+        title.appendChild(actions);
+        div.appendChild(title);
+
+        const msg = document.createElement("p");
+        msg.className = "text-sm text-gray-300 mt-2";
+        msg.textContent = c.message;
+        div.appendChild(msg);
+
+        if (c.fix_command) {
+          const cmdWrap = document.createElement("div");
+          cmdWrap.className = "mt-3";
+          cmdWrap.innerHTML =
+            '<div class="text-xs uppercase tracking-wide text-gray-500 mb-1">Run this command:</div>' +
+            '<div class="cmd" id="cmd-' + c.name + '">' + escapeHtml(c.fix_command) + '</div>' +
+            '<button class="btn btn-ghost btn-sm mt-2" data-copy="' + c.name + '">Copy command</button>';
+          div.appendChild(cmdWrap);
+        }
+
+        if (c.detail && Object.keys(c.detail).length) {
+          const det = document.createElement("details");
+          det.className = "mt-3";
+          det.innerHTML =
+            '<summary class="text-xs text-gray-500">Details</summary>' +
+            '<pre class="cmd mt-2">' + escapeHtml(JSON.stringify(c.detail, null, 2)) + '</pre>';
+          div.appendChild(det);
+        }
+        return div;
+      }
+
+      function escapeHtml(s) {
+        return String(s == null ? "" : s)
+          .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+      }
+
+      async function loadHealth() {
+        checksEl.innerHTML = '<div class="empty-state text-gray-500">Loading checks…</div>';
+        try {
+          const j = await Cockpit.api.get("/api/health/full");
+          document.getElementById("sum-ok").textContent = j.counts.ok;
+          document.getElementById("sum-warn").textContent = j.counts.warn;
+          document.getElementById("sum-error").textContent = j.counts.error;
+          document.getElementById("sum-info").textContent = j.counts.info;
+          checksEl.innerHTML = "";
+          if (!j.checks.length) {
+            checksEl.innerHTML = '<div class="empty-state text-gray-500">No checks reported.</div>';
+            return;
+          }
+          j.checks.forEach(function (c) { checksEl.appendChild(renderCheck(c)); });
+          checksEl.querySelectorAll("[data-copy]").forEach(function (btn) {
+            btn.onclick = function () {
+              const name = btn.getAttribute("data-copy");
+              const text = document.getElementById("cmd-" + name).textContent;
+              navigator.clipboard.writeText(text).then(function () { toast("Command copied."); });
+            };
+          });
+        } catch (e) {
+          checksEl.innerHTML = '<div class="empty-state text-red-400">Failed to load: ' + escapeHtml(e.message) + '</div>';
+        }
+      }
+
+      async function applyFix(name, btn) {
+        const original = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "Fixing…";
+        try {
+          const res = await Cockpit.api.post("/api/health/fix/" + encodeURIComponent(name), {});
+          toast(res.message, res.ok ? "ok" : "error");
+        } catch (e) {
+          toast(e.message || "Auto-fix failed.", "error");
+        } finally {
+          btn.disabled = false;
+          btn.textContent = original;
+          loadHealth();
+        }
+      }
+
+      async function runAllFixes() {
+        runAllBtn.disabled = true;
+        runAllBtn.textContent = "Running…";
+        try {
+          const j = await Cockpit.api.get("/api/health/full");
+          const fixable = j.checks.filter(function (c) { return c.auto_fixable && c.status !== "ok"; });
+          if (!fixable.length) { toast("Nothing to fix."); return; }
+          for (const c of fixable) {
+            try {
+              const r = await Cockpit.api.post("/api/health/fix/" + encodeURIComponent(c.name), {});
+              toast(c.title + ": " + r.message, r.ok ? "ok" : "error");
+            } catch (e) {
+              toast(c.title + ": " + (e.message || "failed"), "error");
+            }
+          }
+        } finally {
+          runAllBtn.disabled = false;
+          runAllBtn.textContent = "Run all auto-fixes";
+          loadHealth();
+        }
+      }
+
+      refreshBtn.onclick = loadHealth;
+      runAllBtn.onclick = runAllFixes;
+      loadHealth();
+      // Auto-refresh every 30s so a yellow row doesn't go stale.
+      setInterval(loadHealth, 30000);
+    })();
+  </script>
+</body>
+</html>
