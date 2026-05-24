@@ -765,10 +765,15 @@ def test_attribute_endpoint_no_price_fetcher_appends_zero(
     fake_scorecard_log: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without Alpaca credentials the endpoint must still 200 with 0 rows
-    appended (price fetcher returns None for every symbol)."""
-    monkeypatch.delenv("ALPACA_KEY_ID", raising=False)
-    monkeypatch.delenv("ALPACA_SECRET", raising=False)
+    """With an empty price chain the endpoint must still 200 with 0 rows
+    appended (every symbol misses, so no scorecard row is written)."""
+    from packages.agents import price_chain as pc
+
+    monkeypatch.delenv("ALPACA_PAPER_KEY_ID", raising=False)
+    monkeypatch.delenv("ALPACA_PAPER_SECRET", raising=False)
+    monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+    # Replace the default chain so the test never hits the network.
+    monkeypatch.setattr(pc, "build_default_chain", lambda: pc.PriceChain())
 
     matured_ts = "2024-01-15T00:00:00+00:00"
     row = {
@@ -787,6 +792,51 @@ def test_attribute_endpoint_no_price_fetcher_appends_zero(
     data = r.json()
     assert data["appended"] == 0
     assert "scorecard_path" in data
+    assert "price_chain" in data
+    assert data["price_chain"]["providers"] == []
+
+
+def test_attribute_endpoint_uses_price_chain_and_reports_providers(
+    client: TestClient,
+    fake_agent_log: Path,
+    fake_scorecard_log: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-empty chain feeds attribution and surfaces per-provider stats.
+
+    Stubs the chain so we exercise the wiring without touching the network.
+    A successful attribution writes one scorecard row and the response
+    reports at least one provider hit.
+    """
+    from packages.agents import price_chain as pc
+
+    def _fake_chain() -> pc.PriceChain:
+        c = pc.PriceChain()
+        c.add("stub", lambda symbol, ts: 100.0 + (1 if symbol == "SPY" else 0))
+        return c
+
+    monkeypatch.setattr(pc, "build_default_chain", _fake_chain)
+
+    matured_ts = "2024-01-15T00:00:00+00:00"
+    row = {
+        "decision_id": "matured-1",
+        "ts": matured_ts,
+        "regime": "bull",
+        "used_llm": True,
+        "agents": {"strategy": {"signals": [
+            {"symbol": "SPY", "side": "buy", "strength": 0.5},
+        ]}},
+    }
+    fake_agent_log.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    r = client.post("/api/agents/attribute")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["appended"] == 1
+    pchain = data["price_chain"]
+    assert pchain["providers"] == ["stub"]
+    # At least one direct hit; cache hits are fine for the rest.
+    assert pchain["stats"].get("stub", 0) >= 1
 
 
 def test_promotion_candidates_endpoint_empty_log(

@@ -1527,51 +1527,26 @@ def api_agents_attribute(force: bool = False) -> dict[str, Any]:
         DEFAULT_HORIZONS_DAYS,
         run_attribution,
     )
+    from packages.agents.price_chain import build_default_chain, provider_summary
 
-    # Build a price fetcher. Try Alpaca first; if not configured, return a
-    # callable that always returns None so attribution is a no-op (the
-    # scorecard simply won't grow until the operator wires credentials).
-    def _no_price(_symbol: str, _ts: Any) -> float | None:
-        return None
-
-    get_close = _no_price
-    try:
-        from packages.data.adapters.alpaca_data import AlpacaDataAdapter
-
-        adapter = AlpacaDataAdapter()
-        if adapter.is_configured():
-            import asyncio
-            from datetime import timedelta
-
-            # Sync wrapper around the async bar fetcher — attribution is a
-            # batch job, not an inner-loop call.
-            def _close_via_alpaca(symbol: str, ts: Any) -> float | None:
-                start = (ts - timedelta(days=1)).isoformat()
-                end = (ts + timedelta(days=1)).isoformat()
-                try:
-                    bars = asyncio.run(adapter.get_bars(symbol, start, end))
-                except Exception:
-                    return None
-                if not bars:
-                    return None
-                # Pick the first bar at or after ts.
-                for b in bars:
-                    if b.ts >= ts:
-                        return float(b.close)
-                return float(bars[-1].close)
-
-            get_close = _close_via_alpaca
-    except ImportError:
-        pass
+    # Build the multi-provider chain. yfinance is always present, so the
+    # chain is never empty — paper attribution can run end-to-end on a
+    # fresh box with zero env config. Alpaca/Polygon get tried first when
+    # configured so we lean on the rate-limit-friendly paid sources.
+    chain = build_default_chain()
 
     n = run_attribution(
         AGENT_LOG,
         SCORECARD_LOG,
-        get_close,
+        chain.get_close,
         horizons_days=DEFAULT_HORIZONS_DAYS,
         now=None if not force else datetime.now(UTC).replace(year=datetime.now(UTC).year + 10),
     )
-    return {"appended": n, "scorecard_path": str(SCORECARD_LOG)}
+    return {
+        "appended": n,
+        "scorecard_path": str(SCORECARD_LOG),
+        "price_chain": provider_summary(chain),
+    }
 
 
 @app.get("/api/agents/promotion_candidates")
