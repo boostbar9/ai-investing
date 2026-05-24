@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from packages.cockpit import errors as err_log
@@ -301,6 +301,23 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 _STATIC_DIR = Path(__file__).parent / "static"
 if _STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> Response:
+    """Return 204 so browsers stop logging 404s for the missing favicon.
+
+    If a real ``favicon.ico`` ever ships under ``static/``, FastAPI's static
+    mount serves it directly and this route is a no-op fallback. Today we
+    just want a clean log on startup.
+    """
+    favicon_path = _STATIC_DIR / "favicon.ico"
+    if favicon_path.exists():
+        return Response(
+            content=favicon_path.read_bytes(),
+            media_type="image/x-icon",
+        )
+    return Response(status_code=204)
 
 
 @app.get("/", response_class=HTMLResponse)

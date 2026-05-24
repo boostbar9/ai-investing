@@ -175,6 +175,64 @@ def start(kind: str, command: list[str], cwd: Path | None = None) -> JobInfo:
         return info
 
 
+# Windows NT status codes we care about. The list is intentionally short — we
+# only translate codes the operator is likely to actually see when a helper
+# script crashes on startup (DLL load fail, AV/permission, Ctrl+C, stack
+# corruption). Everything else falls through to the raw integer so we never
+# hide an unknown failure.
+_WINDOWS_NT_STATUS: dict[int, tuple[str, str]] = {
+    3221225477: (
+        "STATUS_ACCESS_VIOLATION",
+        "the process tried to read or write protected memory — usually a native crash or a corrupted install",
+    ),
+    3221225725: (
+        "STATUS_STACK_OVERFLOW",
+        "the process ran out of stack space — usually unbounded recursion in a helper script",
+    ),
+    3221225786: (
+        "STATUS_CONTROL_C_EXIT",
+        "the process was interrupted with Ctrl+C from the console",
+    ),
+    3221225794: (
+        "STATUS_DLL_INIT_FAILED",
+        "a required DLL failed to initialize — usually a missing VC++ runtime, a broken Ollama install, "
+        "or antivirus quarantine of a binary; try reinstalling Ollama or whitelisting it in your AV",
+    ),
+    3221226505: (
+        "STATUS_STACK_BUFFER_OVERRUN",
+        "the process tripped Windows stack-protection — usually a native bug or a corrupted binary",
+    ),
+    3221225547: (
+        "STATUS_DLL_NOT_FOUND",
+        "a required DLL is missing — usually a missing VC++ runtime or a broken install",
+    ),
+}
+
+
+def exit_hint(rc: int | None) -> dict[str, str]:
+    """Return a hint dict for ``rc`` suitable for an error log ``context``.
+
+    Empty when we have no special interpretation, which lets callers merge
+    it into other context without conditional logic.
+    """
+    if rc is None or rc not in _WINDOWS_NT_STATUS:
+        return {}
+    name, explanation = _WINDOWS_NT_STATUS[rc]
+    return {"exit_status_name": name, "exit_status_hint": explanation}
+
+
+def describe_exit(kind: str, rc: int | None) -> str:
+    """Friendly one-line description of a job exit code.
+
+    Falls back to the bare ``exited with code N`` message if we don't know
+    the code, so operators always see *something* useful.
+    """
+    if rc in _WINDOWS_NT_STATUS:
+        name, explanation = _WINDOWS_NT_STATUS[rc]
+        return f"{kind} exited with code {rc} ({name}: {explanation})"
+    return f"{kind} exited with code {rc}"
+
+
 def _watch(kind: str) -> None:
     proc = _procs.get(kind)
     if proc is None:
@@ -201,10 +259,10 @@ def _watch(kind: str) -> None:
                 tail = (LOG_DIR / f"{kind}.log").read_text(encoding="utf-8", errors="replace")[-2000:]
             err_log.record_error(
                 source=f"job.{kind}",
-                message=f"{kind} exited with code {rc}",
+                message=describe_exit(kind, rc),
                 severity="error",
                 detail=tail or None,
-                context={"exit_code": rc, "log_file": log_file},
+                context={"exit_code": rc, "log_file": log_file, **exit_hint(rc)},
             )
         except Exception:
             pass

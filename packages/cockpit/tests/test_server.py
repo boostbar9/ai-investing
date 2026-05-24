@@ -1112,3 +1112,12 @@ def test_errors_page_includes_share_snapshot_card(snapshot_client: TestClient) -
     assert 'id="snap-preview-btn"' in html
     assert 'id="snap-save-btn"' in html
     assert "/api/health-snapshot" in html
+
+
+def test_favicon_returns_no_content_when_file_missing(client: TestClient) -> None:
+    """Without a favicon.ico on disk we return 204 — not 404 — so the
+    browser stops logging warnings on every page load. The exact status
+    matters because some browsers will keep retrying on 404."""
+    r = client.get("/favicon.ico")
+    assert r.status_code == 204
+    assert r.content == b""
