@@ -38,12 +38,22 @@ log = logging.getLogger("pretrain")
 # Recommended starter universe: SPY + sector ETFs + top 20 megacaps.
 # Tracks the §6 strategy universe; tweak via ``PRETRAIN_UNIVERSE`` env var.
 DEFAULT_UNIVERSE = (
-    # Index + sector ETFs
-    "SPY", "QQQ", "IWM", "DIA",
+    # Broad index + size-style ETFs (all have 2003+ history)
+    "SPY", "QQQ", "IWM", "DIA", "MDY", "VTI",
+    # Sector SPDRs (all 1998-2018 inception; XLRE 2015, XLC 2018)
     "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU", "XLRE", "XLC",
+    # International / regional (long history, gives non-US correlation)
+    "EFA", "EEM", "EWJ", "FXI", "VWO",
+    # Factor / style ETFs (momentum, value, quality, low-vol)
+    "MTUM", "VLUE", "QUAL", "USMV", "IWF", "IWD",
+    # Bonds / safe haven (for crisis behaviour)
+    "TLT", "IEF", "SHY", "HYG", "LQD", "GLD",
     # Megacaps
     "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "BRK-B",
     "JPM", "V", "MA", "UNH", "JNJ", "PG", "HD", "XOM", "CVX", "WMT", "LLY",
+    # Additional large-caps for breadth and diversification
+    "COST", "ABBV", "PEP", "KO", "MRK", "BAC", "ORCL", "CRM", "NFLX", "AMD",
+    "DIS", "INTC", "CSCO", "PFE", "WFC", "GS", "BLK", "CAT", "HON", "BA",
 )
 
 DEFAULT_MACRO_SERIES = (

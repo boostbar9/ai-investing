@@ -1,0 +1,254 @@
+{
+  "generated_at": "2026-05-24T01:09:05.925321+00:00",
+  "panel": {
+    "shape": [
+      5032,
+      13
+    ],
+    "start": "2006-05-23",
+    "end": "2026-05-22",
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "DIA",
+      "XLK",
+      "XLF",
+      "XLE",
+      "XLV",
+      "XLY",
+      "XLP",
+      "XLI",
+      "XLB",
+      "XLU"
+    ]
+  },
+  "windows": [
+    {
+      "name": "2008-gfc",
+      "start": "2008-01-02",
+      "end": "2009-06-30",
+      "description": "Global Financial Crisis: Lehman, TARP, March 2009 low"
+    },
+    {
+      "name": "2015-china",
+      "start": "2015-06-01",
+      "end": "2016-02-29",
+      "description": "China devaluation, Aug 2015 flash, Q1 2016 oil bottom"
+    },
+    {
+      "name": "2018-q4",
+      "start": "2018-01-01",
+      "end": "2018-12-31",
+      "description": "Vol-mageddon (Feb), Q4 rate-hike sell-off"
+    },
+    {
+      "name": "2020-covid",
+      "start": "2020-01-02",
+      "end": "2020-12-31",
+      "description": "COVID crash (Feb-Mar) + record rebound"
+    },
+    {
+      "name": "2022-rates",
+      "start": "2022-01-03",
+      "end": "2023-06-30",
+      "description": "Fed hiking cycle: bond + tech bear"
+    }
+  ],
+  "rows": [
+    {
+      "strategy": "trend-following",
+      "window": "2008-gfc",
+      "window_start": "2008-01-02",
+      "window_end": "2009-06-30",
+      "n_days": 376,
+      "sharpe": -0.9479463706785922,
+      "max_dd": -0.14725931459132038,
+      "cagr": -0.09122844271571362,
+      "hit_rate": 0.13031914893617022,
+      "worst_day": -0.02831195943868375
+    },
+    {
+      "strategy": "trend-following",
+      "window": "2015-china",
+      "window_start": "2015-06-01",
+      "window_end": "2016-02-29",
+      "n_days": 188,
+      "sharpe": -1.6600760843912015,
+      "max_dd": -0.19830718226631294,
+      "cagr": -0.20913113457835752,
+      "hit_rate": 0.3829787234042553,
+      "worst_day": -0.03959421909733413
+    },
+    {
+      "strategy": "trend-following",
+      "window": "2018-q4",
+      "window_start": "2018-01-01",
+      "window_end": "2018-12-31",
+      "n_days": 250,
+      "sharpe": -0.45747036695589743,
+      "max_dd": -0.18372868933004363,
+      "cagr": -0.0723295986310517,
+      "hit_rate": 0.556,
+      "worst_day": -0.041343569635389675
+    },
+    {
+      "strategy": "trend-following",
+      "window": "2020-covid",
+      "window_start": "2020-01-02",
+      "window_end": "2020-12-31",
+      "n_days": 252,
+      "sharpe": 0.8415612497496429,
+      "max_dd": -0.13486325205540636,
+      "cagr": 0.1303232136209349,
+      "hit_rate": 0.46825396825396826,
+      "worst_day": -0.05397720846259771
+    },
+    {
+      "strategy": "trend-following",
+      "window": "2022-rates",
+      "window_start": "2022-01-03",
+      "window_end": "2023-06-30",
+      "n_days": 374,
+      "sharpe": -1.0427630155406644,
+      "max_dd": -0.2582960627258177,
+      "cagr": -0.1305943542007153,
+      "hit_rate": 0.3074866310160428,
+      "worst_day": -0.038531300547304546
+    },
+    {
+      "strategy": "mean-reversion",
+      "window": "2008-gfc",
+      "window_start": "2008-01-02",
+      "window_end": "2009-06-30",
+      "n_days": 376,
+      "sharpe": -0.7406667183175587,
+      "max_dd": -0.0620303104134613,
+      "cagr": -0.03560536415412374,
+      "hit_rate": 0.19946808510638298,
+      "worst_day": -0.015125478826789152
+    },
+    {
+      "strategy": "mean-reversion",
+      "window": "2015-china",
+      "window_start": "2015-06-01",
+      "window_end": "2016-02-29",
+      "n_days": 188,
+      "sharpe": -1.1457702899922002,
+      "max_dd": -0.0853444106167406,
+      "cagr": -0.0875499796514404,
+      "hit_rate": 0.4308510638297872,
+      "worst_day": -0.030674540775681363
+    },
+    {
+      "strategy": "mean-reversion",
+      "window": "2018-q4",
+      "window_start": "2018-01-01",
+      "window_end": "2018-12-31",
+      "n_days": 250,
+      "sharpe": -0.46169092444257676,
+      "max_dd": -0.07180275037142393,
+      "cagr": -0.042081317811835106,
+      "hit_rate": 0.52,
+      "worst_day": -0.038270032055184686
+    },
+    {
+      "strategy": "mean-reversion",
+      "window": "2020-covid",
+      "window_start": "2020-01-02",
+      "window_end": "2020-12-31",
+      "n_days": 252,
+      "sharpe": -0.3712348893644871,
+      "max_dd": -0.2207178621971671,
+      "cagr": -0.07365647828853672,
+      "hit_rate": 0.5436507936507936,
+      "worst_day": -0.0708578252512088
+    },
+    {
+      "strategy": "mean-reversion",
+      "window": "2022-rates",
+      "window_start": "2022-01-03",
+      "window_end": "2023-06-30",
+      "n_days": 374,
+      "sharpe": -0.24158322526876033,
+      "max_dd": -0.06659723170203069,
+      "cagr": -0.013051721777125547,
+      "hit_rate": 0.4919786096256685,
+      "worst_day": -0.015301353673560282
+    },
+    {
+      "strategy": "sector-rotation",
+      "window": "2008-gfc",
+      "window_start": "2008-01-02",
+      "window_end": "2009-06-30",
+      "n_days": 376,
+      "sharpe": -0.8901499491910874,
+      "max_dd": -0.48757267569119256,
+      "cagr": -0.2626624832850383,
+      "hit_rate": 0.4946808510638298,
+      "worst_day": -0.08280614211413216
+    },
+    {
+      "strategy": "sector-rotation",
+      "window": "2015-china",
+      "window_start": "2015-06-01",
+      "window_end": "2016-02-29",
+      "n_days": 188,
+      "sharpe": -0.27544062001373637,
+      "max_dd": -0.13017975437567778,
+      "cagr": -0.05728696371716524,
+      "hit_rate": 0.5159574468085106,
+      "worst_day": -0.0417344381393604
+    },
+    {
+      "strategy": "sector-rotation",
+      "window": "2018-q4",
+      "window_start": "2018-01-01",
+      "window_end": "2018-12-31",
+      "n_days": 250,
+      "sharpe": -0.21155707291682205,
+      "max_dd": -0.15959857246633638,
+      "cagr": -0.04159162100160385,
+      "hit_rate": 0.536,
+      "worst_day": -0.04198039480747162
+    },
+    {
+      "strategy": "sector-rotation",
+      "window": "2020-covid",
+      "window_start": "2020-01-02",
+      "window_end": "2020-12-31",
+      "n_days": 252,
+      "sharpe": 0.6947038890054212,
+      "max_dd": -0.33585004019526554,
+      "cagr": 0.21430660430716908,
+      "hit_rate": 0.5555555555555556,
+      "worst_day": -0.12461448795843975
+    },
+    {
+      "strategy": "sector-rotation",
+      "window": "2022-rates",
+      "window_start": "2022-01-03",
+      "window_end": "2023-06-30",
+      "n_days": 374,
+      "sharpe": 0.25404326619136175,
+      "max_dd": -0.15174372786379864,
+      "cagr": 0.03728399702938012,
+      "hit_rate": 0.5133689839572193,
+      "worst_day": -0.03990705494664352
+    }
+  ],
+  "verdicts": {
+    "trend-following": {
+      "pass": false,
+      "reason": "FAIL \u2014 worst DD -25.8% < -25%; median Sharpe -0.95 < 0"
+    },
+    "mean-reversion": {
+      "pass": false,
+      "reason": "FAIL \u2014 median Sharpe -0.46 < 0"
+    },
+    "sector-rotation": {
+      "pass": false,
+      "reason": "FAIL \u2014 worst DD -48.8% < -25%; median Sharpe -0.21 < 0"
+    }
+  }
+}

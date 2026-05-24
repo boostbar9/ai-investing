@@ -81,41 +81,55 @@ class AlpacaDataAdapter(DataAdapter):
                 "alpaca_data: ALPACA_PAPER_KEY_ID / ALPACA_PAPER_SECRET not set — "
                 "get free paper keys at https://app.alpaca.markets/paper/dashboard/overview"
             )
-        await BUCKETS["alpaca_data"].acquire()
         with span(
             "data.alpaca_data.bars",
             {"symbol": symbol, "timeframe": timeframe, "start": start, "end": end},
         ):
-            r = await self._client.get(
-                f"{self.BASE}/v2/stocks/{symbol}/bars",
-                params={
+            out: list[Bar] = []
+            page_token: str | None = None
+            # Walk Alpaca's next_page_token until exhausted. Cap pages to avoid
+            # runaway loops on a misconfigured request.
+            for _ in range(50):
+                await BUCKETS["alpaca_data"].acquire()
+                params: dict[str, str | int] = {
                     "timeframe": timeframe,
                     "start": start,
                     "end": end,
                     "feed": feed,
                     "limit": 10000,
                     "adjustment": "all",
-                },
-            )
-            if r.status_code != 200:
-                raise DataAdapterError(f"alpaca_data {symbol}: {r.status_code} {r.text[:200]}")
-            data = r.json().get("bars") or []
-            out: list[Bar] = []
-            for row in data:
-                try:
-                    out.append(
-                        Bar(
-                            symbol=symbol,
-                            ts=datetime.fromisoformat(row["t"].replace("Z", "+00:00")).astimezone(UTC),
-                            open=float(row["o"]),
-                            high=float(row["h"]),
-                            low=float(row["l"]),
-                            close=float(row["c"]),
-                            volume=float(row["v"]),
-                        )
+                }
+                if page_token:
+                    params["page_token"] = page_token
+                r = await self._client.get(
+                    f"{self.BASE}/v2/stocks/{symbol}/bars",
+                    params=params,
+                )
+                if r.status_code != 200:
+                    raise DataAdapterError(
+                        f"alpaca_data {symbol}: {r.status_code} {r.text[:200]}"
                     )
-                except (KeyError, ValueError, TypeError):
-                    continue
+                payload = r.json()
+                for row in payload.get("bars") or []:
+                    try:
+                        out.append(
+                            Bar(
+                                symbol=symbol,
+                                ts=datetime.fromisoformat(
+                                    row["t"].replace("Z", "+00:00")
+                                ).astimezone(UTC),
+                                open=float(row["o"]),
+                                high=float(row["h"]),
+                                low=float(row["l"]),
+                                close=float(row["c"]),
+                                volume=float(row["v"]),
+                            )
+                        )
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                page_token = payload.get("next_page_token")
+                if not page_token:
+                    break
             return out
 
     async def aclose(self) -> None:
