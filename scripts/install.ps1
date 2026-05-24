@@ -29,6 +29,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Invoke-Checked([string]$label, [scriptblock]$action) {
+  & $action
+  if ($LASTEXITCODE -ne 0) {
+    Fail "$label failed (exit code $LASTEXITCODE). See output above."
+  }
+}
+
 function Write-Section([string]$msg) {
   Write-Host ""
   Write-Host "=== $msg ===" -ForegroundColor Cyan
@@ -114,10 +121,11 @@ $venvPip    = Join-Path $venvPath "Scripts\pip.exe"
 # ----------------------------------------------------------------------
 Write-Section "Installing Python dependencies (this takes 2-5 minutes)"
 
-& $venvPython -m pip install --upgrade pip --quiet
+Invoke-Checked "pip upgrade" { & $venvPython -m pip install --upgrade pip --quiet }
 Write-Ok "pip upgraded"
 
-& $venvPip install -e ".[dev]" --quiet
+# No --quiet here: build errors are real and must be visible.
+Invoke-Checked "pip install -e .[dev]" { & $venvPip install -e ".[dev]" }
 Write-Ok "ai-investing + dev extras installed"
 
 # ----------------------------------------------------------------------

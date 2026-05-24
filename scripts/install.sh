@@ -87,7 +87,8 @@ section "Installing Python dependencies (this takes 2-5 minutes)"
 "$VENV_PY" -m pip install --upgrade pip --quiet
 ok "pip upgraded"
 
-"$VENV_PIP" install -e ".[dev]" --quiet
+# Drop --quiet here so build errors are visible if they happen.
+"$VENV_PIP" install -e ".[dev]"
 ok "ai-investing + dev extras installed"
 
 # ----------------------------------------------------------------------
