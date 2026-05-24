@@ -180,28 +180,54 @@ def start(kind: str, command: list[str], cwd: Path | None = None) -> JobInfo:
             return existing
 
         log_path = LOG_DIR / f"{kind}.log"
-        # Truncate prior log so the UI tail starts clean.
-        log_path.write_text("", encoding="utf-8")
-
         env = _child_env()
 
-        # Open the log file twice: one handle for the subprocess, one for tailers.
-        f_out = log_path.open("a", encoding="utf-8", buffering=1)
+        # Write a diagnostic header BEFORE spawning the subprocess so that even
+        # if the child dies before printing a single byte (e.g. STATUS_DLL_INIT_FAILED
+        # at interpreter startup), the operator can still see exactly what was
+        # attempted: which interpreter, which cwd, which command, and the
+        # relevant slices of the env. This has paid for itself several times on
+        # Windows where child processes die silently.
+        header_lines = [
+            f"=== launching {kind} at {datetime.now(UTC).isoformat(timespec='seconds')} ===",
+            f"argv = {command}",
+            f"cwd  = {cwd or REPO_ROOT}",
+            f"PYTHONHOME = {env.get('PYTHONHOME', '<unset>')}",
+            f"PYTHONPATH = {env.get('PYTHONPATH', '<unset>')}",
+            f"PATH (first 5) = {os.pathsep.join((env.get('PATH', '').split(os.pathsep))[:5])}",
+            "=== child output below ===",
+            "",
+        ]
+        log_path.write_text("\n".join(header_lines), encoding="utf-8")
 
+        # Spawn with PIPE rather than handing the child an inherited file
+        # handle. On Windows, passing an open Python file object as stdout=
+        # forces handle duplication via CreateProcess STARTUPINFO, which can
+        # collide with Smart App Control / App Isolation / Defender Application
+        # Guard and cause the child interpreter to die during DLL init
+        # (STATUS_DLL_INIT_FAILED, exit 3221225794) before printing anything.
+        # PIPE is universally safe — we copy bytes to the log file from a
+        # daemon thread in the parent process.
         try:
             proc = subprocess.Popen(
                 command,
                 cwd=str(cwd or REPO_ROOT),
                 env=env,
-                stdout=f_out,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
+                bufsize=0,
             )
         except Exception as e:
-            f_out.close()
             raise RuntimeError(f"failed to launch {kind}: {e}") from e
+
+        # Tee child output into the log file (append after the diagnostic
+        # header). Daemon thread so we don't block on the child's exit.
+        threading.Thread(
+            target=_tee_output,
+            args=(kind, proc, log_path),
+            daemon=True,
+        ).start()
 
         info = JobInfo(
             kind=kind,
@@ -277,6 +303,36 @@ def describe_exit(kind: str, rc: int | None) -> str:
         name, explanation = _WINDOWS_NT_STATUS[rc]
         return f"{kind} exited with code {rc} ({name}: {explanation})"
     return f"{kind} exited with code {rc}"
+
+
+def _tee_output(kind: str, proc: subprocess.Popen, log_path: Path) -> None:
+    """Stream a child's stdout into ``log_path`` in 4 KiB chunks.
+
+    The child's stdout is bytes; we decode as UTF-8 with ``replace`` so a
+    rogue non-UTF-8 byte from a native library never crashes the tee. We
+    write in append mode (the diagnostic header was already written by
+    :func:`start`), and flush on every write so the cockpit UI tail sees
+    output immediately.
+    """
+    stream = proc.stdout
+    if stream is None:
+        return
+    try:
+        with log_path.open("a", encoding="utf-8", buffering=1) as sink:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                sink.write(chunk.decode("utf-8", errors="replace"))
+                sink.flush()
+    except Exception as exc:  # pragma: no cover - defensive
+        with contextlib.suppress(OSError):
+            log_path.open("a", encoding="utf-8").write(
+                f"\n[proc.tee] dropped tee for {kind}: {exc!r}\n"
+            )
+    finally:
+        with contextlib.suppress(Exception):
+            stream.close()
 
 
 def _watch(kind: str) -> None:

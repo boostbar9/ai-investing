@@ -74,3 +74,45 @@ def test_child_env_leaves_path_alone_on_posix(monkeypatch: pytest.MonkeyPatch) -
     env = _child_env()
     assert env["PATH"] == "/usr/bin:/bin"
     assert "System32" not in env["PATH"]
+
+
+def test_start_writes_diagnostic_header_before_child_runs(
+    tmp_path: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even if the child dies instantly, the log must show what was tried.
+
+    This is the test we wished we had when paper_loop / pretrain were
+    failing on Windows with zero-byte log files: the header now records
+    argv, cwd, and key env vars so the operator can see exactly what the
+    cockpit attempted.
+    """
+    import sys
+
+    from packages.cockpit import proc
+
+    monkeypatch.setattr(proc, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(proc, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(proc, "_jobs", {})
+    monkeypatch.setattr(proc, "_procs", {})
+    monkeypatch.setattr(proc, "_persist", lambda: None)
+
+    info = proc.start("diag_smoke", [sys.executable, "-c", "print('child ran')"])
+    assert info.pid is not None
+
+    # Wait briefly for the child + tee thread to finish.
+    import time
+
+    for _ in range(50):
+        if info.exit_code is not None:
+            break
+        time.sleep(0.05)
+
+    log_text = (tmp_path / "diag_smoke.log").read_text(encoding="utf-8")
+    # Header is present
+    assert "=== launching diag_smoke at" in log_text
+    assert "argv = " in log_text
+    assert "PYTHONPATH = " in log_text
+    assert "=== child output below ===" in log_text
+    # And the child's actual output made it through the tee
+    assert "child ran" in log_text
