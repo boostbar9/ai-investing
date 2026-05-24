@@ -97,16 +97,27 @@ def detect_regime(spy: pd.Series, vix: pd.Series, breadth: pd.Series) -> RegimeR
 
     X = features.values  # noqa: N806 — ML convention for feature matrix
     model = GaussianHMM(n_components=4, covariance_type="diag", n_iter=200, random_state=0)
-    model.fit(X)
-    states = model.predict(X)
-    posteriors = model.predict_proba(X)
+    try:
+        model.fit(X)
+        states = model.predict(X)
+        posteriors = model.predict_proba(X)
+    except (ValueError, RuntimeError):
+        # hmmlearn raises ValueError on non-convergence (e.g. transmat_ rows
+        # not summing to 1 when a state was never visited). Fall back to the
+        # deterministic heuristic so regime detection still works on small
+        # or degenerate inputs.
+        return _heuristic(features)
     last_state = int(states[-1])
     last_conf = float(posteriors[-1, last_state])
 
     # Label states by mean log-return (ascending = crisis -> bull) and
     # volatility (ascending = bull -> crisis) — combined for stability.
-    means = model.means_[:, 0]            # log_ret_20 mean
-    vols = np.sqrt(model.covars_[:, 0])   # log_ret_20 stdev
+    means = np.asarray(model.means_[:, 0]).ravel()  # log_ret_20 mean per state
+    # hmmlearn returns full covariance as (n_states, n_features, n_features)
+    # for covariance_type="full"; index [:, 0, 0] for the first feature's variance.
+    covars = np.asarray(model.covars_)
+    variances = covars[:, 0, 0] if covars.ndim == 3 else covars[:, 0]
+    vols = np.sqrt(np.maximum(variances, 0.0)).ravel()  # log_ret_20 stdev per state
     score = means - vols                   # higher = bullier
     order = np.argsort(score)              # ascending: worst -> best
     # order[0]=crisis, order[1]=bear, order[2]=chop, order[3]=bull

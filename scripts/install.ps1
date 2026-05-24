@@ -169,5 +169,6 @@ Write-Host "  1. Edit .env and add your Alpaca paper keys (from https://app.alpa
 Write-Host "  2. Activate the venv:    cd $InstallDir; .\.venv\Scripts\Activate.ps1"
 Write-Host "  3. Download market data: `$env:PYTHONPATH='.'; python -m packages.data.pretrain"
 Write-Host "  4. First dry-run:        python tools/paper_trade.py --strategy ensemble --dry-run"
-Write-Host "  5. Open the dashboard:   python tools/paper_dashboard.py; start docs/paper-dashboard.html"
+Write-Host "  5. Open the cockpit GUI:  `$env:PYTHONPATH='.'; python tools/cockpit.py"
+Write-Host "     (then visit http://127.0.0.1:8765 - opens automatically)"
 Write-Host ""

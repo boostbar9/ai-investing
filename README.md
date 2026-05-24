@@ -90,6 +90,20 @@ Then edit `.env` with your [Alpaca paper keys](https://app.alpaca.markets/paper/
 source .venv/bin/activate                                 # Windows: .\.venv\Scripts\Activate.ps1
 PYTHONPATH=. python -m packages.data.pretrain             # download 20yr daily + 90d intraday
 PYTHONPATH=. python tools/paper_trade.py --strategy ensemble --dry-run
+PYTHONPATH=. python tools/cockpit.py                      # local web GUI at http://127.0.0.1:8765
+```
+
+The **cockpit** is a Python-only FastAPI dashboard that runs at
+`http://127.0.0.1:8765` and auto-opens in your browser. It shows live account
+equity, target positions, regime classification, the §16 promotion-gate
+streak, and recent trades. It also exposes controls: pause/resume the bot,
+run a trade cycle on demand, override the regime detector, and an emergency
+flatten button that cancels orders and submits closing market orders for
+every open position.
+
+For the legacy static dashboard (no server required):
+
+```bash
 PYTHONPATH=. python tools/paper_dashboard.py && open docs/paper-dashboard.html
 ```
 

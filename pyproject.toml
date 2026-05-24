@@ -67,6 +67,9 @@ where = ["."]
 include = ["packages*", "tools*"]
 exclude = ["apps*", "data*", "docs*", "infra*", "baselines*", "scripts*", "node_modules*", "*.tests", "*.tests.*"]
 
+[tool.setuptools.package-data]
+"packages.cockpit.web" = ["templates/*.html"]
+
 [tool.uv]
 package = false
 

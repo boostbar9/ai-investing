@@ -38,6 +38,7 @@ import numpy as np
 import pandas as pd
 
 from packages.agents.paper_bridge import advise as agent_advise
+from packages.cockpit.state import load_state as load_cockpit_state
 from packages.execution.broker import (
     AlpacaPaperBroker,
     BrokerError,
@@ -367,6 +368,23 @@ async def run(
                 "strategy": strategy_name,
                 "halted": True,
                 "reasons": kill.reasons,
+                "account_equity": float(account.get("equity", 0)),
+                "orders_planned": 0,
+                "orders_submitted": 0,
+            }
+            log_run(record)
+            return record
+
+        # Cockpit pause: respect a manual halt set from the web GUI.
+        cockpit = load_cockpit_state()
+        if cockpit.paused and not dry_run:
+            log.warning("HALT: cockpit paused by user (%s)", cockpit.last_action or "no note")
+            record = {
+                "ts": started.isoformat(),
+                "strategy": strategy_name,
+                "halted": True,
+                "reasons": ["cockpit-paused"],
+                "cockpit_note": cockpit.last_action,
                 "account_equity": float(account.get("equity", 0)),
                 "orders_planned": 0,
                 "orders_submitted": 0,

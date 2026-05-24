@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ai-investing cockpit</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; }
+    .pill { padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+    .pill-green { background: #064e3b; color: #6ee7b7; }
+    .pill-red { background: #7f1d1d; color: #fca5a5; }
+    .pill-yellow { background: #78350f; color: #fcd34d; }
+    .pill-gray { background: #1f2937; color: #9ca3af; }
+    .pill-blue { background: #1e3a8a; color: #93c5fd; }
+    .btn { padding: 8px 14px; border-radius: 8px; font-weight: 500; font-size: 13px; transition: all 0.15s; cursor: pointer; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
+    .btn-warn { background: #d97706; color: white; }
+    .btn-warn:hover:not(:disabled) { background: #b45309; }
+    .btn-danger { background: #dc2626; color: white; }
+    .btn-danger:hover:not(:disabled) { background: #b91c1c; }
+    .btn-ghost { background: #1f2937; color: #d1d5db; }
+    .btn-ghost:hover:not(:disabled) { background: #374151; }
+    .stat-label { font-size: 11px; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.05em; }
+    .stat-val { font-size: 28px; font-weight: 600; color: #f9fafb; }
+    .stat-val.small { font-size: 20px; }
+    .progress { background: #1f2937; height: 8px; border-radius: 4px; overflow: hidden; }
+    .progress-fill { background: linear-gradient(90deg, #10b981, #34d399); height: 100%; transition: width 0.4s; }
+    table { width: 100%; font-size: 13px; }
+    th { text-align: left; color: #9ca3af; font-weight: 500; padding: 8px 6px; border-bottom: 1px solid #1f2937; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+    td { padding: 8px 6px; border-bottom: 1px solid #111827; color: #e5e7eb; }
+    tr:hover td { background: #0b1220; }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .blink { animation: blink 1.5s ease-in-out infinite; }
+    @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="max-w-7xl mx-auto p-6">
+    <!-- Header -->
+    <header class="flex items-center justify-between mb-6">
+      <div>
+        <h1 class="text-2xl font-semibold">ai-investing cockpit</h1>
+        <p class="text-sm text-gray-400">Local monitor and control panel for the paper bot</p>
+      </div>
+      <div class="flex items-center gap-3">
+        <span id="status-pill" class="pill pill-gray">connecting</span>
+        <span id="last-update" class="text-xs text-gray-500"></span>
+      </div>
+    </header>
+
+    <!-- Top row: stat tiles -->
+    <section class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+      <div class="card p-4">
+        <div class="stat-label">Account equity</div>
+        <div id="stat-equity" class="stat-val mono">—</div>
+        <div id="stat-equity-sub" class="text-xs text-gray-500 mt-1"></div>
+      </div>
+      <div class="card p-4">
+        <div class="stat-label">Buying power</div>
+        <div id="stat-bp" class="stat-val mono">—</div>
+        <div class="text-xs text-gray-500 mt-1">Paper account</div>
+      </div>
+      <div class="card p-4">
+        <div class="stat-label">Regime</div>
+        <div id="stat-regime" class="stat-val small">—</div>
+        <div id="stat-regime-sub" class="text-xs text-gray-500 mt-1"></div>
+      </div>
+      <div class="card p-4">
+        <div class="stat-label">Live drawdown</div>
+        <div id="stat-dd" class="stat-val mono">—</div>
+        <div class="text-xs text-gray-500 mt-1">From running peak</div>
+      </div>
+    </section>
+
+    <!-- Middle row: streak gauge + equity chart -->
+    <section class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+      <!-- Streak panel -->
+      <div class="card p-5">
+        <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-400 mb-3">§16 promotion gate</h2>
+        <div class="flex items-baseline gap-2">
+          <span id="streak-current" class="text-4xl font-bold text-emerald-400">0</span>
+          <span class="text-gray-500">/</span>
+          <span id="streak-target" class="text-lg text-gray-400">60</span>
+          <span class="text-xs text-gray-500 ml-1">clean paper days</span>
+        </div>
+        <div class="progress mt-3">
+          <div id="streak-bar" class="progress-fill" style="width: 0%"></div>
+        </div>
+        <div class="text-xs text-gray-500 mt-3 space-y-1">
+          <div>Longest: <span id="streak-longest" class="mono text-gray-300">0</span></div>
+          <div>Days remaining: <span id="streak-remaining" class="mono text-gray-300">60</span></div>
+          <div>Peak equity: <span id="streak-peak" class="mono text-gray-300">—</span></div>
+        </div>
+      </div>
+
+      <!-- Equity curve -->
+      <div class="card p-5 lg:col-span-2">
+        <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-400 mb-3">Equity curve (last 90 runs)</h2>
+        <div style="height: 220px">
+          <canvas id="equity-chart"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- Controls -->
+    <section class="card p-5 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-400">Controls</h2>
+        <div id="control-state" class="text-xs text-gray-500"></div>
+      </div>
+      <div class="flex flex-wrap items-center gap-3">
+        <button id="btn-pause" class="btn btn-warn">Pause bot</button>
+        <button id="btn-resume" class="btn btn-primary hidden">Resume bot</button>
+        <button id="btn-run-now" class="btn btn-ghost">Run now</button>
+        <button id="btn-flatten" class="btn btn-danger">Emergency flatten</button>
+        <div class="flex items-center gap-2 ml-auto">
+          <label for="sel-regime" class="text-xs text-gray-400">Regime override:</label>
+          <select id="sel-regime" class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-sm text-gray-100">
+            <option value="auto">Auto (detect)</option>
+            <option value="bull">Bull</option>
+            <option value="chop">Chop</option>
+            <option value="bear">Bear</option>
+            <option value="crisis">Crisis</option>
+          </select>
+          <button id="btn-set-regime" class="btn btn-ghost">Apply</button>
+        </div>
+      </div>
+      <div id="last-action" class="text-xs text-gray-500 mt-3"></div>
+    </section>
+
+    <!-- Bottom row: positions + trades -->
+    <section class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+      <div class="card p-5">
+        <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-400 mb-3">Target positions</h2>
+        <div class="overflow-x-auto">
+          <table>
+            <thead>
+              <tr><th>Symbol</th><th class="text-right">Weight</th><th class="text-right">Approx $</th></tr>
+            </thead>
+            <tbody id="tbl-positions">
+              <tr><td colspan="3" class="text-center text-gray-500 py-6">No data yet — run paper trade first</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card p-5">
+        <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-400 mb-3">Recent trades</h2>
+        <div class="overflow-x-auto" style="max-height: 320px; overflow-y: auto">
+          <table>
+            <thead>
+              <tr><th>When</th><th>Side</th><th>Symbol</th><th class="text-right">Qty</th></tr>
+            </thead>
+            <tbody id="tbl-trades">
+              <tr><td colspan="4" class="text-center text-gray-500 py-6">No trades yet</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <footer class="text-center text-xs text-gray-600 py-6">
+      Polling every 5s &middot; <a href="/api/state" class="hover:text-gray-400">/api/state</a> &middot;
+      Press <kbd class="bg-gray-800 px-1 rounded">P</kbd> to pause, <kbd class="bg-gray-800 px-1 rounded">R</kbd> to refresh
+    </footer>
+  </div>
+
+  <script>
+    // ----- helpers -----
+    const fmt = {
+      money: v => v == null ? "—" : "$" + Number(v).toLocaleString(undefined, { maximumFractionDigits: 0 }),
+      pct: v => v == null ? "—" : (Number(v) * 100).toFixed(2) + "%",
+      pctSigned: v => {
+        if (v == null) return "—";
+        const n = Number(v) * 100;
+        const sign = n >= 0 ? "+" : "";
+        return sign + n.toFixed(2) + "%";
+      },
+      time: iso => {
+        if (!iso) return "—";
+        try { return new Date(iso).toLocaleString(); } catch { return iso; }
+      },
+      relTime: iso => {
+        if (!iso) return "";
+        try {
+          const d = new Date(iso);
+          const diff = (Date.now() - d.getTime()) / 1000;
+          if (diff < 60) return Math.floor(diff) + "s ago";
+          if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+          if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+          return Math.floor(diff / 86400) + "d ago";
+        } catch { return ""; }
+      }
+    };
+
+    // ----- chart -----
+    let chart;
+    function ensureChart() {
+      if (chart) return chart;
+      const ctx = document.getElementById("equity-chart").getContext("2d");
+      chart = new Chart(ctx, {
+        type: "line",
+        data: { labels: [], datasets: [{
+          label: "Equity",
+          data: [],
+          borderColor: "#34d399",
+          backgroundColor: "rgba(52,211,153,0.08)",
+          fill: true,
+          tension: 0.25,
+          pointRadius: 0,
+          borderWidth: 2
+        }]},
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false }, tooltip: { mode: "index", intersect: false }},
+          scales: {
+            x: { ticks: { color: "#6b7280", font: { size: 10 }, maxTicksLimit: 8 }, grid: { color: "#1f2937" }},
+            y: { ticks: { color: "#6b7280", font: { size: 10 }, callback: v => "$" + Number(v).toLocaleString() }, grid: { color: "#1f2937" }}
+          }
+        }
+      });
+      return chart;
+    }
+
+    function regimePill(r) {
+      const map = { bull: "pill-green", chop: "pill-blue", bear: "pill-yellow", crisis: "pill-red" };
+      return map[r] || "pill-gray";
+    }
+
+    // ----- render -----
+    function render(state) {
+      const acct = state.account || {};
+      document.getElementById("stat-equity").textContent = fmt.money(acct.equity);
+      document.getElementById("stat-equity-sub").textContent = acct.as_of ? "as of " + fmt.relTime(acct.as_of) : "";
+      document.getElementById("stat-bp").textContent = fmt.money(acct.buying_power);
+
+      const reg = state.regime || {};
+      const effective = reg.effective || "—";
+      const cls = regimePill(effective);
+      document.getElementById("stat-regime").innerHTML = `<span class="pill ${cls}">${effective}</span>`;
+      const subParts = [];
+      if (reg.override && reg.override !== "auto") subParts.push("override: " + reg.override);
+      if (reg.confidence != null) subParts.push("conf " + Number(reg.confidence).toFixed(2));
+      document.getElementById("stat-regime-sub").textContent = subParts.join(" · ");
+
+      const streak = state.streak || {};
+      const dd = streak.current_drawdown;
+      const ddEl = document.getElementById("stat-dd");
+      ddEl.textContent = fmt.pctSigned(dd);
+      ddEl.style.color = dd != null && dd < -0.05 ? "#fca5a5" : dd != null && dd < -0.02 ? "#fcd34d" : "#6ee7b7";
+
+      // Streak panel
+      const current = streak.current || 0;
+      const target = streak.target || 60;
+      document.getElementById("streak-current").textContent = current;
+      document.getElementById("streak-target").textContent = target;
+      document.getElementById("streak-longest").textContent = streak.longest || 0;
+      document.getElementById("streak-remaining").textContent = streak.days_remaining ?? target;
+      document.getElementById("streak-peak").textContent = fmt.money(streak.peak_equity);
+      const pct = Math.min(100, (current / target) * 100);
+      document.getElementById("streak-bar").style.width = pct + "%";
+
+      // Controls
+      const ctrl = state.control || {};
+      const paused = !!ctrl.paused;
+      document.getElementById("btn-pause").classList.toggle("hidden", paused);
+      document.getElementById("btn-resume").classList.toggle("hidden", !paused);
+      const stateLabel = paused
+        ? '<span class="pill pill-yellow">paused</span>'
+        : '<span class="pill pill-green">active</span>';
+      document.getElementById("control-state").innerHTML = stateLabel;
+      if (ctrl.last_action) {
+        document.getElementById("last-action").textContent =
+          "Last action: " + ctrl.last_action + " · " + fmt.relTime(ctrl.last_action_at);
+      }
+      if (ctrl.regime_override) {
+        document.getElementById("sel-regime").value = ctrl.regime_override;
+      }
+
+      // Positions
+      const positions = state.positions || [];
+      const posBody = document.getElementById("tbl-positions");
+      if (positions.length === 0) {
+        posBody.innerHTML = '<tr><td colspan="3" class="text-center text-gray-500 py-6">No data yet — run paper trade first</td></tr>';
+      } else {
+        posBody.innerHTML = positions.map(p =>
+          `<tr><td class="font-medium">${p.symbol}</td><td class="text-right mono">${fmt.pct(p.target_weight)}</td><td class="text-right mono text-gray-400">${fmt.money(p.approx_value)}</td></tr>`
+        ).join("");
+      }
+
+      // Trades
+      const trades = state.trades || [];
+      const tradeBody = document.getElementById("tbl-trades");
+      if (trades.length === 0) {
+        tradeBody.innerHTML = '<tr><td colspan="4" class="text-center text-gray-500 py-6">No trades yet</td></tr>';
+      } else {
+        tradeBody.innerHTML = trades.map(t => {
+          const side = (t.side || "").toUpperCase();
+          const sideCls = side === "BUY" ? "text-emerald-400" : "text-red-400";
+          return `<tr><td class="text-gray-400 text-xs">${fmt.relTime(t.run_ts)}</td><td class="${sideCls} font-medium">${side}</td><td class="font-medium">${t.symbol || "—"}</td><td class="text-right mono">${t.qty ?? "—"}</td></tr>`;
+        }).join("");
+      }
+
+      // Equity chart
+      const curve = state.equity_curve || [];
+      const c = ensureChart();
+      c.data.labels = curve.map(p => {
+        try { return new Date(p.t).toLocaleDateString(); } catch { return p.t; }
+      });
+      c.data.datasets[0].data = curve.map(p => p.equity);
+      c.update("none");
+
+      // Status pill
+      document.getElementById("status-pill").className = "pill pill-green";
+      document.getElementById("status-pill").textContent = "live";
+      document.getElementById("last-update").textContent = "updated " + new Date().toLocaleTimeString();
+    }
+
+    // ----- API -----
+    async function refresh() {
+      try {
+        const r = await fetch("/api/state");
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const data = await r.json();
+        render(data);
+      } catch (e) {
+        document.getElementById("status-pill").className = "pill pill-red";
+        document.getElementById("status-pill").textContent = "offline";
+        console.error("refresh failed", e);
+      }
+    }
+
+    async function post(path, body) {
+      const r = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: body ? JSON.stringify(body) : null
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }
+
+    // ----- handlers -----
+    document.getElementById("btn-pause").onclick = async () => {
+      await post("/api/pause"); refresh();
+    };
+    document.getElementById("btn-resume").onclick = async () => {
+      await post("/api/resume"); refresh();
+    };
+    document.getElementById("btn-run-now").onclick = async () => {
+      const btn = document.getElementById("btn-run-now");
+      btn.disabled = true; btn.textContent = "Queued...";
+      try { await post("/api/run-now"); }
+      finally {
+        setTimeout(() => { btn.disabled = false; btn.textContent = "Run now"; refresh(); }, 2000);
+      }
+    };
+    document.getElementById("btn-flatten").onclick = async () => {
+      if (!confirm("EMERGENCY FLATTEN will pause the bot AND submit market sell orders for every open position. Continue?")) return;
+      await post("/api/flatten"); refresh();
+    };
+    document.getElementById("btn-set-regime").onclick = async () => {
+      const regime = document.getElementById("sel-regime").value;
+      await post("/api/override-regime", { regime }); refresh();
+    };
+
+    // Keyboard shortcuts
+    document.addEventListener("keydown", e => {
+      if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+      if (e.key === "p" || e.key === "P") {
+        document.getElementById("btn-pause").click();
+      } else if (e.key === "r" || e.key === "R") {
+        refresh();
+      }
+    });
+
+    // Boot + poll
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

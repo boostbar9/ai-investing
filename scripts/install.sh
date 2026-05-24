@@ -128,6 +128,7 @@ ${C_CYAN}Next steps:${C_RESET}
   2. Activate the venv:    cd $INSTALL_DIR && source .venv/bin/activate
   3. Download market data: PYTHONPATH=. python -m packages.data.pretrain
   4. First dry-run:        python tools/paper_trade.py --strategy ensemble --dry-run
-  5. Open the dashboard:   python tools/paper_dashboard.py && open docs/paper-dashboard.html
+  5. Open the cockpit GUI: PYTHONPATH=. python tools/cockpit.py
+     (then visit http://127.0.0.1:8765 - opens automatically)
 
 EOF
