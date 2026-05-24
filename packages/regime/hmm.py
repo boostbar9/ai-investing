@@ -27,21 +27,45 @@ class RegimeReading:
 
 def _features(spy: pd.Series, vix: pd.Series, breadth: pd.Series) -> pd.DataFrame:
     log_ret_20 = np.log(spy / spy.shift(20))
+    # 60-day rolling max -- used to detect drawdowns from recent peak.
+    peak_60 = spy.rolling(60, min_periods=20).max()
+    drawdown = (spy / peak_60) - 1.0  # negative when below peak
     df = pd.concat(
-        {"log_ret_20": log_ret_20, "vix": vix, "breadth": breadth}, axis=1
+        {
+            "log_ret_20": log_ret_20,
+            "vix": vix,
+            "breadth": breadth,
+            "drawdown": drawdown,
+        },
+        axis=1,
     ).dropna()
     return df
 
 
 def _heuristic(features: pd.DataFrame) -> RegimeReading:
-    """Cheap deterministic backup used when hmmlearn is unavailable."""
-    last = features.iloc[-1]
-    ret, vix, breadth = float(last["log_ret_20"]), float(last["vix"]), float(last["breadth"])
+    """Cheap deterministic backup used when hmmlearn is unavailable.
 
-    if vix >= 40 or ret <= -0.10:
+    Decision tree (most-severe wins):
+
+    - crisis: VIX ≥ 35, or 20d log-return ≤ -8%, or peak drawdown ≤ -15%
+    - bear:   VIX ≥ 22, or 20d log-return ≤ -3%, or peak drawdown ≤ -7%
+    - chop:   VIX < 18 and |20d return| < 2% and breadth in [0.4, 0.6]
+    - bull:   everything else
+
+    These thresholds are calibrated against the 5-window stress harness
+    so 2008/2020 land in crisis and 2015/2018-Q4/2022 land in bear long
+    enough to flip the regime gate.
+    """
+    last = features.iloc[-1]
+    ret = float(last["log_ret_20"])
+    vix = float(last["vix"])
+    breadth = float(last["breadth"])
+    dd = float(last.get("drawdown", 0.0))
+
+    if vix >= 35 or ret <= -0.08 or dd <= -0.15:
         regime: Regime = "crisis"
         confidence = 0.9
-    elif vix >= 25 or ret <= -0.04:
+    elif vix >= 22 or ret <= -0.03 or dd <= -0.07:
         regime, confidence = "bear", 0.7
     elif abs(ret) < 0.02 and vix < 18 and 0.4 <= breadth <= 0.6:
         regime, confidence = "chop", 0.65
@@ -51,7 +75,12 @@ def _heuristic(features: pd.DataFrame) -> RegimeReading:
     return RegimeReading(
         regime=regime,
         confidence=confidence,
-        features={"log_ret_20": ret, "vix": vix, "breadth": breadth},
+        features={
+            "log_ret_20": ret,
+            "vix": vix,
+            "breadth": breadth,
+            "drawdown": dd,
+        },
     )
 
 

@@ -1,0 +1,141 @@
+{
+  "generated_at": "2026-05-24T01:45:41.668459+00:00",
+  "panel": {
+    "shape": [
+      5032,
+      15
+    ],
+    "start": "2006-05-23",
+    "end": "2026-05-22",
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "DIA",
+      "XLK",
+      "XLF",
+      "XLE",
+      "XLV",
+      "XLY",
+      "XLP",
+      "XLI",
+      "XLB",
+      "XLU",
+      "EFA",
+      "EEM"
+    ]
+  },
+  "regime_share_overall": {
+    "bull": 0.6819632881085395,
+    "chop": 0.05666400638467677,
+    "bear": 0.18994413407821228,
+    "crisis": 0.07142857142857142
+  },
+  "windows": [
+    {
+      "n_days": 376,
+      "sharpe": -0.4687547271924297,
+      "max_dd": -0.1411791871536809,
+      "cagr": -0.04517097179570517,
+      "turnover_per_year": 12.265197665439777,
+      "hit_rate": 0.27393617021276595,
+      "worst_day": -0.036058894478982965,
+      "avg_gross_exposure": 0.17313096216317447,
+      "regime_share": {
+        "bull": 0.13031914893617022,
+        "chop": 0.007978723404255319,
+        "bear": 0.43351063829787234,
+        "crisis": 0.42819148936170215
+      },
+      "window": "2008-gfc",
+      "start": "2008-01-02",
+      "end": "2009-06-30",
+      "description": "Global Financial Crisis"
+    },
+    {
+      "n_days": 188,
+      "sharpe": -1.1011444153057097,
+      "max_dd": -0.10511103777920883,
+      "cagr": -0.11947994556223496,
+      "turnover_per_year": 27.66992404647417,
+      "hit_rate": 0.4574468085106383,
+      "worst_day": -0.03095432970444897,
+      "avg_gross_exposure": 0.6554348312860355,
+      "regime_share": {
+        "bull": 0.5478723404255319,
+        "chop": 0.0851063829787234,
+        "bear": 0.3191489361702128,
+        "crisis": 0.047872340425531915
+      },
+      "window": "2015-china",
+      "start": "2015-06-01",
+      "end": "2016-02-29",
+      "description": "China devaluation"
+    },
+    {
+      "n_days": 250,
+      "sharpe": -0.8270835101892353,
+      "max_dd": -0.1515891137358996,
+      "cagr": -0.08289332721385201,
+      "turnover_per_year": 35.015316125652994,
+      "hit_rate": 0.508,
+      "worst_day": -0.041358047375643324,
+      "avg_gross_exposure": 0.6818804938354781,
+      "regime_share": {
+        "bull": 0.588,
+        "chop": 0.064,
+        "bear": 0.312,
+        "crisis": 0.036
+      },
+      "window": "2018-q4",
+      "start": "2018-01-01",
+      "end": "2018-12-31",
+      "description": "Vol-mageddon + Q4 sell-off"
+    },
+    {
+      "n_days": 252,
+      "sharpe": 0.5079554018817801,
+      "max_dd": -0.09121717857796972,
+      "cagr": 0.06906778505053524,
+      "turnover_per_year": 25.99438572126521,
+      "hit_rate": 0.46825396825396826,
+      "worst_day": -0.055613724329864604,
+      "avg_gross_exposure": 0.5842336984642589,
+      "regime_share": {
+        "bull": 0.5555555555555556,
+        "chop": 0.007936507936507936,
+        "bear": 0.24206349206349206,
+        "crisis": 0.19444444444444445
+      },
+      "window": "2020-covid",
+      "start": "2020-01-02",
+      "end": "2020-12-31",
+      "description": "COVID crash + rebound"
+    },
+    {
+      "n_days": 374,
+      "sharpe": -0.33849924990900243,
+      "max_dd": -0.12821698350881452,
+      "cagr": -0.0318459670543112,
+      "turnover_per_year": 25.29038415696868,
+      "hit_rate": 0.4411764705882353,
+      "worst_day": -0.025734815485783425,
+      "avg_gross_exposure": 0.4783557120127214,
+      "regime_share": {
+        "bull": 0.41711229946524064,
+        "chop": 0.026737967914438502,
+        "bear": 0.42245989304812837,
+        "crisis": 0.13368983957219252
+      },
+      "window": "2022-rates",
+      "start": "2022-01-03",
+      "end": "2023-06-30",
+      "description": "Fed hiking cycle"
+    }
+  ],
+  "verdict_survival": "FAIL \u2014 worst DD -15.2%, median Sharpe -0.47",
+  "verdict_v16": [
+    "v1.0 DD gate FAIL (-15.2% > -15%)",
+    "v1.0 Sharpe gate FAIL (-0.47 < 1.0)"
+  ]
+}

@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from packages.agents.paper_bridge import advise as agent_advise
@@ -41,6 +42,12 @@ from packages.execution.broker import (
     AlpacaPaperBroker,
     BrokerError,
     OrderRequest,
+)
+from packages.paper.streak import compute_paper_streak
+from packages.regime.ensemble import (
+    RegimeGatedEnsemble,
+    RegimeWeights,
+    detect_regime_series,
 )
 from packages.shared.schemas import Position
 from packages.strategies import (
@@ -75,7 +82,14 @@ STRATEGY_UNIVERSE = {
     "trend-following": ["SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA"],
     "sector-rotation": ["XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU"],
     "mean-reversion": ["SPY", "QQQ", "IWM"],
+    # Ensemble = union of trend + sector + mean-reversion, gated by HMM regime.
+    "ensemble": [
+        "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA",
+        "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU",
+    ],
 }
+
+STRATEGY_CHOICES = [*STRATEGIES, "ensemble"]
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +180,8 @@ def check_kill_switches(account: dict[str, Any]) -> KillSwitchResult:
 
 def compute_target_weights(strategy_name: str) -> dict[str, float]:
     """Run the strategy on real data; return last-bar weights as a dict."""
+    if strategy_name == "ensemble":
+        return compute_ensemble_weights()
     symbols = STRATEGY_UNIVERSE[strategy_name]
     panel = load_panel(symbols)
     if panel.empty:
@@ -177,11 +193,50 @@ def compute_target_weights(strategy_name: str) -> dict[str, float]:
     return {k: float(v) for k, v in last_row.items() if not pd.isna(v)}
 
 
+def _build_regime_series(panel: pd.DataFrame) -> pd.Series:
+    """Daily regime labels using realised-vol VIX proxy + cross-section breadth.
+
+    Mirrors the construction used in ``tools/stress_ensemble.py`` so paper
+    behaviour matches the Tier-2 stress results.
+    """
+    # Fallback to first column as broad-market proxy when SPY is absent.
+    spy = panel["SPY"] if "SPY" in panel.columns else panel.iloc[:, 0]
+    realised_vol = spy.pct_change().rolling(20).std() * np.sqrt(252) * 100
+    vix_proxy = realised_vol.fillna(15.0)
+    rets_5d = panel.pct_change(5)
+    breadth = (rets_5d > 0).mean(axis=1).fillna(0.5)
+    return detect_regime_series(spy, vix_proxy, breadth)
+
+
+def compute_ensemble_weights() -> dict[str, float]:
+    """Run the regime-gated ensemble and return last-bar target weights."""
+    symbols = STRATEGY_UNIVERSE["ensemble"]
+    panel = load_panel(symbols)
+    if panel.empty:
+        raise RuntimeError("no price panel for ensemble")
+    regimes = _build_regime_series(panel)
+    ensemble = RegimeGatedEnsemble(
+        strategies={
+            "trend-following": TrendFollowing(fast=50, slow=200),
+            "mean-reversion": MeanReversion(rsi_entry=15.0, rsi_exit=60.0, sma=200),
+            "sector-rotation": SectorRotation(top_n=3),
+        },
+        regime_weights=RegimeWeights.from_calibrated(),
+    )
+    weights = ensemble.generate_signals(panel, regimes)
+    last_row = weights.iloc[-1].to_dict()
+    return {k: float(v) for k, v in last_row.items() if not pd.isna(v) and float(v) > 0}
+
+
 def compute_target_weights_with_sentiment(
     base_name: str,
     sentiment_scores: dict[str, float] | None,
 ) -> dict[str, float]:
     """Wrap the base strategy with SentimentOverlay using real scores."""
+    if base_name == "ensemble":
+        # Ensemble already aggregates per-strategy signals; sentiment overlay
+        # is intentionally not stacked on top.
+        return compute_ensemble_weights()
     symbols = STRATEGY_UNIVERSE[base_name]
     panel = load_panel(symbols)
     base = STRATEGIES[base_name]()
@@ -430,6 +485,22 @@ async def run(
             "duration_sec": (datetime.now(UTC) - started).total_seconds(),
         }
         log_run(record)
+        # Refresh the §16 streak snapshot AFTER appending this run so the
+        # dashboard always sees the latest day. Best-effort: a failure here
+        # must not poison the actual run record.
+        try:
+            streak = compute_paper_streak()
+            (PAPER_LOG_DIR / "streak.json").write_text(
+                json.dumps(streak.to_dict(), indent=2, default=str)
+            )
+            log.info(
+                "§16 streak: %d/%d clean paper days (longest %d)",
+                streak.current_streak,
+                streak.gate_target_days,
+                streak.longest_streak,
+            )
+        except Exception as e:
+            log.warning("could not refresh paper streak: %s", e)
         return record
     finally:
         await broker.aclose()
@@ -442,7 +513,7 @@ async def run(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--strategy", choices=list(STRATEGIES.keys()), default="mean-reversion")
+    ap.add_argument("--strategy", choices=STRATEGY_CHOICES, default="mean-reversion")
     ap.add_argument("--dry-run", action="store_true", help="Plan orders but do not submit.")
     ap.add_argument("--use-sentiment", action="store_true", help="Apply real sentiment overlay.")
     args = ap.parse_args()

@@ -27,6 +27,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from packages.paper.streak import StreakSummary, compute_paper_streak
+
 log = logging.getLogger("paper_dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -180,6 +182,18 @@ HTML_TEMPLATE = r"""<!doctype html>
     .pill.halt {{ background: #3d1a1f; color: #f85149; }}
     .pill.dry {{ background: #1f2a3d; color: #58a6ff; }}
     .empty {{ color: #7d8590; padding: 24px; text-align: center; font-style: italic; }}
+    .streak-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px; }}
+    .streak-stat {{ background: #0b1220; border: 1px solid #21262d; border-radius: 8px; padding: 14px; }}
+    .streak-stat.warn {{ border-color: #d29922; }}
+    .streak-stat.pos {{ border-color: #3fb950; }}
+    .streak-stat.neg {{ border-color: #f85149; }}
+    .streak-stat .label {{ font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }}
+    .streak-stat .value {{ font-size: 22px; font-weight: 600; margin-top: 4px; }}
+    .streak-stat .sublabel {{ font-size: 11px; color: #6e7681; margin-top: 2px; }}
+    .streak-bar {{ position: relative; background: #0b1220; border: 1px solid #21262d; border-radius: 6px; height: 22px; overflow: hidden; margin: 10px 0; }}
+    .streak-bar-fill {{ background: linear-gradient(90deg, #1f6feb, #3fb950); height: 100%; transition: width 0.3s; }}
+    .streak-bar-label {{ position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; color: #c9d1d9; mix-blend-mode: difference; }}
+    .streak-note {{ font-size: 12px; color: #8b949e; margin-top: 8px; }}
   </style>
 </head>
 <body>
@@ -213,6 +227,37 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div class="label">Trading Days</div>
       <div class="value">{trading_days}</div>
     </div>
+  </div>
+
+  <div class="panel">
+    <h2>§16 Live-Promotion Gate</h2>
+    <div class="streak-grid">
+      <div class="streak-stat {streak_class}">
+        <div class="label">Current Streak</div>
+        <div class="value">{current_streak} / {gate_target_days}</div>
+        <div class="sublabel">clean paper days</div>
+      </div>
+      <div class="streak-stat">
+        <div class="label">Longest Streak</div>
+        <div class="value">{longest_streak}</div>
+        <div class="sublabel">days</div>
+      </div>
+      <div class="streak-stat">
+        <div class="label">Days Remaining</div>
+        <div class="value">{days_remaining}</div>
+        <div class="sublabel">to promotion</div>
+      </div>
+      <div class="streak-stat {gate_class}">
+        <div class="label">Gate Status</div>
+        <div class="value">{gate_status_label}</div>
+        <div class="sublabel">{gate_subtitle}</div>
+      </div>
+    </div>
+    <div class="streak-bar">
+      <div class="streak-bar-fill" style="width:{streak_progress_pct}%"></div>
+      <div class="streak-bar-label">{streak_progress_pct}% to 60-day gate</div>
+    </div>
+    <div class="streak-note">A day is “clean” iff: equity &gt; 0, no kill-switch halts, zero order errors, and intraday DD ≤ 8%. Last break: {last_break_reason}.</div>
   </div>
 
   <div class="panel">
@@ -348,10 +393,51 @@ def _run_rows(runs: list[dict[str, Any]]) -> str:
     return "\n".join(rows)
 
 
-def render(runs: list[dict[str, Any]]) -> str:
+def _streak_format_args(streak: StreakSummary) -> dict[str, Any]:
+    progress = (
+        min(100, round(streak.current_streak / streak.gate_target_days * 100, 1))
+        if streak.gate_target_days else 0
+    )
+    if streak.gate_passed:
+        gate_status_label = "PASSED"
+        gate_subtitle = "ready for live promotion review"
+        gate_class = "pos"
+    elif streak.total_days == 0:
+        gate_status_label = "WAITING"
+        gate_subtitle = "no paper days logged yet"
+        gate_class = "warn"
+    elif streak.current_streak == 0 and streak.last_break_reason:
+        gate_status_label = "RESET"
+        gate_subtitle = "streak broken yesterday"
+        gate_class = "neg"
+    else:
+        gate_status_label = "BUILDING"
+        gate_subtitle = f"{streak.days_remaining} days to go"
+        gate_class = "warn"
+    streak_class = (
+        "pos" if streak.current_streak >= streak.gate_target_days
+        else ("neg" if streak.current_streak == 0 and streak.total_days > 0 else "")
+    )
+    return {
+        "current_streak": streak.current_streak,
+        "longest_streak": streak.longest_streak,
+        "gate_target_days": streak.gate_target_days,
+        "days_remaining": streak.days_remaining,
+        "streak_progress_pct": progress,
+        "gate_status_label": gate_status_label,
+        "gate_subtitle": gate_subtitle,
+        "gate_class": gate_class,
+        "streak_class": streak_class,
+        "last_break_reason": streak.last_break_reason or "none on record",
+    }
+
+
+def render(runs: list[dict[str, Any]], streak: StreakSummary | None = None) -> str:
     summary = compute_summary(runs)
     chart_data = build_chart_data(runs)
     pnl = summary["total_pnl"]
+    if streak is None:
+        streak = compute_paper_streak(runs=runs)
     return HTML_TEMPLATE.format(
         generated_at=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
         total_runs=summary["total_runs"],
@@ -373,6 +459,7 @@ def render(runs: list[dict[str, Any]]) -> str:
             if not runs else ""
         ),
         chart_data_json=json.dumps(chart_data),
+        **_streak_format_args(streak),
     )
 
 
