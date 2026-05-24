@@ -841,9 +841,35 @@ _LAST_AGENT_RUN: dict[str, Any] = {
         "strategy": {"status": "idle", "detail": ""},
         "risk": {"status": "idle", "detail": ""},
         "execution": {"status": "idle", "detail": ""},
+        "discovery": {"status": "idle", "detail": ""},
     },
     "audit": [],
 }
+
+
+# Discovery audit log — the agent runs in advisory mode (NOT in the order
+# path) so we persist its proposals separately for offline review and
+# eventual promotion into the strategy playbook by hand.
+DISCOVERY_LOG = Path("data/discoveries_log.jsonl")
+DISCOVERY_LOG_MAX = 500
+
+
+def _append_discovery_log(payload: dict[str, Any]) -> None:
+    """Append one discovery row (compact), tail-trim to ``DISCOVERY_LOG_MAX``."""
+    if not payload.get("patterns"):
+        return  # nothing interesting — skip the write
+    try:
+        DISCOVERY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        row = json.dumps(payload, default=str, separators=(",", ":"))
+        with DISCOVERY_LOG.open("a", encoding="utf-8") as f:
+            f.write(row + "\n")
+        # Tail-trim opportunistically (cheap because rows are small).
+        lines = DISCOVERY_LOG.read_text(encoding="utf-8").splitlines()
+        if len(lines) > DISCOVERY_LOG_MAX:
+            keep = lines[-DISCOVERY_LOG_MAX:]
+            DISCOVERY_LOG.write_text("\n".join(keep) + "\n", encoding="utf-8")
+    except OSError as e:
+        log.warning("failed to append discovery log: %s", e)
 
 
 def _last_run_payload() -> dict[str, Any]:
@@ -950,6 +976,101 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
         execution_status = "ok"
         n_fills = len(result.execution.fills)
 
+    # Discovery agent (advisory only). Failure here MUST NOT halt the chain;
+    # an exception is logged and the dashboard simply shows "idle".
+    discovery_payload: dict[str, Any] = {"status": "idle", "detail": "not run", "patterns": [], "notes": ""}
+    try:
+        from packages.shared.universe import DEFAULT_UNIVERSE
+
+        disc_universe = DEFAULT_UNIVERSE.filter(symbols) or list(symbols)
+        disc_features = {
+            "sentiment": float(result.research.sentiment),
+            "regime_bull": 1.0 if regime == "bull" else 0.0,
+            "regime_bear": 1.0 if regime == "bear" else 0.0,
+            "regime_chop": 1.0 if regime == "chop" else 0.0,
+            "regime_crisis": 1.0 if regime == "crisis" else 0.0,
+            "n_signals": float(n_signals),
+            "n_approved": float(n_approved),
+        }
+        if req.use_llm:
+            from packages.agents.llm_router import LLMRouter
+            from packages.agents.runners import build_discovery_runner
+            from packages.shared.schemas import DiscoveryInput
+
+            d_router = LLMRouter()
+            try:
+                d_runner = build_discovery_runner(d_router)
+                d_in = DiscoveryInput(
+                    decision_id=result.decision_id,
+                    regime=regime,  # type: ignore[arg-type]
+                    universe=disc_universe,
+                    features=disc_features,
+                    recent_thesis=result.research.thesis,
+                )
+                d_out = await d_runner(d_in)
+            finally:
+                await d_router.aclose()
+        else:
+            # Deterministic stub: derive at most one pattern from the existing
+            # research/strategy outputs so the cockpit shows something useful
+            # without an Ollama dependency.
+            from packages.shared.schemas import DiscoveryOutput, PatternCandidate
+
+            patterns: list[PatternCandidate] = []
+            if regime != "crisis" and disc_universe and abs(result.research.sentiment) >= 0.3:
+                side = "momentum-follow" if result.research.sentiment > 0 else "defensive-rotation"
+                patterns.append(
+                    PatternCandidate(
+                        name=f"{regime}-{side}",
+                        hypothesis=(
+                            f"In {regime} regime with sentiment {result.research.sentiment:+.2f}, "
+                            f"lean toward {('long-momentum' if result.research.sentiment > 0 else 'defensives')} "
+                            f"across {', '.join(disc_universe[:3])}."
+                        ),
+                        symbols=disc_universe[:3],
+                        feature_keys=["sentiment", f"regime_{regime}"],
+                        confidence=min(0.6, abs(result.research.sentiment)),
+                        horizon_days=5,
+                    )
+                )
+            d_out = DiscoveryOutput(
+                decision_id=result.decision_id,
+                patterns=patterns,
+                notes="deterministic stub: derived from research sentiment + regime",
+            )
+        disc_patterns = [p.model_dump() for p in d_out.patterns]
+        discovery_payload = {
+            "status": "ok" if disc_patterns else "idle",
+            "detail": (
+                f"{len(disc_patterns)} pattern(s) proposed (advisory only)"
+                if disc_patterns
+                else "no novel patterns"
+            ),
+            "advisory_only": True,
+            "patterns": disc_patterns,
+            "notes": d_out.notes,
+        }
+        if disc_patterns:
+            _append_discovery_log(
+                {
+                    "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+                    "decision_id": str(result.decision_id),
+                    "regime": regime,
+                    "used_llm": bool(req.use_llm),
+                    "patterns": disc_patterns,
+                    "notes": d_out.notes,
+                }
+            )
+    except Exception as e:
+        log.warning("discovery agent failed (advisory only, ignored): %s", e)
+        discovery_payload = {
+            "status": "warn",
+            "detail": f"discovery error (ignored): {type(e).__name__}",
+            "advisory_only": True,
+            "patterns": [],
+            "notes": "",
+        }
+
     payload: dict[str, Any] = {
         "ran_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "decision_id": str(result.decision_id),
@@ -990,6 +1111,7 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
                     else [f.model_dump(mode="json") for f in result.execution.fills]
                 ),
             },
+            "discovery": discovery_payload,
         },
         "audit": [
             {
@@ -1188,6 +1310,29 @@ def api_agents_history(limit: int = 50) -> dict[str, Any]:
     if limit > 0:
         rows = rows[:limit]
     return {"runs": rows, "total": len(rows)}
+
+
+@app.get("/api/agents/discoveries")
+def api_agents_discoveries(limit: int = 50) -> dict[str, Any]:
+    """Most recent patterns proposed by the advisory Discovery agent."""
+    rows: list[dict[str, Any]] = []
+    try:
+        if DISCOVERY_LOG.exists():
+            with DISCOVERY_LOG.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except OSError as e:
+        log.warning("failed to read discoveries log: %s", e)
+    rows.reverse()
+    if limit > 0:
+        rows = rows[:limit]
+    return {"discoveries": rows, "total": len(rows), "advisory_only": True}
 
 
 # --------------------------------------------------------------------------

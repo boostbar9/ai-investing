@@ -74,6 +74,14 @@ def fake_agent_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
+def fake_discovery_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect the advisory discovery log to a tmp file so tests are hermetic."""
+    log = tmp_path / "discoveries_log.jsonl"
+    monkeypatch.setattr(srv, "DISCOVERY_LOG", log)
+    return log
+
+
+@pytest.fixture
 def client(fake_log: Path, fake_state: Path, fake_agent_log: Path) -> TestClient:
     return TestClient(srv.app)
 
@@ -352,6 +360,7 @@ def test_agents_last_idle_before_first_run(client: TestClient) -> None:
                 "strategy": {"status": "idle", "detail": ""},
                 "risk": {"status": "idle", "detail": ""},
                 "execution": {"status": "idle", "detail": ""},
+                "discovery": {"status": "idle", "detail": ""},
             },
             "audit": [],
         }
@@ -360,7 +369,7 @@ def test_agents_last_idle_before_first_run(client: TestClient) -> None:
     assert r.status_code == 200
     j = r.json()
     assert j["ran_at"] is None
-    assert set(j["agents"].keys()) == {"research", "strategy", "risk", "execution"}
+    assert set(j["agents"].keys()) == {"research", "strategy", "risk", "execution", "discovery"}
     for a in j["agents"].values():
         assert a["status"] == "idle"
 
@@ -514,6 +523,143 @@ def test_agents_schedule_tick_skips_when_paused(
     s = st.load_state()
     s.paused = False
     st.save_state(s)
+
+
+# ---------------------------------------------------------------------------
+# Advisory Discovery agent (NOT in the order path, must never gate trading).
+# ---------------------------------------------------------------------------
+
+
+def test_agents_run_includes_discovery_block(
+    client: TestClient, fake_discovery_log: Path
+) -> None:
+    """/api/agents/run must always surface a discovery block (advisory_only)."""
+    r = client.post(
+        "/api/agents/run",
+        json={"symbols": ["SPY", "QQQ"], "regime": "chop", "use_llm": False},
+    )
+    assert r.status_code == 200, r.text
+    j = r.json()
+    disc = j["agents"]["discovery"]
+    # Contract: status + advisory_only flag + patterns list always present.
+    assert disc["status"] in {"ok", "idle", "warn"}
+    assert disc["advisory_only"] is True
+    assert isinstance(disc["patterns"], list)
+    # Core invariant: discovery never gates execution.
+    assert j["agents"]["execution"]["status"] != "halt" or j["halted"]
+
+
+def test_discovery_stub_silent_in_crisis(
+    client: TestClient, fake_discovery_log: Path
+) -> None:
+    """Spec §5: crisis regime → discovery emits zero patterns even if
+    other signals would have triggered one."""
+    r = client.post(
+        "/api/agents/run",
+        json={"symbols": ["SPY", "QQQ"], "regime": "crisis", "use_llm": False},
+    )
+    assert r.status_code == 200
+    j = r.json()
+    disc = j["agents"]["discovery"]
+    assert disc["advisory_only"] is True
+    assert disc["patterns"] == []
+    # And nothing should have been written to the discovery log.
+    assert not fake_discovery_log.exists() or fake_discovery_log.read_text().strip() == ""
+
+
+def test_discovery_stub_emits_on_strong_sentiment(
+    client: TestClient, fake_discovery_log: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bull regime with |sentiment| >= 0.3 must produce exactly one pattern.
+
+    We wrap ``paper_bridge.advise`` to bump the research sentiment so the
+    stub's deterministic emit rule fires. This proves the wiring without
+    needing Ollama.
+    """
+    import dataclasses
+
+    from packages.agents import paper_bridge
+    from packages.shared.schemas import ResearchOutput
+
+    original_advise = paper_bridge.advise
+
+    async def _advise_with_strong_sentiment(**kwargs):  # type: ignore[no-untyped-def]
+        result = await original_advise(**kwargs)
+        # Replace research output so the discovery stub's |s| >= 0.3 path fires.
+        boosted = ResearchOutput(
+            decision_id=result.research.decision_id,
+            thesis="strong positive sentiment for testing",
+            sentiment=0.5,
+            citations=result.research.citations,
+        )
+        return dataclasses.replace(result, research=boosted)
+
+    monkeypatch.setattr(paper_bridge, "advise", _advise_with_strong_sentiment)
+
+    r = client.post(
+        "/api/agents/run",
+        json={"symbols": ["SPY", "QQQ", "TLT"], "regime": "bull", "use_llm": False},
+    )
+    assert r.status_code == 200, r.text
+    j = r.json()
+    disc = j["agents"]["discovery"]
+    assert disc["advisory_only"] is True
+    assert len(disc["patterns"]) >= 1
+    p = disc["patterns"][0]
+    # Stub contract: name encodes regime + side; symbols come from the curated
+    # universe (uppercase); confidence is bounded; horizon is short.
+    assert p["name"].startswith("bull-")
+    assert all(s == s.upper() for s in p["symbols"])
+    assert 0.0 <= p["confidence"] <= 1.0
+    assert 1 <= p["horizon_days"] <= 60
+    assert "sentiment" in p["feature_keys"]
+
+
+def test_api_agents_discoveries_history(
+    client: TestClient, fake_discovery_log: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a run that produced patterns, GET /api/agents/discoveries must
+    return them newest-first with the advisory_only flag."""
+    import dataclasses
+
+    from packages.agents import paper_bridge
+    from packages.shared.schemas import ResearchOutput
+
+    original_advise = paper_bridge.advise
+
+    async def _advise_with_strong_sentiment(**kwargs):  # type: ignore[no-untyped-def]
+        result = await original_advise(**kwargs)
+        boosted = ResearchOutput(
+            decision_id=result.research.decision_id,
+            thesis="strong positive sentiment for history test",
+            sentiment=0.45,
+            citations=result.research.citations,
+        )
+        return dataclasses.replace(result, research=boosted)
+
+    monkeypatch.setattr(paper_bridge, "advise", _advise_with_strong_sentiment)
+
+    # Empty before any run.
+    r0 = client.get("/api/agents/discoveries")
+    assert r0.status_code == 200
+    assert r0.json() == {"discoveries": [], "total": 0, "advisory_only": True}
+
+    # One run that should produce a pattern.
+    r1 = client.post(
+        "/api/agents/run",
+        json={"symbols": ["SPY", "QQQ"], "regime": "bull", "use_llm": False},
+    )
+    assert r1.status_code == 200
+
+    r2 = client.get("/api/agents/discoveries?limit=10")
+    assert r2.status_code == 200
+    j = r2.json()
+    assert j["advisory_only"] is True
+    assert j["total"] >= 1
+    row = j["discoveries"][0]
+    assert row["regime"] == "bull"
+    assert row["used_llm"] is False
+    assert isinstance(row["patterns"], list) and len(row["patterns"]) >= 1
 
 
 def test_state_endpoint_handles_empty_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

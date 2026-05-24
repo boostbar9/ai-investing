@@ -77,3 +77,4 @@ data/paper_log/
 data/cockpit/
 data/sentiment_cache.json
 data/agents_log.jsonl
+data/discoveries_log.jsonl

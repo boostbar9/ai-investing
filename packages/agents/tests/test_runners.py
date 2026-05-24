@@ -10,12 +10,14 @@ import pytest
 
 from packages.agents.llm_router import LLMRouter
 from packages.agents.runners import (
+    build_discovery_runner,
     build_execution_runner,
     build_research_runner,
     build_risk_runner,
     build_strategy_runner,
 )
 from packages.shared.schemas import (
+    DiscoveryInput,
     ExecutionInput,
     Order,
     Position,
@@ -199,4 +201,115 @@ async def test_execution_runner_overrides_audit_id():
     )
     assert out.fills == []
     assert str(out.audit_id) != fake_audit  # server overrides
+    await router.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Discovery (advisory-only, never gates the order path)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_discovery_runner_drops_hallucinated_symbols():
+    """Patterns referencing symbols outside the supplied universe must be
+    silently dropped — the order path can never see a fictional ticker."""
+    did = uuid4()
+    router = _router_with(
+        {
+            "qwen2.5": {
+                "decision_id": str(did),
+                "patterns": [
+                    {
+                        "name": "good-pattern",
+                        "hypothesis": "Real signal on SPY momentum.",
+                        "symbols": ["SPY"],
+                        "feature_keys": ["sentiment"],
+                        "confidence": 0.5,
+                        "horizon_days": 5,
+                    },
+                    {
+                        "name": "hallucinated-pattern",
+                        "hypothesis": "Fake ticker XYZ123 should be filtered.",
+                        "symbols": ["XYZ123"],
+                        "feature_keys": ["sentiment"],
+                        "confidence": 0.9,
+                        "horizon_days": 5,
+                    },
+                ],
+                "notes": "two candidates",
+            }
+        }
+    )
+    run = build_discovery_runner(router)
+    out = await run(
+        DiscoveryInput(
+            decision_id=did,
+            regime="bull",
+            universe=["SPY", "QQQ"],
+            features={"sentiment": 0.5},
+        )
+    )
+    assert len(out.patterns) == 1
+    assert out.patterns[0].name == "good-pattern"
+    assert out.patterns[0].symbols == ["SPY"]
+    await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_discovery_runner_drops_unknown_feature_keys():
+    """A pattern that anchors on a feature we didn't expose must be dropped
+    — otherwise the operator has no way to validate the hypothesis."""
+    did = uuid4()
+    router = _router_with(
+        {
+            "qwen2.5": {
+                "decision_id": str(did),
+                "patterns": [
+                    {
+                        "name": "bad-feature",
+                        "hypothesis": "Anchors on a feature we never computed.",
+                        "symbols": ["SPY"],
+                        "feature_keys": ["made_up_feature"],
+                        "confidence": 0.5,
+                        "horizon_days": 5,
+                    },
+                ],
+            }
+        }
+    )
+    run = build_discovery_runner(router)
+    out = await run(
+        DiscoveryInput(
+            decision_id=did,
+            regime="chop",
+            universe=["SPY"],
+            features={"sentiment": 0.0},  # made_up_feature NOT here
+        )
+    )
+    assert out.patterns == []
+    await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_discovery_runner_chain_failure_falls_back_silently():
+    """When every model in the chain fails, the safe default is an empty
+    patterns list with a clear note — NEVER halt the order path."""
+    did = uuid4()
+    router = _router_with(
+        {
+            "qwen2.5": None,
+            "llama3.1": None,
+            "llama3.2": None,
+        }
+    )
+    run = build_discovery_runner(router)
+    out = await run(
+        DiscoveryInput(
+            decision_id=did,
+            regime="chop",
+            universe=["SPY"],
+            features={"sentiment": 0.0},
+        )
+    )
+    assert out.patterns == []
+    assert "fallback" in out.notes.lower()
     await router.aclose()

@@ -26,6 +26,7 @@ from pydantic import ValidationError
 
 from packages.agents.llm_router import LLMError, LLMRouter
 from packages.agents.prompts import (
+    discovery_prompt,
     execution_prompt,
     research_prompt,
     risk_prompt,
@@ -33,9 +34,12 @@ from packages.agents.prompts import (
 )
 from packages.shared.otel import span
 from packages.shared.schemas import (
+    DiscoveryInput,
+    DiscoveryOutput,
     ExecutionInput,
     ExecutionOutput,
     Fill,
+    PatternCandidate,
     ResearchInput,
     ResearchOutput,
     RiskInput,
@@ -80,6 +84,16 @@ def _safe_execution(payload: ExecutionInput) -> ExecutionOutput:
         decision_id=payload.decision_id,
         fills=[],
         audit_id=uuid4(),
+    )
+
+
+def _safe_discovery(payload: DiscoveryInput) -> DiscoveryOutput:
+    # Discovery falls back to “no new patterns” — the order path doesn't
+    # depend on us so the safest output is silence.
+    return DiscoveryOutput(
+        decision_id=payload.decision_id,
+        patterns=[],
+        notes="(discovery fallback \u2014 no patterns proposed)",
     )
 
 
@@ -166,6 +180,40 @@ def build_risk_runner(router: LLMRouter) -> Callable[[RiskInput], Awaitable[Risk
         )
 
     return _risk
+
+
+def build_discovery_runner(router: LLMRouter) -> Callable[[DiscoveryInput], Awaitable[DiscoveryOutput]]:
+    """Advisory pattern-discovery runner.
+
+    Unlike the four order-path agents, Discovery is allowed to fail loudly
+    (returning the safe default ``patterns=[]``) without halting trading.
+    The caller is expected to log the output for offline review.
+    """
+
+    async def _discovery(payload: DiscoveryInput) -> DiscoveryOutput:
+        raw = await _run(
+            router=router,
+            agent="discovery",
+            decision_id_str=str(payload.decision_id),
+            prompt=discovery_prompt(payload),
+            output_model=DiscoveryOutput,
+            safe_default=_safe_discovery,
+            payload=payload,
+        )
+        # Strict universe + feature gate — drop any hallucinated symbols or
+        # feature keys so the dashboard never shows a fictional ticker.
+        allowed_symbols = {s.upper() for s in payload.universe}
+        allowed_features = set(payload.features.keys())
+        clean: list[PatternCandidate] = []
+        for p in raw.patterns:
+            syms = [s.upper() for s in p.symbols if s and s.upper() in allowed_symbols]
+            feats = [k for k in p.feature_keys if k in allowed_features]
+            if not syms or not feats:
+                continue  # drop — nothing grounded to act on
+            clean.append(p.model_copy(update={"symbols": syms, "feature_keys": feats}))
+        return raw.model_copy(update={"patterns": clean})
+
+    return _discovery
 
 
 def build_execution_runner(router: LLMRouter) -> Callable[[ExecutionInput], Awaitable[ExecutionOutput]]:

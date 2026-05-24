@@ -46,12 +46,44 @@ def test_vram_heuristic_steps_through_tiers() -> None:
     assert active_profile(vram_gb=80) is WORKSTATION  # nothing bigger
 
 
-def test_chain_for_rx_7900_xt_uses_14b_class() -> None:
+def test_chain_for_rx_7900_xt_research_uses_deepseek_32b() -> None:
+    """May-2026 upgrade: heavy-reasoning agents on 20GB cards get DeepSeek R1 32B.
+
+    The 32B distill is the largest model that fits comfortably in 20GB VRAM
+    alongside Ollama's own overhead and a small KV cache. Anything bigger
+    (70B) gets evicted at load time.
+    """
     chain = chain_for("research", RX_7900_XT)
-    # Spec calls for DeepSeek R1 reasoning; on this tier we use the 14B
-    # distill. Critical assertion: NOT the 70B which won't fit.
-    assert "70b" not in chain.primary.lower()
-    assert "14b" in chain.primary.lower()
+    assert chain.primary == "deepseek-r1:32b"
+    # Backup must NOT be the 70B which won't fit.
+    assert "70b" not in chain.backup.lower()
+
+
+def test_chain_for_rx_7900_xt_risk_uses_deepseek_32b() -> None:
+    """Risk gate is the most safety-critical agent — top-tier model wins."""
+    assert chain_for("risk", RX_7900_XT).primary == "deepseek-r1:32b"
+
+
+def test_chain_for_rx_7900_xt_discovery_uses_deepseek_32b() -> None:
+    """Discovery needs to spot novel patterns — heavy reasoner."""
+    assert chain_for("discovery", RX_7900_XT).primary == "deepseek-r1:32b"
+
+
+def test_chain_for_rx_7900_xt_strategy_and_execution_stay_mid_tier() -> None:
+    """Mid-tier agents on rx_7900_xt run a smaller, faster model so the
+    32B reasoners aren't blocked waiting for VRAM."""
+    assert "14b" in chain_for("strategy", RX_7900_XT).primary.lower()
+    assert "14b" in chain_for("execution", RX_7900_XT).primary.lower()
+
+
+def test_every_profile_has_a_discovery_chain() -> None:
+    """Adding Discovery as a 5th agent means every profile must register a
+    chain for it — otherwise active_profile() would KeyError at runtime."""
+    for prof in (CPU_ONLY, BALANCED, RX_7900_XT, HIGH_END, WORKSTATION):
+        chain = chain_for("discovery", prof)
+        assert chain.primary, f"profile {prof.name} missing discovery primary"
+        assert chain.backup, f"profile {prof.name} missing discovery backup"
+        assert chain.quantized, f"profile {prof.name} missing discovery quantized"
 
 
 def test_chain_for_workstation_matches_spec_defaults() -> None:
@@ -63,10 +95,11 @@ def test_chain_for_workstation_matches_spec_defaults() -> None:
 def test_all_models_returns_dedup_list_per_profile() -> None:
     models = all_models(RX_7900_XT)
     assert len(models) == len(set(models)), "all_models must dedupe"
-    # Sanity: a handful of expected tags appear
+    # Sanity: the heavy reasoner, its 14B backup, and the mid-tier fast
+    # model all show up so ``ollama pull`` knows to grab them.
+    assert any("deepseek-r1:32b" in m for m in models)
     assert any("deepseek-r1:14b" in m for m in models)
-    assert any("qwen2.5:14b" in m for m in models)
-    assert any("llama3.2:3b" in m for m in models)
+    assert any("qwen3:14b" in m for m in models)
 
 
 def test_chain_for_unknown_agent_raises() -> None:

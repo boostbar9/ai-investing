@@ -121,6 +121,17 @@
           <div class="kv mb-2" id="detail-execution">awaiting run</div>
           <div class="text-xs text-gray-300" style="min-height: 36px;">Advisory mode — actual orders route through the paper loop.</div>
         </div>
+        <div id="card-discovery" class="agent-card idle">
+          <div class="flex items-center justify-between mb-2">
+            <div class="font-semibold text-sm">
+              <span class="agent-light idle" id="light-discovery"></span>Discovery
+              <span class="pill pill-gray text-xs ml-1" data-tt="This agent proposes patterns; it is NEVER in the live order path until you promote a pattern by hand.">advisory only</span>
+            </div>
+            <span class="pill pill-gray text-xs" id="status-discovery">idle</span>
+          </div>
+          <div class="kv mb-2" id="detail-discovery">awaiting run</div>
+          <div class="text-xs text-gray-300" id="notes-discovery" style="min-height: 36px;">—</div>
+        </div>
       </div>
     </section>
 
@@ -158,6 +169,20 @@
         </div>
       </div>
       <div class="mt-3 text-xs text-gray-400" id="sched-meta">never run</div>
+    </section>
+
+    <section class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium">
+          Proposed patterns
+          <span class="pill pill-gray text-xs ml-1">advisory only</span>
+          <span class="tt" data-tt="Discovery agent's pattern candidates. NOT routed into orders until you promote one by hand into the strategy playbook.">?</span>
+        </div>
+        <span class="text-xs text-gray-500" id="discovery-meta">—</span>
+      </div>
+      <div id="discovery-list">
+        <div class="text-xs text-gray-500 py-2">No patterns proposed in the most recent run.</div>
+      </div>
     </section>
 
     <section class="card p-5 mb-4">
@@ -225,12 +250,42 @@
       detEl.textContent = detail;
     }
 
+    function paintDiscovery(d) {
+      const detEl = document.getElementById('detail-discovery');
+      const notesEl = document.getElementById('notes-discovery');
+      const meta = document.getElementById('discovery-meta');
+      const list = document.getElementById('discovery-list');
+      const patterns = (d && d.patterns) || [];
+      detEl.textContent = (d && d.detail) || 'not run';
+      notesEl.textContent = (d && d.notes) || '—';
+      meta.textContent = patterns.length + ' pattern(s) • advisory only';
+      if (!patterns.length) {
+        list.innerHTML = '<div class="text-xs text-gray-500 py-2">No patterns proposed in the most recent run.</div>';
+        return;
+      }
+      list.innerHTML = patterns.map(p => {
+        const conf = Number(p.confidence || 0).toFixed(2);
+        const syms = (p.symbols || []).map(Cockpit.fmt.escape).join(', ');
+        const feats = (p.feature_keys || []).map(Cockpit.fmt.escape).join(', ');
+        return `<div class="audit-row p-3 mb-2" style="background:#0b1220;border:1px solid #1f2937;border-radius:8px">`
+          + `<div class="flex items-center justify-between mb-1">`
+          + `  <span class="font-semibold text-sm">${Cockpit.fmt.escape(p.name || 'pattern')}</span>`
+          + `  <span class="text-xs text-gray-400">confidence ${conf} · ${Number(p.horizon_days || 0)}d</span>`
+          + `</div>`
+          + `<div class="text-xs text-gray-300 mb-1">${Cockpit.fmt.escape(p.hypothesis || '')}</div>`
+          + `<div class="text-xs text-gray-500">symbols: ${syms || '—'} · features: ${feats || '—'}</div>`
+          + `</div>`;
+      }).join('');
+    }
+
     function paintRun(j) {
       if (!j || !j.agents) return;
       setAgentCard('research',  j.agents.research);
       setAgentCard('strategy',  j.agents.strategy);
       setAgentCard('risk',      j.agents.risk);
       setAgentCard('execution', j.agents.execution);
+      setAgentCard('discovery', j.agents.discovery);
+      paintDiscovery(j.agents.discovery);
 
       const r = j.agents.research || {};
       document.getElementById('thesis-research').textContent = r.thesis || '—';

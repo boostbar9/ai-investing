@@ -59,18 +59,22 @@ class HardwareProfile:
 
 
 # Operator default: Devin's box (Ryzen 7 5700X3D, RX 7900 XT 20GB, 32GB RAM).
-# Sized so two 14B models can coexist in VRAM (~22GB peak; one swaps when
-# the other is hot). Quantized fallback drops to 7B for cold-start latency.
+# Upgrade May-2026: heavy-reasoning agents (research, risk, discovery) get
+# deepseek-r1:32b q4_K_M (~20GB VRAM, fits with margin); fast-structured-output
+# agents (strategy, execution) stay on qwen3:14b q4_K_M (~9GB) so the chain
+# overlaps a reasoning model with a fast model on alternating turns. Backups
+# step down one size class; quantized fallback drops to 7B for cold-start.
 RX_7900_XT = HardwareProfile(
     name="rx_7900_xt",
-    description="20GB AMD GPU class (RX 7900 XT/XTX), 32GB system RAM",
+    description="20GB AMD GPU class (RX 7900 XT/XTX), 32GB system RAM \u2014 deepseek-r1:32b heavy / qwen3:14b fast",
     min_vram_gb=20,
     min_ram_gb=32,
     chains={
-        "research":  LLMChain("deepseek-r1:14b",            "qwen2.5:14b-instruct-q4_K_M", "qwen2.5:7b-instruct-q4_K_M"),
-        "strategy":  LLMChain("qwen2.5:14b-instruct-q4_K_M", "llama3.1:8b-instruct-q4_K_M", "qwen2.5:7b-instruct-q4_K_M"),
-        "risk":      LLMChain("deepseek-r1:14b",            "qwen2.5:14b-instruct-q4_K_M", "qwen2.5:7b-instruct-q4_K_M"),
-        "execution": LLMChain("llama3.1:8b-instruct-q4_K_M", "qwen2.5:7b-instruct-q4_K_M", "llama3.2:3b-instruct-q4_K_M"),
+        "research":  LLMChain("deepseek-r1:32b",            "deepseek-r1:14b",              "qwen3:14b"),
+        "strategy":  LLMChain("qwen3:14b",                  "qwen2.5:14b-instruct-q4_K_M", "qwen2.5:7b-instruct-q4_K_M"),
+        "risk":      LLMChain("deepseek-r1:32b",            "deepseek-r1:14b",              "qwen3:14b"),
+        "execution": LLMChain("qwen3:14b",                  "llama3.1:8b-instruct-q4_K_M", "qwen2.5:7b-instruct-q4_K_M"),
+        "discovery": LLMChain("deepseek-r1:32b",            "deepseek-r1:14b",              "qwen3:14b"),
     },
 )
 
@@ -86,6 +90,7 @@ CPU_ONLY = HardwareProfile(
         "strategy":  LLMChain("qwen2.5:7b-instruct-q4_K_M", "llama3.1:8b-instruct-q4_K_M", "llama3.2:3b-instruct-q4_K_M"),
         "risk":      LLMChain("qwen2.5:7b-instruct-q4_K_M", "llama3.1:8b-instruct-q4_K_M", "llama3.2:3b-instruct-q4_K_M"),
         "execution": LLMChain("llama3.2:3b-instruct-q4_K_M", "qwen2.5:7b-instruct-q4_K_M", "llama3.2:3b-instruct-q4_K_M"),
+        "discovery": LLMChain("qwen2.5:7b-instruct-q4_K_M", "llama3.1:8b-instruct-q4_K_M", "llama3.2:3b-instruct-q4_K_M"),
     },
 )
 
@@ -101,6 +106,7 @@ BALANCED = HardwareProfile(
         "strategy":  LLMChain("qwen2.5:7b-instruct-q4_K_M", "llama3.1:8b-instruct-q4_K_M", "llama3.2:3b-instruct-q4_K_M"),
         "risk":      LLMChain("qwen2.5:7b-instruct-q4_K_M", "llama3.1:8b-instruct-q4_K_M", "llama3.2:3b-instruct-q4_K_M"),
         "execution": LLMChain("llama3.1:8b-instruct-q4_K_M", "qwen2.5:7b-instruct-q4_K_M", "llama3.2:3b-instruct-q4_K_M"),
+        "discovery": LLMChain("qwen2.5:7b-instruct-q4_K_M", "llama3.1:8b-instruct-q4_K_M", "llama3.2:3b-instruct-q4_K_M"),
     },
 )
 
@@ -116,6 +122,7 @@ HIGH_END = HardwareProfile(
         "strategy":  LLMChain("qwen2.5:32b-instruct-q4_K_M", "llama3.3:70b-q4_K_M",        "qwen2.5:14b-instruct-q4_K_M"),
         "risk":      LLMChain("deepseek-r1:32b",            "qwen2.5:32b-instruct-q4_K_M", "qwen2.5:14b-instruct-q4_K_M"),
         "execution": LLMChain("llama3.3:70b-q4_K_M",        "qwen2.5:14b-instruct-q4_K_M", "llama3.2:3b-instruct-q4_K_M"),
+        "discovery": LLMChain("deepseek-r1:32b",            "qwen2.5:32b-instruct-q4_K_M", "qwen2.5:14b-instruct-q4_K_M"),
     },
 )
 
@@ -131,6 +138,7 @@ WORKSTATION = HardwareProfile(
         "strategy":  LLMChain("qwen2.5:72b",     "llama3.3:70b",    "qwen2.5:7b-instruct-q4_K_M"),
         "risk":      LLMChain("deepseek-r1:70b", "mistral-large",   "deepseek-r1:7b-q4_K_M"),
         "execution": LLMChain("llama3.3:70b",    "mistral-large",   "llama3.2:3b-q4_K_M"),
+        "discovery": LLMChain("deepseek-r1:70b", "qwen2.5:72b",     "deepseek-r1:7b-q4_K_M"),
     },
 )
 

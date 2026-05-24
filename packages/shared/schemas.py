@@ -93,3 +93,59 @@ class ExecutionOutput(BaseModel):
     decision_id: UUID
     fills: list[Fill]
     audit_id: UUID
+
+
+# ---------------------------------------------------------------------------
+# Discovery (advisory) — spec §5 extension, May 2026
+# ---------------------------------------------------------------------------
+# Discovery proposes pattern candidates that the operator can promote into
+# the Strategy agent's playbook by hand. Discovery is NOT in the order path.
+# Its output is logged to data/discoveries_log.jsonl and shown on the
+# cockpit /agents page with a clear "advisory only" badge.
+
+
+class DiscoveryInput(AgentRequest):
+    regime: Regime
+    universe: list[str]
+    features: dict[str, float]
+    recent_thesis: str | None = None  # research output passed through for context
+
+
+class PatternCandidate(BaseModel):
+    name: str = Field(
+        ...,
+        description="Short label, e.g. 'tech-vol-mean-revert' or 'energy-momentum-breakout'",
+    )
+    hypothesis: str = Field(
+        ...,
+        description="One paragraph explaining the proposed edge in plain English.",
+    )
+    symbols: list[str] = Field(
+        default_factory=list,
+        description="Tickers the pattern would touch. Must be in the curated universe.",
+    )
+    feature_keys: list[str] = Field(
+        default_factory=list,
+        description="Feature names from the input dict that anchor the pattern.",
+    )
+    confidence: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="How strongly the model believes the pattern is real.",
+    )
+    horizon_days: int = Field(
+        default=5,
+        ge=1,
+        le=60,
+        description="Expected holding period in trading days.",
+    )
+
+
+class DiscoveryOutput(BaseModel):
+    decision_id: UUID
+    patterns: list[PatternCandidate] = Field(default_factory=list)
+    notes: str = Field(
+        default="",
+        description="Optional commentary about what the model looked for.",
+    )
