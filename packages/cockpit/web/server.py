@@ -239,6 +239,13 @@ def equity_curve_points(window: int = 90) -> list[dict[str, Any]]:
 
 app = FastAPI(title="ai-investing cockpit", version="0.1.0")
 
+# Mount static assets (shared CSS/JS for every page).
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+_STATIC_DIR = Path(__file__).parent / "static"
+if _STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
@@ -276,6 +283,56 @@ def _render(name: str) -> HTMLResponse:
     if not path.exists():
         return HTMLResponse(f"<h1>template missing: {name}</h1>", status_code=500)
     return HTMLResponse(path.read_text(encoding="utf-8"))
+
+
+@app.get("/api/health")
+def api_health() -> dict[str, Any]:
+    """Compact health summary for the global topbar and health panel.
+
+    Includes data freshness, the most recent paper-loop run, error counts,
+    git commit so the user can verify what build is currently running, and
+    a derived ``status`` (ok / warn / down) that the UI maps to a color.
+    """
+    cstate = load_state()
+    err_counts = err_log.count_unresolved()
+    job_states = {k: job_mgr.status(k).to_dict() for k in ("paper_loop", "pretrain")}
+    last_run_ts: str | None = None
+    last_halted = False
+    try:
+        if PAPER_LOG.exists():
+            with PAPER_LOG.open(encoding="utf-8") as f:
+                last_line = ""
+                for line in f:
+                    if line.strip():
+                        last_line = line
+            if last_line:
+                obj = json.loads(last_line)
+                last_run_ts = obj.get("ts")
+                last_halted = bool(obj.get("halted", False))
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+    # Roll up an overall status
+    if err_counts.get("error", 0) > 0 or last_halted:
+        status = "warn"
+    elif not PAPER_LOG.exists():
+        status = "idle"
+    else:
+        status = "ok"
+    try:
+        commit = updater.current_commit()
+    except Exception:
+        commit = {"sha": "", "summary": ""}
+    return {
+        "status": status,
+        "now": datetime.now(UTC).isoformat(timespec="seconds"),
+        "mode": cstate.trading_mode,
+        "paused": cstate.paused,
+        "last_paper_run": last_run_ts,
+        "last_paper_halted": last_halted,
+        "errors": err_counts,
+        "jobs": job_states,
+        "commit": commit,
+    }
 
 
 @app.get("/api/state")

@@ -5,46 +5,40 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Trading - ai-investing</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/cockpit.css" />
+  <script src="/static/cockpit.js" defer></script>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
-    .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; }
-    .pill { padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
-    .pill-green { background: #064e3b; color: #6ee7b7; }
-    .pill-blue { background: #1e3a8a; color: #93c5fd; }
-    .pill-gray { background: #1f2937; color: #9ca3af; }
-    .pill-red { background: #7f1d1d; color: #fca5a5; }
-    .pill-yellow { background: #78350f; color: #fcd34d; }
-    .btn { padding: 8px 14px; border-radius: 8px; font-weight: 500; font-size: 13px; cursor: pointer; transition: all .15s; }
-    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .btn-primary { background: #2563eb; color: white; }
-    .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
-    .btn-ghost { background: #1f2937; color: #d1d5db; }
-    .btn-danger { background: #dc2626; color: white; }
     .log-box { background: #050810; border: 1px solid #1f2937; border-radius: 8px; padding: 12px; max-height: 520px; overflow-y: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; color: #d1d5db; }
-    .nav-link { padding: 6px 12px; border-radius: 6px; color: #9ca3af; text-decoration: none; font-size: 13px; }
-    .nav-link:hover { background: #1f2937; color: #f9fafb; }
-    .nav-active { background: #1f2937; color: #f9fafb; }
-    select, input[type=checkbox] { accent-color: #2563eb; }
     .select { background: #0b1220; border: 1px solid #1f2937; border-radius: 6px; padding: 8px 10px; color: #f9fafb; font-size: 13px; }
-    .nav-badge { display: inline-block; margin-left: 4px; padding: 1px 7px; font-size: 10px; font-weight: 700; border-radius: 999px; background: #7f1d1d; color: #fecaca; vertical-align: 1px; }
+    select, input[type=checkbox] { accent-color: #2563eb; }
     .mode-banner { padding: 14px 18px; border-radius: 12px; margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
     .mode-paper { background: linear-gradient(135deg, #064e3b 0%, #065f46 100%); border: 1px solid #10b981; color: #d1fae5; }
-    .mode-live { background: linear-gradient(135deg, #7f1d1d 0%, #991b1b 100%); border: 2px solid #ef4444; color: #fecaca; animation: pulse-live 2.4s ease-in-out infinite; box-shadow: 0 0 0 0 rgba(239,68,68,.5); }
+    .mode-live { background: linear-gradient(135deg, #7f1d1d 0%, #991b1b 100%); border: 2px solid #ef4444; color: #fecaca; animation: pulse-live 2.4s ease-in-out infinite; }
     @keyframes pulse-live { 0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,.45);} 50% { box-shadow: 0 0 0 12px rgba(239,68,68,0);} }
     .mode-dot { display:inline-block; width:10px; height:10px; border-radius:999px; margin-right:8px; }
     .mode-dot-paper { background:#34d399; box-shadow:0 0 8px #34d399; }
     .mode-dot-live { background:#fca5a5; box-shadow:0 0 10px #ef4444; }
+    .cycle-row td { padding: 6px 8px; border-bottom: 1px solid #1f2937; font-size: 12px; }
   </style>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="topbar"><div class="topbar-inner">
+    <a href="/" class="topbar-brand">
+      <span id="cockpit-conn-dot" class="topbar-brand-dot idle"></span>
+      <span>ai-investing</span>
+    </a>
+    <div id="cockpit-topbar"></div>
+  </div></div>
+
   <div class="max-w-5xl mx-auto p-6">
-    <nav class="flex items-center gap-1 mb-4 text-sm">
+    <nav class="nav flex items-center gap-1 mb-4 text-sm">
       <a href="/" class="nav-link">Dashboard</a>
       <a href="/trading" class="nav-link nav-active">Trading</a>
       <a href="/models" class="nav-link">Models</a>
       <a href="/settings" class="nav-link">Settings</a>
       <a href="/updates" class="nav-link">Updates</a>
-      <a href="/errors" class="nav-link">Errors<span id="nav-err-badge" class="nav-badge" style="display:none">0</span></a>
+      <a href="/errors" class="nav-link">Errors<span id="nav-err-badge" class="nav-badge" data-err-badge style="display:none">0</span></a>
+      <button id="shortcuts-btn" class="btn btn-ghost btn-sm ml-auto" data-tt="Keyboard shortcuts (press ?)">?</button>
     </nav>
 
     <div id="mode-banner" class="mode-banner mode-paper">
@@ -54,7 +48,7 @@
         <div class="text-xs opacity-80 mt-1" id="mode-sub">Orders go to Alpaca paper account ($100k simulated). No real money at risk.</div>
       </div>
       <div class="flex flex-col items-end gap-2">
-        <button id="mode-toggle-btn" class="btn btn-ghost">Switch to LIVE mode</button>
+        <button id="mode-toggle-btn" class="btn btn-ghost" data-tt="Switching to live mode auto-pauses the bot for safety. Requires live Alpaca keys.">Switch to LIVE mode</button>
         <span class="text-xs opacity-70" id="mode-keys"></span>
       </div>
     </div>
@@ -67,7 +61,7 @@
     <section class="card p-5 mb-4">
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
         <div>
-          <label class="text-xs text-gray-400 block mb-1">Strategy</label>
+          <label class="text-xs text-gray-400 block mb-1">Strategy <span class="tt" data-tt="ensemble blends mean-reversion + momentum signals; recommended default per spec §11.">?</span></label>
           <select id="strategy" class="select w-full">
             <option value="ensemble">ensemble (recommended)</option>
             <option value="mean-reversion">mean-reversion</option>
@@ -75,15 +69,15 @@
           </select>
         </div>
         <div>
-          <label class="text-xs text-gray-400 block mb-1">Mode</label>
+          <label class="text-xs text-gray-400 block mb-1">Mode <span class="tt" data-tt="Dry-run is the safe default — signals are computed and logged but no orders are submitted.">?</span></label>
           <label class="flex items-center gap-2 mt-2">
-            <input id="dry-run" type="checkbox" />
+            <input id="dry-run" type="checkbox" checked />
             <span class="text-sm">Dry run (no real orders)</span>
           </label>
         </div>
         <div class="flex gap-2 justify-end">
-          <button id="start-btn" class="btn btn-primary">Start loop</button>
-          <button id="stop-btn" class="btn btn-danger">Stop loop</button>
+          <button id="start-btn" class="btn btn-primary" data-tt="Begin a continuous trading loop. Default is dry-run for safety.">Start loop</button>
+          <button id="stop-btn" class="btn btn-danger" data-tt="Stop the running loop. Open positions are not touched — use Flatten on the dashboard for that.">Stop loop</button>
         </div>
       </div>
       <div class="mt-4 flex items-center gap-3">
@@ -92,10 +86,33 @@
       </div>
     </section>
 
+    <section class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium">Last 5 cycles <span class="tt" data-tt="Most recent paper-trade cycles. Halted means the regime gate or risk guard blocked sizing.">?</span></div>
+        <span class="text-xs text-gray-500" id="cycles-meta">—</span>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left">
+          <thead>
+            <tr class="text-xs uppercase tracking-wider text-gray-500">
+              <th class="pb-2 pr-3">Time</th>
+              <th class="pb-2 pr-3">Regime</th>
+              <th class="pb-2 pr-3">Orders</th>
+              <th class="pb-2 pr-3">P&amp;L</th>
+              <th class="pb-2 pr-3">Status</th>
+            </tr>
+          </thead>
+          <tbody id="cycles-body">
+            <tr><td colspan="5" class="text-xs text-gray-500 py-3">No cycles yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="card p-5">
       <div class="flex items-center justify-between mb-3">
-        <div class="text-sm font-medium">Live log</div>
-        <button id="clear-log" class="btn btn-ghost">Clear view</button>
+        <div class="text-sm font-medium">Live log <span class="tt" data-tt="Streamed stdout from the paper_loop process. Useful for debugging.">?</span></div>
+        <button id="clear-log" class="btn btn-ghost btn-sm">Clear view</button>
       </div>
       <div id="log" class="log-box">Click Start loop to begin. Logs will stream here.</div>
     </section>
@@ -103,29 +120,63 @@
 
   <script>
     let source = null;
+    let currentMode = 'paper';
+    let liveKeysPresent = false;
 
     async function refreshStatus() {
-      const r = await fetch('/api/trading/status');
-      const j = await r.json();
-      const pill = document.getElementById('status-pill');
-      const meta = document.getElementById('status-meta');
-      if (j.running) {
-        pill.textContent = 'running';
-        pill.className = 'pill pill-blue';
-        meta.textContent = `pid ${j.pid} - started ${j.started_at || '?'}`;
-      } else if (j.exit_code === 0) {
-        pill.textContent = 'stopped';
-        pill.className = 'pill pill-gray';
-        meta.textContent = `last finished ${j.finished_at || ''}`;
-      } else if (j.exit_code !== null && j.exit_code !== undefined) {
-        pill.textContent = 'crashed';
-        pill.className = 'pill pill-red';
-        meta.textContent = `exit ${j.exit_code} at ${j.finished_at || ''}`;
-      } else {
-        pill.textContent = 'idle';
-        pill.className = 'pill pill-gray';
-        meta.textContent = 'no loop running yet';
+      try {
+        const j = await Cockpit.api.get('/api/trading/status');
+        const pill = document.getElementById('status-pill');
+        const meta = document.getElementById('status-meta');
+        if (j.running) {
+          pill.textContent = 'running';
+          pill.className = 'pill pill-blue';
+          meta.textContent = `pid ${j.pid} · started ${j.started_at || '?'}`;
+        } else if (j.exit_code === 0) {
+          pill.textContent = 'stopped';
+          pill.className = 'pill pill-gray';
+          meta.textContent = `last finished ${j.finished_at || ''}`;
+        } else if (j.exit_code !== null && j.exit_code !== undefined) {
+          pill.textContent = 'crashed';
+          pill.className = 'pill pill-red';
+          meta.textContent = `exit ${j.exit_code} at ${j.finished_at || ''}`;
+        } else {
+          pill.textContent = 'idle';
+          pill.className = 'pill pill-gray';
+          meta.textContent = 'no loop running yet';
+        }
+        Cockpit.markConnection('live');
+      } catch (e) {
+        Cockpit.markConnection('offline');
       }
+    }
+
+    async function refreshTopbar() {
+      try {
+        const state = await Cockpit.api.get('/api/state');
+        Cockpit.renderTopbar(state);
+      } catch (e) { /* ignore */ }
+    }
+
+    async function refreshCycles() {
+      try {
+        const j = await Cockpit.api.get('/api/state');
+        const trades = (j.trades || []).slice(-5).reverse();
+        const tbody = document.getElementById('cycles-body');
+        if (!trades.length) {
+          tbody.innerHTML = '<tr><td colspan="5" class="text-xs text-gray-500 py-3">No cycles yet.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = trades.map(t => {
+          const reg = (t.regime || '—');
+          const pnl = (t.pnl !== undefined && t.pnl !== null) ? Cockpit.fmt.moneySigned(t.pnl) : '—';
+          const orders = (t.orders !== undefined) ? t.orders : (t.qty ? 1 : '—');
+          const halted = t.halted ? '<span class="pill pill-red">halted</span>' : '<span class="pill pill-green">ok</span>';
+          const ts = t.ts || t.time || '';
+          return `<tr class="cycle-row"><td>${Cockpit.fmt.escape(String(ts))}</td><td>${Cockpit.fmt.escape(reg)}</td><td>${orders}</td><td>${pnl}</td><td>${halted}</td></tr>`;
+        }).join('');
+        document.getElementById('cycles-meta').textContent = trades.length + ' shown';
+      } catch (e) { /* ignore */ }
     }
 
     async function start() {
@@ -134,20 +185,25 @@
       if (!dryRun) {
         if (!confirm('Start LIVE paper-trading? Orders will be submitted to Alpaca paper account.')) return;
       }
-      const r = await fetch('/api/trading/start', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({strategy, dry_run: dryRun}),
-      });
-      if (!r.ok) { alert('Failed to start trading loop'); return; }
-      attachStream();
-      refreshStatus();
+      try {
+        await Cockpit.api.post('/api/trading/start', {strategy, dry_run: dryRun});
+        Cockpit.toastSuccess(`Loop started (${strategy}${dryRun ? ', dry-run' : ''})`);
+        attachStream();
+        refreshStatus();
+      } catch (e) {
+        Cockpit.toastError('Failed to start trading loop: ' + e.message);
+      }
     }
 
     async function stop() {
       if (!confirm('Stop the paper-trade loop?')) return;
-      await fetch('/api/trading/stop', {method: 'POST'});
-      refreshStatus();
+      try {
+        await Cockpit.api.post('/api/trading/stop', {});
+        Cockpit.toastSuccess('Loop stopped');
+        refreshStatus();
+      } catch (e) {
+        Cockpit.toastError('Stop failed: ' + e.message);
+      }
     }
 
     function attachStream() {
@@ -166,9 +222,6 @@
       });
     }
 
-    let currentMode = 'paper';
-    let liveKeysPresent = false;
-
     function applyModeUI(j) {
       currentMode = j.mode || 'paper';
       liveKeysPresent = !!j.live_keys_present;
@@ -180,7 +233,7 @@
       const keys = document.getElementById('mode-keys');
       if (currentMode === 'live') {
         banner.className = 'mode-banner mode-live';
-        label.textContent = 'LIVE MODE - REAL MONEY';
+        label.textContent = 'LIVE MODE · REAL MONEY';
         sub.textContent = 'Orders route to your live Alpaca account. The bot is auto-paused; review carefully before resuming.';
         dot.className = 'mode-dot mode-dot-live';
         btn.textContent = 'Switch back to PAPER';
@@ -200,9 +253,7 @@
 
     async function loadMode() {
       try {
-        const r = await fetch('/api/mode');
-        if (!r.ok) return;
-        const j = await r.json();
+        const j = await Cockpit.api.get('/api/mode');
         applyModeUI(j);
       } catch (e) { /* ignore */ }
     }
@@ -210,68 +261,51 @@
     async function toggleMode() {
       if (currentMode === 'paper') {
         if (!liveKeysPresent) {
-          alert('Live Alpaca keys are not configured.\n\nGo to Settings and add ALPACA_LIVE_KEY_ID and ALPACA_LIVE_SECRET first.');
+          Cockpit.toastWarn('Live Alpaca keys are not configured. Add them on Settings first.');
           return;
         }
         const phrase = prompt(
           'WARNING: Switching to LIVE mode.\n\nReal orders will be submitted to your real Alpaca brokerage account using REAL MONEY.\n\nThe bot will be auto-paused for safety.\n\nType exactly:  I UNDERSTAND  to confirm.'
         );
         if (phrase !== 'I UNDERSTAND') {
-          if (phrase !== null) alert('Phrase did not match. Switch cancelled.');
+          if (phrase !== null) Cockpit.toastWarn('Phrase did not match. Switch cancelled.');
           return;
         }
-        const r = await fetch('/api/mode', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({mode: 'live', confirm_live: true}),
-        });
-        if (!r.ok) {
-          const j = await r.json().catch(() => ({}));
-          alert('Switch failed: ' + (j.detail || r.status));
-          return;
+        try {
+          await Cockpit.api.post('/api/mode', {mode: 'live', confirm_live: true});
+          await loadMode();
+          Cockpit.toastWarn('Switched to LIVE. Bot is paused. Resume from the Dashboard when ready.', 'Live mode');
+        } catch (e) {
+          Cockpit.toastError('Switch failed: ' + e.message);
         }
-        await loadMode();
-        alert('Switched to LIVE. Bot is paused. Resume from the Dashboard when ready.');
       } else {
         if (!confirm('Switch back to PAPER mode? The bot will be paused.')) return;
-        const r = await fetch('/api/mode', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({mode: 'paper', confirm_live: false}),
-        });
-        if (!r.ok) {
-          const j = await r.json().catch(() => ({}));
-          alert('Switch failed: ' + (j.detail || r.status));
-          return;
+        try {
+          await Cockpit.api.post('/api/mode', {mode: 'paper', confirm_live: false});
+          await loadMode();
+          Cockpit.toastSuccess('Switched to PAPER mode.');
+        } catch (e) {
+          Cockpit.toastError('Switch failed: ' + e.message);
         }
-        await loadMode();
       }
     }
 
-    async function refreshErrBadge() {
-      try {
-        const r = await fetch('/api/errors');
-        if (!r.ok) return;
-        const j = await r.json();
-        const c = j.counts || {};
-        const open = (c.error || 0) + (c.warning || 0);
-        const b = document.getElementById('nav-err-badge');
-        if (open > 0) { b.textContent = String(open); b.style.display = 'inline-block'; }
-        else { b.style.display = 'none'; }
-      } catch (e) {}
-    }
+    document.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('mode-toggle-btn').addEventListener('click', toggleMode);
+      document.getElementById('start-btn').addEventListener('click', start);
+      document.getElementById('stop-btn').addEventListener('click', stop);
+      document.getElementById('clear-log').addEventListener('click', () => { document.getElementById('log').textContent = ''; });
+      document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
 
-    document.getElementById('mode-toggle-btn').addEventListener('click', toggleMode);
-    document.getElementById('start-btn').addEventListener('click', start);
-    document.getElementById('stop-btn').addEventListener('click', stop);
-    document.getElementById('clear-log').addEventListener('click', () => { document.getElementById('log').textContent = ''; });
-
-    refreshStatus();
-    attachStream();
-    loadMode();
-    refreshErrBadge();
-    setInterval(refreshStatus, 3000);
-    setInterval(refreshErrBadge, 15000);
+      refreshStatus();
+      attachStream();
+      loadMode();
+      refreshTopbar();
+      refreshCycles();
+      setInterval(refreshStatus, 3000);
+      setInterval(refreshTopbar, 5000);
+      setInterval(refreshCycles, 10000);
+    });
   </script>
 </body>
 </html>

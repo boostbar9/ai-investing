@@ -5,29 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Errors - ai-investing</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/cockpit.css" />
+  <script src="/static/cockpit.js" defer></script>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
-    .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; }
-    .pill { padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
-    .pill-red { background: #7f1d1d; color: #fca5a5; }
-    .pill-yellow { background: #78350f; color: #fcd34d; }
-    .pill-blue { background: #1e3a8a; color: #93c5fd; }
-    .pill-gray { background: #1f2937; color: #9ca3af; }
-    .pill-green { background: #064e3b; color: #6ee7b7; }
-    .btn { padding: 8px 14px; border-radius: 8px; font-weight: 500; font-size: 13px; cursor: pointer; transition: all .15s; border: 0; }
-    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .btn-primary { background: #2563eb; color: white; }
-    .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
-    .btn-ghost { background: #1f2937; color: #d1d5db; }
-    .btn-ghost:hover:not(:disabled) { background: #374151; }
-    .btn-danger { background: #dc2626; color: white; }
-    .btn-danger:hover:not(:disabled) { background: #b91c1c; }
-    .nav-link { padding: 6px 12px; border-radius: 6px; color: #9ca3af; text-decoration: none; font-size: 13px; }
-    .nav-link:hover { background: #1f2937; color: #f9fafb; }
-    .nav-active { background: #1f2937; color: #f9fafb; }
-    .nav-badge { display: inline-block; margin-left: 4px; padding: 1px 7px; font-size: 10px; font-weight: 700; border-radius: 999px; background: #7f1d1d; color: #fecaca; vertical-align: 1px; }
     .select { background: #0b1220; border: 1px solid #1f2937; border-radius: 6px; padding: 8px 10px; color: #f9fafb; font-size: 13px; }
-    .err-row { border: 1px solid #1f2937; border-radius: 10px; padding: 12px 14px; background: #0b1220; }
+    .err-row { border: 1px solid #1f2937; border-radius: 10px; padding: 12px 14px; background: #0b1220; transition: border-color .15s; }
+    .err-row:hover { border-color: #374151; }
     .err-row.sev-error { border-left: 4px solid #ef4444; }
     .err-row.sev-warning { border-left: 4px solid #f59e0b; }
     .err-row.sev-info { border-left: 4px solid #3b82f6; }
@@ -35,19 +18,29 @@
     .ctx-chip { display: inline-block; background: #1f2937; color: #9ca3af; font-size: 10px; padding: 2px 8px; border-radius: 999px; margin: 2px 4px 2px 0; font-family: ui-monospace, Menlo, Consolas, monospace; }
     details > summary { cursor: pointer; user-select: none; }
     details > summary::-webkit-details-marker { color: #6b7280; }
-    .toast { position: fixed; bottom: 24px; right: 24px; padding: 12px 18px; border-radius: 8px; background: #064e3b; color: #6ee7b7; font-size: 13px; box-shadow: 0 10px 25px rgba(0,0,0,.4); opacity: 0; transform: translateY(10px); transition: all .2s; z-index: 50; }
-    .toast.show { opacity: 1; transform: translateY(0); }
+    .empty-state { background: #0b1220; border: 1px dashed #1f2937; border-radius: 12px; padding: 48px 24px; text-align: center; }
+    .empty-state .icon { font-size: 36px; opacity: 0.4; margin-bottom: 8px; }
+    .group-header { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #6b7280; padding: 12px 4px 6px; }
   </style>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="topbar"><div class="topbar-inner">
+    <a href="/" class="topbar-brand">
+      <span id="cockpit-conn-dot" class="topbar-brand-dot idle"></span>
+      <span>ai-investing</span>
+    </a>
+    <div id="cockpit-topbar"></div>
+  </div></div>
+
   <div class="max-w-6xl mx-auto p-6">
-    <nav class="flex items-center gap-1 mb-4 text-sm">
+    <nav class="nav flex items-center gap-1 mb-4 text-sm">
       <a href="/" class="nav-link">Dashboard</a>
       <a href="/trading" class="nav-link">Trading</a>
       <a href="/models" class="nav-link">Models</a>
       <a href="/settings" class="nav-link">Settings</a>
       <a href="/updates" class="nav-link">Updates</a>
-      <a href="/errors" class="nav-link nav-active">Errors<span id="nav-badge" class="nav-badge" style="display:none">0</span></a>
+      <a href="/errors" class="nav-link nav-active">Errors<span id="nav-err-badge" class="nav-badge" data-err-badge style="display:none">0</span></a>
+      <button id="shortcuts-btn" class="btn btn-ghost btn-sm ml-auto" data-tt="Keyboard shortcuts (press ?)">?</button>
     </nav>
 
     <header class="mb-6 flex items-start justify-between gap-4 flex-wrap">
@@ -56,9 +49,9 @@
         <p class="text-sm text-gray-400">All cockpit exceptions, subprocess crashes, and warnings land here. Use Copy as Markdown to paste a debug report into chat.</p>
       </div>
       <div class="flex gap-2 flex-wrap">
-        <button id="refresh-btn" class="btn btn-ghost">Refresh</button>
-        <button id="copy-md-btn" class="btn btn-primary">Copy as Markdown</button>
-        <button id="clear-btn" class="btn btn-danger">Clear log</button>
+        <button id="refresh-btn" class="btn btn-ghost" data-tt="Reload from /api/errors right now.">Refresh</button>
+        <button id="copy-md-btn" class="btn btn-primary" data-tt="Copy a markdown debug bundle (last 100 entries) to your clipboard.">Copy as Markdown</button>
+        <button id="clear-btn" class="btn btn-danger" data-tt="Delete every entry from the error log. Cannot be undone.">Clear log</button>
       </div>
     </header>
 
@@ -74,12 +67,16 @@
           </select>
         </div>
         <div class="flex items-center gap-2 text-xs">
-          <span id="count-error" class="pill pill-red">0 errors</span>
-          <span id="count-warning" class="pill pill-yellow">0 warnings</span>
-          <span id="count-info" class="pill pill-blue">0 info</span>
+          <span id="count-error" class="pill pill-red" data-tt="Open errors. Anything with severity=error blocks acceptance criteria.">0 errors</span>
+          <span id="count-warning" class="pill pill-yellow" data-tt="Warnings. Worth a look but non-blocking.">0 warnings</span>
+          <span id="count-info" class="pill pill-blue" data-tt="Informational entries from subprocesses.">0 info</span>
           <span id="count-total" class="text-gray-500">0 total</span>
         </div>
-        <div class="ml-auto flex items-center gap-2">
+        <div class="ml-auto flex items-center gap-3 flex-wrap">
+          <label class="text-xs text-gray-400 flex items-center gap-2" data-tt="Group entries by source process (paper_loop, cockpit, pretrain).">
+            <input id="group-by-source" type="checkbox" />
+            <span>Group by source</span>
+          </label>
           <label class="text-xs text-gray-400 flex items-center gap-2">
             <input id="auto-refresh" type="checkbox" checked />
             <span>Auto-refresh (10s)</span>
@@ -89,24 +86,14 @@
     </section>
 
     <section id="entries" class="space-y-2">
-      <div class="card p-6 text-center text-gray-500">Loading...</div>
+      <div class="card p-6 text-center text-gray-500"><span class="skel" style="display:inline-block;width:120px;height:14px">&nbsp;</span></div>
     </section>
   </div>
-
-  <div id="toast" class="toast">Copied</div>
 
   <script>
     let refreshTimer = null;
     let currentSeverity = '';
-
-    function fmtTime(iso) {
-      try {
-        const d = new Date(iso);
-        return d.toLocaleString();
-      } catch (e) {
-        return iso;
-      }
-    }
+    let groupBySource = false;
 
     function pillForSev(sev) {
       if (sev === 'error') return 'pill pill-red';
@@ -115,36 +102,27 @@
       return 'pill pill-gray';
     }
 
-    function escapeHtml(s) {
-      if (s == null) return '';
-      return String(s)
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;')
-        .replaceAll("'", '&#39;');
-    }
-
-    function renderEntry(e, idx) {
+    function renderEntry(e) {
       const sev = e.severity || 'error';
+      const esc = Cockpit.fmt.escape;
       const ctxChips = e.context ? Object.entries(e.context).map(([k,v]) =>
-        `<span class="ctx-chip">${escapeHtml(k)}=${escapeHtml(typeof v === 'object' ? JSON.stringify(v) : v)}</span>`
+        `<span class="ctx-chip">${esc(k)}=${esc(typeof v === 'object' ? JSON.stringify(v) : v)}</span>`
       ).join('') : '';
       const detailBlock = e.detail ? `
         <details class="mt-2">
           <summary class="text-xs text-gray-400">Show traceback / detail</summary>
-          <div class="err-detail mt-2">${escapeHtml(e.detail)}</div>
+          <div class="err-detail mt-2">${esc(e.detail)}</div>
         </details>` : '';
       return `
-        <div class="err-row sev-${sev}">
+        <div class="err-row sev-${sev} fade-in">
           <div class="flex items-center justify-between gap-3 flex-wrap">
             <div class="flex items-center gap-2 flex-wrap">
-              <span class="${pillForSev(sev)}">${escapeHtml(sev)}</span>
-              <span class="text-xs text-gray-500 font-mono">${escapeHtml(e.source || '?')}</span>
-              <span class="text-xs text-gray-500">${escapeHtml(fmtTime(e.ts))}</span>
+              <span class="${pillForSev(sev)}">${esc(sev)}</span>
+              <span class="text-xs text-gray-500 font-mono">${esc(e.source || '?')}</span>
+              <span class="text-xs text-gray-500">${esc(Cockpit.fmt.time(e.ts))}</span>
             </div>
           </div>
-          <div class="mt-2 text-sm text-gray-100">${escapeHtml(e.message || '(no message)')}</div>
+          <div class="mt-2 text-sm text-gray-100">${esc(e.message || '(no message)')}</div>
           ${ctxChips ? `<div class="mt-2">${ctxChips}</div>` : ''}
           ${detailBlock}
         </div>
@@ -158,100 +136,118 @@
       document.getElementById('count-warning').textContent = `${c.warning || 0} warnings`;
       document.getElementById('count-info').textContent = `${c.info || 0} info`;
       document.getElementById('count-total').textContent = `${total} total`;
-      const badge = document.getElementById('nav-badge');
-      const open = (c.error || 0) + (c.warning || 0);
-      if (open > 0) {
-        badge.textContent = String(open);
-        badge.style.display = 'inline-block';
-      } else {
-        badge.style.display = 'none';
-      }
     }
 
     async function load() {
       try {
         const sev = currentSeverity;
         const url = sev ? `/api/errors?severity=${encodeURIComponent(sev)}` : '/api/errors';
-        const r = await fetch(url);
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const j = await r.json();
+        const j = await Cockpit.api.get(url);
         setCounts(j.counts);
+        Cockpit.markConnection('live');
         const entries = j.entries || [];
         const container = document.getElementById('entries');
         if (entries.length === 0) {
-          container.innerHTML = '<div class="card p-6 text-center text-gray-500">No entries to show. The error log is empty (or your filter has no matches).</div>';
+          container.innerHTML = `
+            <div class="empty-state">
+              <div class="icon">◯</div>
+              <div class="text-base text-gray-300">All clear — no entries to show.</div>
+              <div class="text-xs text-gray-500 mt-2">The error log is empty${currentSeverity ? ' for the selected filter' : ''}. Things look healthy.</div>
+            </div>`;
           return;
         }
-        container.innerHTML = entries.map(renderEntry).join('');
+        if (groupBySource) {
+          const groups = {};
+          for (const e of entries) {
+            const src = e.source || 'unknown';
+            (groups[src] = groups[src] || []).push(e);
+          }
+          const sources = Object.keys(groups).sort();
+          container.innerHTML = sources.map(src => {
+            const list = groups[src];
+            const head = `<div class="group-header">${Cockpit.fmt.escape(src)} · ${list.length} entr${list.length === 1 ? 'y' : 'ies'}</div>`;
+            return head + list.map(renderEntry).join('');
+          }).join('');
+        } else {
+          container.innerHTML = entries.map(renderEntry).join('');
+        }
+        Cockpit.initTooltips(container);
       } catch (e) {
+        Cockpit.markConnection('offline');
         document.getElementById('entries').innerHTML =
-          `<div class="card p-6 text-center text-red-400">Failed to load errors: ${escapeHtml(e.message)}</div>`;
+          `<div class="card p-6 text-center text-red-400">Failed to load errors: ${Cockpit.fmt.escape(e.message)}</div>`;
       }
     }
 
-    function showToast(msg) {
-      const t = document.getElementById('toast');
-      t.textContent = msg;
-      t.classList.add('show');
-      setTimeout(() => t.classList.remove('show'), 1800);
+    async function refreshTopbar() {
+      try {
+        const state = await Cockpit.api.get('/api/state');
+        Cockpit.renderTopbar(state);
+      } catch (e) { /* ignore */ }
     }
 
     async function copyMarkdown() {
       try {
-        const r = await fetch('/api/errors/markdown?limit=100');
-        const j = await r.json();
+        const j = await Cockpit.api.get('/api/errors/markdown?limit=100');
         const md = j.markdown || '';
-        if (!md.trim()) { showToast('Nothing to copy'); return; }
+        if (!md.trim()) { Cockpit.toastWarn('Nothing to copy'); return; }
         try {
           await navigator.clipboard.writeText(md);
-          showToast('Copied ' + md.length + ' chars to clipboard');
+          Cockpit.toastSuccess(`Copied ${md.length} chars to clipboard`);
         } catch (clipErr) {
-          // Fallback: open a textarea so the user can copy manually
           const ta = document.createElement('textarea');
           ta.value = md;
-          ta.style.position = 'fixed';
-          ta.style.left = '0';
-          ta.style.top = '0';
-          ta.style.width = '100%';
-          ta.style.height = '50vh';
+          ta.style.position = 'fixed'; ta.style.left = '0'; ta.style.top = '0';
+          ta.style.width = '100%'; ta.style.height = '50vh';
           document.body.appendChild(ta);
           ta.select();
-          try { document.execCommand('copy'); showToast('Copied (fallback)'); }
-          catch (e) { showToast('Copy failed - select and Ctrl+C manually'); }
+          try { document.execCommand('copy'); Cockpit.toastSuccess('Copied (fallback)'); }
+          catch (e) { Cockpit.toastError('Copy failed — select and Ctrl+C manually'); }
           setTimeout(() => ta.remove(), 4000);
         }
       } catch (e) {
-        showToast('Failed: ' + e.message);
+        Cockpit.toastError('Failed: ' + e.message);
       }
     }
 
     async function clearLog() {
       if (!confirm('Clear ALL entries from the error log? This cannot be undone.')) return;
-      const r = await fetch('/api/errors/clear', {method: 'POST'});
-      if (!r.ok) { showToast('Clear failed'); return; }
-      const j = await r.json();
-      showToast(`Cleared ${j.cleared || 0} entries`);
-      load();
+      try {
+        const j = await Cockpit.api.post('/api/errors/clear', {});
+        Cockpit.toastSuccess(`Cleared ${j.cleared || 0} entries`);
+        load();
+      } catch (e) {
+        Cockpit.toastError('Clear failed: ' + e.message);
+      }
     }
 
-    document.getElementById('refresh-btn').addEventListener('click', load);
-    document.getElementById('copy-md-btn').addEventListener('click', copyMarkdown);
-    document.getElementById('clear-btn').addEventListener('click', clearLog);
-    document.getElementById('sev-filter').addEventListener('change', (e) => {
-      currentSeverity = e.target.value;
-      load();
-    });
-    document.getElementById('auto-refresh').addEventListener('change', (e) => {
-      if (e.target.checked) {
-        refreshTimer = setInterval(load, 10000);
-      } else if (refreshTimer) {
-        clearInterval(refreshTimer);
-        refreshTimer = null;
-      }
-    });
+    document.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('refresh-btn').addEventListener('click', load);
+      document.getElementById('copy-md-btn').addEventListener('click', copyMarkdown);
+      document.getElementById('clear-btn').addEventListener('click', clearLog);
+      document.getElementById('sev-filter').addEventListener('change', (e) => {
+        currentSeverity = e.target.value;
+        load();
+      });
+      document.getElementById('group-by-source').addEventListener('change', (e) => {
+        groupBySource = e.target.checked;
+        load();
+      });
+      document.getElementById('auto-refresh').addEventListener('change', (e) => {
+        if (e.target.checked) {
+          refreshTimer = setInterval(load, 10000);
+        } else if (refreshTimer) {
+          clearInterval(refreshTimer);
+          refreshTimer = null;
+        }
+      });
+      document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
 
-    load();
-    refreshTimer = setInterval(load, 10000);
+      load();
+      refreshTopbar();
+      refreshTimer = setInterval(load, 10000);
+      setInterval(refreshTopbar, 5000);
+    });
   </script>
 </body>
 </html>

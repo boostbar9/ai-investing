@@ -76,6 +76,36 @@ def test_index_serves_html(client: TestClient) -> None:
     assert "ai-investing cockpit" in r.text.lower() or "cockpit" in r.text.lower()
 
 
+def test_health_endpoint_shape(client: TestClient) -> None:
+    """/api/health must return the contract the global topbar expects."""
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    j = r.json()
+    for key in (
+        "status",
+        "now",
+        "mode",
+        "paused",
+        "last_paper_run",
+        "last_paper_halted",
+        "errors",
+        "jobs",
+        "commit",
+    ):
+        assert key in j, f"missing key {key!r}"
+    assert j["status"] in {"ok", "warn", "idle", "down"}
+    assert isinstance(j["errors"], dict)
+    assert isinstance(j["jobs"], dict)
+
+
+def test_static_assets_mounted(client: TestClient) -> None:
+    """Shared CSS/JS must be served at /static so every page can load them."""
+    for path in ("/static/cockpit.css", "/static/cockpit.js"):
+        r = client.get(path)
+        assert r.status_code == 200, f"{path} -> {r.status_code}"
+        assert len(r.text) > 100
+
+
 def test_state_endpoint_returns_snapshot(client: TestClient) -> None:
     r = client.get("/api/state")
     assert r.status_code == 200
