@@ -113,6 +113,55 @@ def _load() -> None:
 _load()
 
 
+# Directories Windows needs in PATH so a freshly-spawned Python can load its
+# own DLLs (VC++ runtime, ucrtbase, etc.). We add these defensively because
+# some shells strip System32 from PATH or replace it with a sanitized one,
+# which causes child Python processes to die instantly with STATUS_DLL_INIT_FAILED
+# (Windows exit code 3221225794) before they can print a traceback.
+_WINDOWS_SYSTEM_PATHS = (
+    r"C:\Windows\System32",
+    r"C:\Windows",
+    r"C:\Windows\System32\Wbem",
+    r"C:\Windows\System32\WindowsPowerShell\v1.0",
+)
+
+# Environment variables that, if leaked from the parent shell, will break
+# child Python interpreters by pointing them at the wrong install.
+_PYTHON_ENV_LANDMINES = ("PYTHONHOME",)
+
+
+def _child_env() -> dict[str, str]:
+    """Build a sanitized environment for spawning Python child jobs.
+
+    Three jobs:
+
+    * Inherit the cockpit's env (so user-configured API keys flow through).
+    * Strip variables that are known to break child Python processes when
+      they leak from an enclosing shell (currently ``PYTHONHOME`` — if it
+      points at a different install, the child crashes at startup with
+      ``STATUS_DLL_INIT_FAILED``).
+    * On Windows, ensure ``PATH`` contains the system directories that
+      Python needs to find its runtime DLLs. We append rather than prepend
+      so user-customised PATH still wins for everything else.
+    """
+    env = os.environ.copy()
+    for var in _PYTHON_ENV_LANDMINES:
+        env.pop(var, None)
+    env.setdefault("PYTHONPATH", ".")
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    if os.name == "nt":
+        path = env.get("PATH", "")
+        parts = [p for p in path.split(os.pathsep) if p]
+        existing = {p.lower() for p in parts}
+        for sys_dir in _WINDOWS_SYSTEM_PATHS:
+            if sys_dir.lower() not in existing:
+                parts.append(sys_dir)
+        env["PATH"] = os.pathsep.join(parts)
+    return env
+
+
 def status(kind: str) -> JobInfo:
     with _lock:
         return _jobs.get(kind, JobInfo(kind=kind))
@@ -134,10 +183,7 @@ def start(kind: str, command: list[str], cwd: Path | None = None) -> JobInfo:
         # Truncate prior log so the UI tail starts clean.
         log_path.write_text("", encoding="utf-8")
 
-        env = os.environ.copy()
-        env.setdefault("PYTHONPATH", ".")
-        env["PYTHONUNBUFFERED"] = "1"
-        env["PYTHONIOENCODING"] = "utf-8"
+        env = _child_env()
 
         # Open the log file twice: one handle for the subprocess, one for tailers.
         f_out = log_path.open("a", encoding="utf-8", buffering=1)
