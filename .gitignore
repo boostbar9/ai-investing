@@ -76,3 +76,4 @@ data/parquet/
 data/paper_log/
 data/cockpit/
 data/sentiment_cache.json
+data/agents_log.jsonl
