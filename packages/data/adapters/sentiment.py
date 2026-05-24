@@ -47,7 +47,67 @@ _NEGATIVE = {
 _NEGATORS = {"not", "no", "never", "isn't", "won't", "doesn't", "ain't"}
 
 _TICKER_RE = re.compile(r"\$([A-Z]{1,5})\b")
+_BARE_TICKER_RE = re.compile(r"\b([A-Z]{2,5})\b")
 _WORD_RE = re.compile(r"[A-Za-z']+")
+
+
+# Name -> ticker map for the major names we trade. Helps us catch mentions
+# like "Apple" or "Tesla" in mainstream news (not just $AAPL on Reddit).
+# Keys are lowercase substrings; matching is conservative on purpose.
+DEFAULT_NAME_TO_TICKER: dict[str, str] = {
+    "apple": "AAPL",
+    "microsoft": "MSFT",
+    "nvidia": "NVDA",
+    "alphabet": "GOOGL",
+    "google": "GOOGL",
+    "amazon": "AMZN",
+    "meta platforms": "META",
+    "facebook": "META",
+    "tesla": "TSLA",
+    "berkshire": "BRK-B",
+    "jpmorgan": "JPM",
+    "jp morgan": "JPM",
+    "johnson & johnson": "JNJ",
+    "visa": "V",
+    "mastercard": "MA",
+    "walmart": "WMT",
+    "procter & gamble": "PG",
+    "chevron": "CVX",
+    "exxon": "XOM",
+    "home depot": "HD",
+    "unitedhealth": "UNH",
+    "eli lilly": "LLY",
+    "broadcom": "AVGO",
+    "s&p 500": "SPY",
+    "s&p500": "SPY",
+    "sp500": "SPY",
+    "nasdaq": "QQQ",
+    "russell 2000": "IWM",
+    "dow jones": "DIA",
+}
+
+# Common false-positive bare-uppercase tokens that look like tickers but aren't.
+_TICKER_BLACKLIST = frozenset({
+    "USA", "NYSE", "NASDAQ", "SEC", "FED", "CEO", "CFO", "CTO", "COO",
+    "ETF", "IPO", "GDP", "CPI", "PCE", "FOMC", "ECB", "BOJ", "PBOC",
+    "AI", "ML", "EV", "USD", "EUR", "GBP", "JPY", "CNY",
+    "PM", "AM", "ET", "PT", "UTC", "EST", "PST", "GMT",
+    "YEAR", "WEEK", "DAY", "MONTH", "NEWS", "DATA", "INC", "LLC",
+    "AND", "THE", "FOR", "WITH", "FROM", "INTO", "OVER",
+    "HIGH", "LOW", "OPEN", "CLOSE", "BUY", "SELL", "HOLD",
+    "EU", "UK", "UN", "NATO", "OPEC",
+    "REUTERS", "AP", "WSJ", "FT", "CNBC", "BBC",
+})
+
+# Known tickers we actively trade; bare-uppercase matching is restricted to
+# this set to avoid pulling in random capitalized words from news copy.
+_KNOWN_TICKERS = frozenset({
+    "SPY", "QQQ", "IWM", "DIA",
+    "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU", "XLRE", "XLC",
+    "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META", "TSLA",
+    "JPM", "JNJ", "V", "MA", "WMT", "PG", "CVX", "XOM", "HD", "UNH", "LLY", "AVGO",
+    "BRK", "BRKB",
+})
 
 
 def score_headline(text: str) -> float:
@@ -85,16 +145,44 @@ def score_headline(text: str) -> float:
 
 
 def extract_tickers(text: str) -> list[str]:
-    """Extract ``$TICKER`` mentions, deduplicated, uppercase."""
+    """Extract ticker mentions, deduplicated, uppercase.
+
+    Matches three flavors of mention:
+    1. ``$AAPL`` (Reddit/Twitter convention) -- highest signal.
+    2. Bare uppercase tokens (``AAPL``) but only from a known-ticker allowlist,
+       so common acronyms (CEO, USA, FED) are not mistaken for symbols.
+    3. Common company names ("Apple", "Tesla") via :data:`DEFAULT_NAME_TO_TICKER`.
+    """
     if not text:
         return []
     seen: set[str] = set()
     out: list[str] = []
+
+    # 1. Explicit $TICKER mentions
     for m in _TICKER_RE.finditer(text):
         sym = m.group(1).upper()
         if sym not in seen:
             seen.add(sym)
             out.append(sym)
+
+    # 2. Bare uppercase tokens, restricted to known tickers and not blacklisted.
+    for m in _BARE_TICKER_RE.finditer(text):
+        sym = m.group(1).upper()
+        if sym in _TICKER_BLACKLIST:
+            continue
+        if sym not in _KNOWN_TICKERS:
+            continue
+        if sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+
+    # 3. Company names (case-insensitive substring match)
+    low = text.lower()
+    for name, sym in DEFAULT_NAME_TO_TICKER.items():
+        if name in low and sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+
     return out
 
 
@@ -114,8 +202,12 @@ DEFAULT_SUBREDDITS = (
 DEFAULT_RSS = (
     # Yahoo Finance top news.
     "https://finance.yahoo.com/news/rssindex",
-    # MarketWatch top stories.
-    "https://feeds.marketwatch.com/marketwatch/topstories/",
+    # MarketWatch top stories (now https://).
+    "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+    # MarketWatch market pulse.
+    "https://feeds.content.dowjones.io/public/rss/mw_marketpulse",
+    # Seeking Alpha market-news.
+    "https://seekingalpha.com/market_currents.xml",
 )
 
 
@@ -134,7 +226,17 @@ class SentimentAdapter(DataAdapter):
         self.rss_feeds = rss_feeds
         self._client = client or httpx.AsyncClient(
             timeout=20,
-            headers={"User-Agent": os.getenv("SENTIMENT_USER_AGENT", "ai-investing/0.1")},
+            follow_redirects=True,
+            headers={
+                "User-Agent": os.getenv(
+                    "SENTIMENT_USER_AGENT",
+                    # Reddit aggressively blocks generic clients. A browser-like
+                    # UA + accepting JSON improves the success rate from cloud IPs.
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                ),
+                "Accept": "application/json, text/xml, text/html, */*",
+            },
         )
 
     async def health(self) -> dict[str, Any]:

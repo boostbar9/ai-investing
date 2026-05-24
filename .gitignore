@@ -71,3 +71,5 @@ temporal-data/
 Thumbs.db
 *.bak
 data/parquet/
+data/paper_log/
+data/sentiment_cache.json

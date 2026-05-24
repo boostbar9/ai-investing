@@ -66,6 +66,32 @@ def test_extract_tickers_no_tickers():
     assert extract_tickers("") == []
 
 
+def test_extract_tickers_company_names():
+    # Mainstream news mentions company names, not $TICKER.
+    assert "TSLA" in extract_tickers("Tesla shares rally on robotaxi news")
+    assert "AAPL" in extract_tickers("Apple unveils new AI chip")
+    assert "SPY" in extract_tickers("S&P 500 hits new high")
+    assert "QQQ" in extract_tickers("Nasdaq jumps 2% on tech earnings")
+
+
+def test_extract_tickers_bare_uppercase_allowlist():
+    # Bare tickers only match known symbols.
+    assert "AAPL" in extract_tickers("AAPL beats earnings")
+    # Common acronyms must NOT be mistaken for tickers.
+    assert extract_tickers("The CEO of the company met with the SEC") == []
+    assert extract_tickers("Fed signals dovish stance, USA growth strong") == []
+
+
+def test_extract_tickers_mixed():
+    text = "Tesla and $NVDA surge as the Fed holds rates"
+    out = extract_tickers(text)
+    assert "TSLA" in out
+    assert "NVDA" in out
+    assert "FED" not in out  # blacklist
+    # No duplicates
+    assert len(out) == len(set(out))
+
+
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
