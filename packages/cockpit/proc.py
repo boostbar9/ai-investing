@@ -208,6 +208,19 @@ def start(kind: str, command: list[str], cwd: Path | None = None) -> JobInfo:
         # (STATUS_DLL_INIT_FAILED, exit 3221225794) before printing anything.
         # PIPE is universally safe — we copy bytes to the log file from a
         # daemon thread in the parent process.
+        #
+        # On Windows we *also* break the child out of any Windows job object
+        # the cockpit is part of (CREATE_BREAKAWAY_FROM_JOB) and detach
+        # console inheritance (CREATE_NO_WINDOW). When a cockpit is launched
+        # from Windows Terminal / SSH / VS Code, the launching shell often
+        # places the cockpit in a job object that restricts child DLL
+        # loading. Breaking out lets each background job spawn cleanly.
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = (
+                subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+                | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+            )
         try:
             proc = subprocess.Popen(
                 command,
@@ -217,7 +230,37 @@ def start(kind: str, command: list[str], cwd: Path | None = None) -> JobInfo:
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 bufsize=0,
+                creationflags=creationflags,
             )
+        except OSError as e:
+            # CREATE_BREAKAWAY_FROM_JOB fails with ERROR_ACCESS_DENIED when
+            # the parent job forbids breakaway. Fall back to spawning without
+            # the flag — child may still inherit the job, but at least we
+            # tried, and we surface this in the log so the operator knows.
+            if (
+                os.name == "nt"
+                and getattr(e, "winerror", None) == 5
+                and creationflags
+            ):
+                with contextlib.suppress(OSError):
+                    log_path.open("a", encoding="utf-8").write(
+                        f"[proc] CREATE_BREAKAWAY_FROM_JOB denied for {kind}; "
+                        f"retrying without breakaway. If the child fails with "
+                        f"STATUS_DLL_INIT_FAILED, the cockpit's parent job is "
+                        f"restricting children.\n"
+                    )
+                proc = subprocess.Popen(
+                    command,
+                    cwd=str(cwd or REPO_ROOT),
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    bufsize=0,
+                    creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
+                )
+            else:
+                raise RuntimeError(f"failed to launch {kind}: {e}") from e
         except Exception as e:
             raise RuntimeError(f"failed to launch {kind}: {e}") from e
 
