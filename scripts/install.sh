@@ -53,7 +53,7 @@ ok "$(git --version)"
 section "Getting the code"
 
 if [ -d "$INSTALL_DIR/.git" ]; then
-  ok "Repo already exists at $INSTALL_DIR — pulling latest"
+  ok "Repo already exists at $INSTALL_DIR - pulling latest"
   git -C "$INSTALL_DIR" pull --ff-only
 elif [ -e "$INSTALL_DIR" ]; then
   fail "$INSTALL_DIR exists but is not a git repo. Move or delete it, then re-run."
@@ -110,7 +110,7 @@ fi
 if [ "$SKIP_DOCTOR" != "1" ]; then
   section "Running doctor"
   PYTHONPATH=. "$VENV_PY" tools/doctor.py || \
-    warn "Doctor reported issues — review the output above. Most often this means .env still needs Alpaca keys."
+    warn "Doctor reported issues - review the output above. Most often this means .env still needs Alpaca keys."
 fi
 
 # ----------------------------------------------------------------------

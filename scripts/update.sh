@@ -87,7 +87,7 @@ section "Fetching updates"
 git fetch origin main --quiet
 behind=$(git rev-list --count HEAD..origin/main)
 if [ "$behind" = "0" ]; then
-  ok "Already up to date — nothing to pull"
+  ok "Already up to date - nothing to pull"
 else
   ok "$behind new commit(s) on origin/main"
   git pull --ff-only origin main
@@ -103,7 +103,7 @@ VENV_PY="$INSTALL_DIR/.venv/bin/python"
 VENV_PIP="$INSTALL_DIR/.venv/bin/pip"
 
 if [ ! -x "$VENV_PY" ]; then
-  warn ".venv not found — running fresh dependency install"
+  warn ".venv not found - running fresh dependency install"
   python3 -m venv .venv
   "$VENV_PY" -m pip install --upgrade pip --quiet
   "$VENV_PIP" install -e ".[dev]" --quiet
@@ -111,11 +111,11 @@ if [ ! -x "$VENV_PY" ]; then
 else
   post_toml=$(hash_file pyproject.toml || true)
   if [ "$pre_toml" != "$post_toml" ]; then
-    ok "pyproject.toml changed — reinstalling dependencies"
+    ok "pyproject.toml changed - reinstalling dependencies"
     "$VENV_PIP" install -e ".[dev]" --quiet
     ok "Dependencies updated"
   else
-    ok "pyproject.toml unchanged — skipping pip install"
+    ok "pyproject.toml unchanged - skipping pip install"
   fi
 fi
 
@@ -140,7 +140,7 @@ fi
 if [ "$SKIP_DOCTOR" != "1" ] && [ -x "$VENV_PY" ]; then
   section "Running doctor"
   PYTHONPATH=. "$VENV_PY" tools/doctor.py || \
-    warn "Doctor reported issues — review the output above."
+    warn "Doctor reported issues - review the output above."
 fi
 
 # ----------------------------------------------------------------------

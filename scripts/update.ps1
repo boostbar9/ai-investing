@@ -10,7 +10,7 @@
   Designed to be re-runnable and to never destroy local changes:
     * Refuses to pull if the working tree has uncommitted edits
     * Refuses to pull if you're on a branch other than main
-    * Stashes nothing automatically — surfaces the problem and exits
+    * Stashes nothing automatically - surfaces the problem and exits
 
 .EXAMPLE
   PS> cd C:\Users\devfa\ai-investing; .\scripts\update.ps1
@@ -99,7 +99,7 @@ Write-Section "Fetching updates"
 git fetch origin main --quiet
 $behindCount = [int]((git rev-list --count "HEAD..origin/main").Trim())
 if ($behindCount -eq 0) {
-  Write-Ok "Already up to date — nothing to pull"
+  Write-Ok "Already up to date - nothing to pull"
 } else {
   Write-Ok "$behindCount new commit(s) on origin/main"
   git pull --ff-only origin main
@@ -116,7 +116,7 @@ $venvPython = Join-Path $InstallDir ".venv\Scripts\python.exe"
 $venvPip    = Join-Path $InstallDir ".venv\Scripts\pip.exe"
 
 if (-not (Test-Path $venvPython)) {
-  Write-Warn ".venv not found — running fresh dependency install"
+  Write-Warn ".venv not found - running fresh dependency install"
   python -m venv .venv
   & $venvPython -m pip install --upgrade pip --quiet
   & $venvPip install -e ".[dev]" --quiet
@@ -124,11 +124,11 @@ if (-not (Test-Path $venvPython)) {
 } else {
   $postToml = if (Test-Path "pyproject.toml") { (Get-FileHash pyproject.toml).Hash } else { "" }
   if ($preToml -ne $postToml -or $preHash -eq "") {
-    Write-Ok "pyproject.toml changed — reinstalling dependencies"
+    Write-Ok "pyproject.toml changed - reinstalling dependencies"
     & $venvPip install -e ".[dev]" --quiet
     Write-Ok "Dependencies updated"
   } else {
-    Write-Ok "pyproject.toml unchanged — skipping pip install"
+    Write-Ok "pyproject.toml unchanged - skipping pip install"
   }
 }
 
@@ -157,7 +157,7 @@ if (-not $SkipDoctor -and (Test-Path $venvPython)) {
   try {
     & $venvPython tools/doctor.py
   } catch {
-    Write-Warn "Doctor reported issues — review the output above."
+    Write-Warn "Doctor reported issues - review the output above."
   }
 }
 

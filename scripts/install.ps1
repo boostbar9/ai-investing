@@ -86,7 +86,7 @@ Write-Ok $gitVersion
 Write-Section "Getting the code"
 
 if (Test-Path (Join-Path $InstallDir ".git")) {
-  Write-Ok "Repo already exists at $InstallDir — pulling latest"
+  Write-Ok "Repo already exists at $InstallDir - pulling latest"
   Push-Location $InstallDir
   git pull --ff-only
   Pop-Location
@@ -151,7 +151,7 @@ if (-not $SkipDoctor) {
   try {
     & $venvPython tools/doctor.py
   } catch {
-    Write-Warn "Doctor reported issues — review the output above. Most often this means .env still needs Alpaca keys."
+    Write-Warn "Doctor reported issues - review the output above. Most often this means .env still needs Alpaca keys."
   }
 }
 
