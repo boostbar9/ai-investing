@@ -187,6 +187,53 @@
 
     <section class="card p-5 mb-4">
       <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium">
+          Self-improvement scorecard
+          <span class="pill pill-gray text-xs ml-1">closed-loop</span>
+          <span class="tt" data-tt="Each agent run is joined to realized close prices N days later. Hit rate and avg PnL feed the prompt self-reflection on the next run.">?</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-gray-500" id="scorecard-meta">—</span>
+          <button id="attribute-btn" class="pill pill-blue text-xs" style="cursor:pointer">Run attribution</button>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+        <div class="text-xs">
+          <div class="text-gray-500">5-day hit rate</div>
+          <div id="sc-hit-rate" class="text-lg font-semibold">—</div>
+        </div>
+        <div class="text-xs">
+          <div class="text-gray-500">Avg 5d PnL (bps)</div>
+          <div id="sc-pnl5" class="text-lg font-semibold">—</div>
+        </div>
+        <div class="text-xs">
+          <div class="text-gray-500">Avg 1d PnL (bps)</div>
+          <div id="sc-pnl1" class="text-lg font-semibold">—</div>
+        </div>
+        <div class="text-xs">
+          <div class="text-gray-500">Runs scored</div>
+          <div id="sc-runs" class="text-lg font-semibold">—</div>
+        </div>
+      </div>
+      <div class="text-xs text-gray-400" id="sc-regime-bias">no data yet</div>
+    </section>
+
+    <section class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium">
+          Promotion candidates
+          <span class="pill pill-yellow text-xs ml-1">human approval required</span>
+          <span class="tt" data-tt="Discovery patterns that pass the §16 backtest floor (Sharpe ≥1.0, max DD ≤8%). Operator decides whether to promote into the Strategy playbook.">?</span>
+        </div>
+        <span class="text-xs text-gray-500" id="promo-meta">—</span>
+      </div>
+      <div id="promo-list">
+        <div class="text-xs text-gray-500 py-2">No promotion candidates yet.</div>
+      </div>
+    </section>
+
+    <section class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-3">
         <div class="text-sm font-medium">Recent runs <span class="tt" data-tt="Append-only log at data/agents_log.jsonl. Capped at 500 rows.">?</span></div>
         <span class="text-xs text-gray-500" id="history-meta">—</span>
       </div>
@@ -461,6 +508,65 @@
       } catch (e) { /* ignore */ }
     }
 
+    async function loadScorecard() {
+      try {
+        const j = await Cockpit.api.get('/api/agents/scorecard?limit=20');
+        const summary = (j && j.summary) || {};
+        const fmt = (v, suffix) => (v === null || v === undefined) ? '—' : (Number(v).toFixed(suffix === 'pct' ? 1 : 1) + (suffix === 'pct' ? '%' : ''));
+        document.getElementById('sc-hit-rate').textContent = summary.hit_rate_5d === null || summary.hit_rate_5d === undefined ? '—' : (Number(summary.hit_rate_5d * 100).toFixed(1) + '%');
+        document.getElementById('sc-pnl5').textContent = fmt(summary.avg_pnl_bps_5d);
+        document.getElementById('sc-pnl1').textContent = fmt(summary.avg_pnl_bps_1d);
+        document.getElementById('sc-runs').textContent = (summary.n_runs || 0) + ' / ' + (summary.n_signals || 0) + ' sigs';
+        const bias = summary.regime_bias || {};
+        const biasStr = Object.keys(bias).length
+          ? 'regime mix: ' + Object.keys(bias).map(k => `${Cockpit.fmt.escape(k)}=${bias[k]}`).join(', ')
+          : 'no scorecard data yet — click Run attribution to backfill';
+        document.getElementById('sc-regime-bias').textContent = biasStr;
+        document.getElementById('scorecard-meta').textContent = summary.last_run_ts ? ('last: ' + summary.last_run_ts) : 'no runs scored';
+      } catch (e) { /* ignore */ }
+    }
+
+    async function loadPromotionCandidates() {
+      try {
+        const j = await Cockpit.api.get('/api/agents/promotion_candidates?limit=10');
+        const rows = (j && j.candidates) || [];
+        const list = document.getElementById('promo-list');
+        const meta = document.getElementById('promo-meta');
+        meta.textContent = `${rows.length} of ${j.total || 0} shown`;
+        if (!rows.length) {
+          list.innerHTML = '<div class="text-xs text-gray-500 py-2">No promotion candidates yet.</div>';
+          return;
+        }
+        list.innerHTML = rows.map(r => {
+          const v = r.verdict || {};
+          const syms = (v.symbols || []).map(Cockpit.fmt.escape).join(', ');
+          const reasons = (v.reasons || []).map(Cockpit.fmt.escape).join(' • ');
+          return `<div class="audit-row p-3 mb-2" style="background:#0b1220;border:1px solid #1f2937;border-radius:8px">`
+            + `<div class="flex items-center justify-between mb-1">`
+            + `  <span class="font-semibold text-sm">${Cockpit.fmt.escape(v.pattern_name || 'pattern')}</span>`
+            + `  <span class="text-xs text-gray-400">Sharpe ${Number(v.sharpe || 0).toFixed(2)} · DD ${(Number(v.max_dd || 0) * 100).toFixed(1)}% · ${Number(v.horizon_days || 0)}d</span>`
+            + `</div>`
+            + `<div class="text-xs text-gray-300 mb-1">symbols: ${syms || '—'}</div>`
+            + `<div class="text-xs text-gray-500">${reasons || ''} · status: ${Cockpit.fmt.escape(r.human_status || 'pending')}</div>`
+            + `</div>`;
+        }).join('');
+      } catch (e) { /* ignore */ }
+    }
+
+    async function runAttribution() {
+      const btn = document.getElementById('attribute-btn');
+      btn.disabled = true; const original = btn.textContent; btn.textContent = 'attributing…';
+      try {
+        const j = await Cockpit.api.post('/api/agents/attribute', {});
+        Cockpit.toastSuccess(`Attribution appended ${j.appended} row(s)`);
+        await loadScorecard();
+      } catch (e) {
+        Cockpit.toastWarn('Attribution failed: ' + (e && e.message || 'unknown'));
+      } finally {
+        btn.disabled = false; btn.textContent = original;
+      }
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
       document.getElementById('run-btn').addEventListener('click', async () => {
         await runPipeline();
@@ -469,12 +575,17 @@
       document.getElementById('sched-save-btn').addEventListener('click', saveSchedule);
       document.getElementById('sched-tick-btn').addEventListener('click', tickNow);
       document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
+      document.getElementById('attribute-btn').addEventListener('click', runAttribution);
       refreshTopbar();
       loadLast();
       loadSchedule();
       loadHistory();
+      loadScorecard();
+      loadPromotionCandidates();
       setInterval(refreshTopbar, 5000);
       setInterval(loadSchedule, 7000);
+      setInterval(loadScorecard, 30000);
+      setInterval(loadPromotionCandidates, 30000);
     });
   </script>
 </body>

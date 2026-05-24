@@ -79,6 +79,26 @@ def _append_agent_log(payload: dict[str, Any]) -> None:
     """
     try:
         AGENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        # Persist a compact row, but ALSO include the strategy signals so
+        # outcome attribution (packages.agents.attribution) can join each
+        # call to forward returns. Keep the row small — fills/audit are
+        # already in data/paper_log; we don't duplicate them here.
+        per_agent: dict[str, dict[str, Any]] = {}
+        for name, agent in (payload.get("agents") or {}).items():
+            cell: dict[str, Any] = {
+                "status": agent.get("status"),
+                "detail": agent.get("detail"),
+            }
+            if name == "strategy":
+                cell["signals"] = [
+                    {
+                        "symbol": s.get("symbol"),
+                        "side": s.get("side"),
+                        "strength": s.get("strength"),
+                    }
+                    for s in (agent.get("signals") or [])
+                ]
+            per_agent[name] = cell
         row = {
             "ts": payload.get("ran_at"),
             "decision_id": payload.get("decision_id"),
@@ -87,10 +107,7 @@ def _append_agent_log(payload: dict[str, Any]) -> None:
             "used_llm": payload.get("used_llm"),
             "regime": payload.get("regime"),
             "symbols": payload.get("symbols"),
-            "agents": {
-                n: {"status": a.get("status"), "detail": a.get("detail")}
-                for n, a in (payload.get("agents") or {}).items()
-            },
+            "agents": per_agent,
         }
         with AGENT_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, default=str) + "\n")
@@ -853,6 +870,12 @@ _LAST_AGENT_RUN: dict[str, Any] = {
 DISCOVERY_LOG = Path("data/discoveries_log.jsonl")
 DISCOVERY_LOG_MAX = 500
 
+# Agent self-improvement scorecard: each row attributes one matured run to
+# realized forward returns. Written by the nightly attribution job; read by
+# the dashboard panel + the prompt self-reflection injection.
+SCORECARD_LOG = Path("data/agent_scorecard.jsonl")
+SCORECARD_PROMOTION_LOG = Path("data/promotion_candidates.jsonl")
+
 
 def _append_discovery_log(payload: dict[str, Any]) -> None:
     """Append one discovery row (compact), tail-trim to ``DISCOVERY_LOG_MAX``."""
@@ -911,6 +934,19 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
     # paper loop. The graph treats these as candidate signals only.
     target_weights = {s: 1.0 / len(symbols) for s in symbols}
 
+    # Compute the recent self-assessment summary once. Used by every LLM
+    # runner below (research, strategy, risk, execution, discovery) so all
+    # agents share the same recent-performance frame of reference. Cheap to
+    # compute even on every request — reads at most last_n_runs jsonl rows.
+    scorecard_summary: dict[str, Any] | None = None
+    if req.use_llm:
+        try:
+            from packages.agents.attribution import summarize_scorecard
+            scorecard_summary = summarize_scorecard(SCORECARD_LOG, last_n_runs=20).to_jsonable()
+        except Exception as e:
+            log.warning("scorecard summary skipped: %s", e)
+            scorecard_summary = None
+
     if req.use_llm:
         # LLM-backed runners (Ollama). Build a fresh graph so we don't have
         # to import inside the bridge module.
@@ -929,10 +965,10 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
         router = LLMRouter()
         try:
             graph = AgentGraph(
-                research=build_research_runner(router),
-                strategy=build_strategy_runner(router),
-                risk=build_risk_runner(router),
-                execution=build_execution_runner(router),
+                research=build_research_runner(router, scorecard_summary=scorecard_summary),
+                strategy=build_strategy_runner(router, scorecard_summary=scorecard_summary),
+                risk=build_risk_runner(router, scorecard_summary=scorecard_summary),
+                execution=build_execution_runner(router, scorecard_summary=scorecard_summary),
                 approval=_auto_approve,
             )
             result = await graph.run(
@@ -999,7 +1035,7 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
 
             d_router = LLMRouter()
             try:
-                d_runner = build_discovery_runner(d_router)
+                d_runner = build_discovery_runner(d_router, scorecard_summary=scorecard_summary)
                 d_in = DiscoveryInput(
                     decision_id=result.decision_id,
                     regime=regime,  # type: ignore[arg-type]
@@ -1333,6 +1369,128 @@ def api_agents_discoveries(limit: int = 50) -> dict[str, Any]:
     if limit > 0:
         rows = rows[:limit]
     return {"discoveries": rows, "total": len(rows), "advisory_only": True}
+
+
+# --------------------------------------------------------------------------
+# Self-improvement: outcome attribution + promotion candidates
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/agents/scorecard")
+def api_agents_scorecard(limit: int = 50) -> dict[str, Any]:
+    """Return the most recent scorecard rows + a rolled-up summary.
+
+    The scorecard is written by the nightly attribution job. It joins each
+    matured agent run to the realized close prices N days later so the
+    operator can see hit-rate and avg PnL per recent run.
+    """
+    from packages.agents.attribution import summarize_scorecard
+
+    rows: list[dict[str, Any]] = []
+    try:
+        if SCORECARD_LOG.exists():
+            with SCORECARD_LOG.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except OSError as e:
+        log.warning("failed to read scorecard log: %s", e)
+    summary = summarize_scorecard(SCORECARD_LOG, last_n_runs=max(limit, 20)).to_jsonable()
+    rows.reverse()
+    if limit > 0:
+        rows = rows[:limit]
+    return {"runs": rows, "total": len(rows), "summary": summary}
+
+
+@app.post("/api/agents/attribute")
+def api_agents_attribute(force: bool = False) -> dict[str, Any]:
+    """Trigger attribution: walk agents_log.jsonl and append matured runs
+    to ``agent_scorecard.jsonl``. Returns the count of new rows written.
+
+    ``force=true`` ignores the look-ahead safety horizon and re-attributes
+    using whatever prices the data adapter can produce — mainly for tests
+    and operator debugging. Default behavior only attributes runs whose
+    shortest horizon has fully matured.
+    """
+    from packages.agents.attribution import (
+        DEFAULT_HORIZONS_DAYS,
+        run_attribution,
+    )
+
+    # Build a price fetcher. Try Alpaca first; if not configured, return a
+    # callable that always returns None so attribution is a no-op (the
+    # scorecard simply won't grow until the operator wires credentials).
+    def _no_price(_symbol: str, _ts: Any) -> float | None:
+        return None
+
+    get_close = _no_price
+    try:
+        from packages.data.adapters.alpaca_data import AlpacaDataAdapter
+
+        adapter = AlpacaDataAdapter()
+        if adapter.is_configured():
+            import asyncio
+            from datetime import timedelta
+
+            # Sync wrapper around the async bar fetcher — attribution is a
+            # batch job, not an inner-loop call.
+            def _close_via_alpaca(symbol: str, ts: Any) -> float | None:
+                start = (ts - timedelta(days=1)).isoformat()
+                end = (ts + timedelta(days=1)).isoformat()
+                try:
+                    bars = asyncio.run(adapter.get_bars(symbol, start, end))
+                except Exception:
+                    return None
+                if not bars:
+                    return None
+                # Pick the first bar at or after ts.
+                for b in bars:
+                    if b.ts >= ts:
+                        return float(b.close)
+                return float(bars[-1].close)
+
+            get_close = _close_via_alpaca
+    except ImportError:
+        pass
+
+    n = run_attribution(
+        AGENT_LOG,
+        SCORECARD_LOG,
+        get_close,
+        horizons_days=DEFAULT_HORIZONS_DAYS,
+        now=None if not force else datetime.now(UTC).replace(year=datetime.now(UTC).year + 10),
+    )
+    return {"appended": n, "scorecard_path": str(SCORECARD_LOG)}
+
+
+@app.get("/api/agents/promotion_candidates")
+def api_agents_promotion_candidates(limit: int = 50) -> dict[str, Any]:
+    """Discovery patterns that have passed the §16 backtest gate — awaiting
+    human approval before being promoted into the Strategy playbook.
+    """
+    rows: list[dict[str, Any]] = []
+    try:
+        if SCORECARD_PROMOTION_LOG.exists():
+            with SCORECARD_PROMOTION_LOG.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except OSError as e:
+        log.warning("failed to read promotion candidates log: %s", e)
+    rows.reverse()
+    if limit > 0:
+        rows = rows[:limit]
+    return {"candidates": rows, "total": len(rows)}
 
 
 # --------------------------------------------------------------------------

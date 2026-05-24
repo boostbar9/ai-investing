@@ -17,6 +17,7 @@ The actual call path is::
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from packages.shared.schemas import (
     DiscoveryInput,
@@ -101,14 +102,64 @@ def _schema_block(model: type) -> str:
     return json.dumps(schema, separators=(",", ":"))
 
 
+def _fmt_bps(v: float | None) -> str:
+    if v is None:
+        return "n/a"
+    return f"{v:+.1f} bps"
+
+
+def _fmt_pct(v: float | None) -> str:
+    if v is None:
+        return "n/a"
+    return f"{v * 100:.0f}%"
+
+
+def self_reflection_block(scorecard_summary: dict[str, Any] | None) -> str:
+    """Format a short, plain-text self-reflection block for prompt injection.
+
+    Designed to be *advisory* — the model is told to use the summary as a
+    sanity check, not as a hard rule. Returns an empty string when no
+    scorecard data is available so prompts remain unchanged on cold start.
+    """
+    if not scorecard_summary:
+        return ""
+    n_runs = int(scorecard_summary.get("n_runs") or 0)
+    n_signals = int(scorecard_summary.get("n_signals") or 0)
+    if n_runs == 0 or n_signals == 0:
+        return ""
+    hit = _fmt_pct(scorecard_summary.get("hit_rate_5d"))
+    pnl5 = _fmt_bps(scorecard_summary.get("avg_pnl_bps_5d"))
+    pnl1 = _fmt_bps(scorecard_summary.get("avg_pnl_bps_1d"))
+    regime_bias = scorecard_summary.get("regime_bias") or {}
+    # Sort by count desc for readability.
+    bias_str = ", ".join(
+        f"{k}:{v}" for k, v in sorted(regime_bias.items(), key=lambda kv: -kv[1])
+    ) or "none"
+    return f"""RECENT SELF-ASSESSMENT (advisory; use as a sanity check, not a hard rule):
+  * Last {n_runs} runs / {n_signals} scored signals.
+  * 5-day hit rate: {hit} (positive PnL / total scored).
+  * Avg PnL: {pnl5} at 5d, {pnl1} at 1d.
+  * Regime mix in scored runs: {bias_str}.
+  If the hit rate is materially below 50% or PnL is negative, lean toward
+  smaller strengths and tighter rationales. If hit rate is strong, do NOT
+  enlarge bets — sizing happens deterministically downstream.
+
+"""
+
+
 # ---------------------------------------------------------------------------
 # Research
 # ---------------------------------------------------------------------------
 
-def research_prompt(payload: ResearchInput) -> str:
+def research_prompt(
+    payload: ResearchInput,
+    *,
+    scorecard_summary: dict[str, Any] | None = None,
+) -> str:
+    reflection = self_reflection_block(scorecard_summary)
     return f"""{_PREAMBLE}
 
-ROLE: Research Agent (step 1 of 5).
+{reflection}ROLE: Research Agent (step 1 of 5).
 TASK: For each symbol, weigh what is materially new in the last
 {payload.lookback_days} days: earnings surprise, guidance, macro shocks,
 sector rotation, insider activity, regulatory action. Score net sentiment
@@ -130,10 +181,15 @@ OUTPUT JSON SCHEMA:
 # Strategy
 # ---------------------------------------------------------------------------
 
-def strategy_prompt(payload: StrategyInput) -> str:
+def strategy_prompt(
+    payload: StrategyInput,
+    *,
+    scorecard_summary: dict[str, Any] | None = None,
+) -> str:
+    reflection = self_reflection_block(scorecard_summary)
     return f"""{_PREAMBLE}
 
-ROLE: Strategy Agent (step 3 of 5).
+{reflection}ROLE: Strategy Agent (step 3 of 5).
 TASK: Produce trade signals for the universe under regime `{payload.regime}`.
 
 REGIME PLAYBOOK:
@@ -161,10 +217,15 @@ OUTPUT JSON SCHEMA:
 # Risk
 # ---------------------------------------------------------------------------
 
-def risk_prompt(payload: RiskInput) -> str:
+def risk_prompt(
+    payload: RiskInput,
+    *,
+    scorecard_summary: dict[str, Any] | None = None,
+) -> str:
+    reflection = self_reflection_block(scorecard_summary)
     return f"""{_PREAMBLE}
 
-ROLE: Risk Agent (step 4 of 5). You are the LAST line of defense before a
+{reflection}ROLE: Risk Agent (step 4 of 5). You are the LAST line of defense before a
 real order. The deterministic engine handles sizing; you decide whether
 each signal is even ALLOWED to be sized.
 
@@ -196,10 +257,15 @@ OUTPUT JSON SCHEMA:
 # Execution
 # ---------------------------------------------------------------------------
 
-def execution_prompt(payload: ExecutionInput) -> str:
+def execution_prompt(
+    payload: ExecutionInput,
+    *,
+    scorecard_summary: dict[str, Any] | None = None,
+) -> str:
+    reflection = self_reflection_block(scorecard_summary)
     return f"""{_PREAMBLE}
 
-ROLE: Execution Agent (step 5 of 5). The broker abstraction will actually
+{reflection}ROLE: Execution Agent (step 5 of 5). The broker abstraction will actually
 place orders; you only plan slicing/routing notes. NEVER invent prices,
 fills, or counts — always return an empty `fills` array.
 
@@ -224,10 +290,15 @@ OUTPUT JSON SCHEMA:
 # Discovery (advisory only)
 # ---------------------------------------------------------------------------
 
-def discovery_prompt(payload: DiscoveryInput) -> str:
+def discovery_prompt(
+    payload: DiscoveryInput,
+    *,
+    scorecard_summary: dict[str, Any] | None = None,
+) -> str:
+    reflection = self_reflection_block(scorecard_summary)
     return f"""{_PREAMBLE}
 
-ROLE: Discovery Agent (advisory — NOT in the order path).
+{reflection}ROLE: Discovery Agent (advisory — NOT in the order path).
 You are the trader's research lab. Your job is to look at the current
 regime, feature dictionary, and recent research thesis, then propose
 NOVEL pattern candidates that the strategy playbook does not yet cover.

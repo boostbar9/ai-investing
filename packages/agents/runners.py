@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -137,13 +138,17 @@ async def _run(
 # Public factories — match the callable shapes wired into AgentGraph.
 # ---------------------------------------------------------------------------
 
-def build_research_runner(router: LLMRouter) -> Callable[[ResearchInput], Awaitable[ResearchOutput]]:
+def build_research_runner(
+    router: LLMRouter,
+    *,
+    scorecard_summary: dict[str, Any] | None = None,
+) -> Callable[[ResearchInput], Awaitable[ResearchOutput]]:
     async def _research(payload: ResearchInput) -> ResearchOutput:
         return await _run(
             router=router,
             agent="research",
             decision_id_str=str(payload.decision_id),
-            prompt=research_prompt(payload),
+            prompt=research_prompt(payload, scorecard_summary=scorecard_summary),
             output_model=ResearchOutput,
             safe_default=_safe_research,
             payload=payload,
@@ -152,13 +157,17 @@ def build_research_runner(router: LLMRouter) -> Callable[[ResearchInput], Awaita
     return _research
 
 
-def build_strategy_runner(router: LLMRouter) -> Callable[[StrategyInput], Awaitable[StrategyOutput]]:
+def build_strategy_runner(
+    router: LLMRouter,
+    *,
+    scorecard_summary: dict[str, Any] | None = None,
+) -> Callable[[StrategyInput], Awaitable[StrategyOutput]]:
     async def _strategy(payload: StrategyInput) -> StrategyOutput:
         return await _run(
             router=router,
             agent="strategy",
             decision_id_str=str(payload.decision_id),
-            prompt=strategy_prompt(payload),
+            prompt=strategy_prompt(payload, scorecard_summary=scorecard_summary),
             output_model=StrategyOutput,
             safe_default=_safe_strategy,
             payload=payload,
@@ -167,13 +176,17 @@ def build_strategy_runner(router: LLMRouter) -> Callable[[StrategyInput], Awaita
     return _strategy
 
 
-def build_risk_runner(router: LLMRouter) -> Callable[[RiskInput], Awaitable[RiskOutput]]:
+def build_risk_runner(
+    router: LLMRouter,
+    *,
+    scorecard_summary: dict[str, Any] | None = None,
+) -> Callable[[RiskInput], Awaitable[RiskOutput]]:
     async def _risk(payload: RiskInput) -> RiskOutput:
         return await _run(
             router=router,
             agent="risk",
             decision_id_str=str(payload.decision_id),
-            prompt=risk_prompt(payload),
+            prompt=risk_prompt(payload, scorecard_summary=scorecard_summary),
             output_model=RiskOutput,
             safe_default=_safe_risk,
             payload=payload,
@@ -182,7 +195,11 @@ def build_risk_runner(router: LLMRouter) -> Callable[[RiskInput], Awaitable[Risk
     return _risk
 
 
-def build_discovery_runner(router: LLMRouter) -> Callable[[DiscoveryInput], Awaitable[DiscoveryOutput]]:
+def build_discovery_runner(
+    router: LLMRouter,
+    *,
+    scorecard_summary: dict[str, Any] | None = None,
+) -> Callable[[DiscoveryInput], Awaitable[DiscoveryOutput]]:
     """Advisory pattern-discovery runner.
 
     Unlike the four order-path agents, Discovery is allowed to fail loudly
@@ -195,7 +212,7 @@ def build_discovery_runner(router: LLMRouter) -> Callable[[DiscoveryInput], Awai
             router=router,
             agent="discovery",
             decision_id_str=str(payload.decision_id),
-            prompt=discovery_prompt(payload),
+            prompt=discovery_prompt(payload, scorecard_summary=scorecard_summary),
             output_model=DiscoveryOutput,
             safe_default=_safe_discovery,
             payload=payload,
@@ -216,7 +233,11 @@ def build_discovery_runner(router: LLMRouter) -> Callable[[DiscoveryInput], Awai
     return _discovery
 
 
-def build_execution_runner(router: LLMRouter) -> Callable[[ExecutionInput], Awaitable[ExecutionOutput]]:
+def build_execution_runner(
+    router: LLMRouter,
+    *,
+    scorecard_summary: dict[str, Any] | None = None,
+) -> Callable[[ExecutionInput], Awaitable[ExecutionOutput]]:
     async def _execution(payload: ExecutionInput) -> ExecutionOutput:
         # We let the LLM plan slicing, but always fill audit_id locally so
         # downstream consumers can rely on it.
@@ -224,7 +245,7 @@ def build_execution_runner(router: LLMRouter) -> Callable[[ExecutionInput], Awai
             router=router,
             agent="execution",
             decision_id_str=str(payload.decision_id),
-            prompt=execution_prompt(payload),
+            prompt=execution_prompt(payload, scorecard_summary=scorecard_summary),
             output_model=ExecutionOutput,
             safe_default=_safe_execution,
             payload=payload,

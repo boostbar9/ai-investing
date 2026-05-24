@@ -82,6 +82,22 @@ def fake_discovery_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
+def fake_scorecard_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect the agent scorecard log to a tmp file."""
+    log = tmp_path / "agent_scorecard.jsonl"
+    monkeypatch.setattr(srv, "SCORECARD_LOG", log)
+    return log
+
+
+@pytest.fixture
+def fake_promotion_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect the promotion candidates log to a tmp file."""
+    log = tmp_path / "promotion_candidates.jsonl"
+    monkeypatch.setattr(srv, "SCORECARD_PROMOTION_LOG", log)
+    return log
+
+
+@pytest.fixture
 def client(fake_log: Path, fake_state: Path, fake_agent_log: Path) -> TestClient:
     return TestClient(srv.app)
 
@@ -677,3 +693,192 @@ def test_state_endpoint_handles_empty_log(tmp_path: Path, monkeypatch: pytest.Mo
         assert data["positions"] == []
         assert data["trades"] == []
         assert data["equity_curve"] == []
+
+
+# --------------------------------------------------------------------------
+# Self-improvement endpoints
+# --------------------------------------------------------------------------
+
+
+def test_scorecard_endpoint_empty_log(
+    client: TestClient,
+    fake_scorecard_log: Path,
+) -> None:
+    """No scorecard file yet -> 200 with empty runs and zeroed summary."""
+    r = client.get("/api/agents/scorecard")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["runs"] == []
+    assert data["total"] == 0
+    summary = data["summary"]
+    assert summary["n_runs"] == 0
+    assert summary["n_signals"] == 0
+    assert summary["hit_rate_5d"] is None
+
+
+def test_scorecard_endpoint_returns_rows(
+    client: TestClient,
+    fake_scorecard_log: Path,
+) -> None:
+    """Two scorecard rows -> endpoint returns them newest-first with a
+    correctly computed summary."""
+    row1 = {
+        "decision_id": "r1",
+        "ts": "2026-05-22T20:00:00+00:00",
+        "regime": "bull",
+        "used_llm": True,
+        "signals": [
+            {"symbol": "SPY", "side": "buy", "strength": 0.5,
+             "horizon_returns_bps": {"1": 30.0, "5": 150.0}},
+        ],
+    }
+    row2 = {
+        "decision_id": "r2",
+        "ts": "2026-05-23T20:00:00+00:00",
+        "regime": "chop",
+        "used_llm": True,
+        "signals": [
+            {"symbol": "QQQ", "side": "buy", "strength": 0.4,
+             "horizon_returns_bps": {"1": -10.0, "5": -50.0}},
+        ],
+    }
+    with fake_scorecard_log.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(row1) + "\n")
+        f.write(json.dumps(row2) + "\n")
+
+    r = client.get("/api/agents/scorecard")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["total"] == 2
+    assert data["runs"][0]["decision_id"] == "r2"
+    assert data["runs"][1]["decision_id"] == "r1"
+    summary = data["summary"]
+    assert summary["n_runs"] == 2
+    assert summary["n_signals"] == 2
+    assert summary["hit_rate_5d"] == 0.5
+    assert summary["regime_bias"] == {"bull": 1, "chop": 1}
+
+
+def test_attribute_endpoint_no_price_fetcher_appends_zero(
+    client: TestClient,
+    fake_agent_log: Path,
+    fake_scorecard_log: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without Alpaca credentials the endpoint must still 200 with 0 rows
+    appended (price fetcher returns None for every symbol)."""
+    monkeypatch.delenv("ALPACA_KEY_ID", raising=False)
+    monkeypatch.delenv("ALPACA_SECRET", raising=False)
+
+    matured_ts = "2024-01-15T00:00:00+00:00"
+    row = {
+        "decision_id": "old-1",
+        "ts": matured_ts,
+        "regime": "bull",
+        "used_llm": True,
+        "agents": {"strategy": {"signals": [
+            {"symbol": "SPY", "side": "buy", "strength": 0.5},
+        ]}},
+    }
+    fake_agent_log.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    r = client.post("/api/agents/attribute")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["appended"] == 0
+    assert "scorecard_path" in data
+
+
+def test_promotion_candidates_endpoint_empty_log(
+    client: TestClient,
+    fake_promotion_log: Path,
+) -> None:
+    """No promotion file -> 200 with empty candidates list."""
+    r = client.get("/api/agents/promotion_candidates")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["candidates"] == []
+    assert data["total"] == 0
+
+
+def test_promotion_candidates_endpoint_returns_rows(
+    client: TestClient,
+    fake_promotion_log: Path,
+) -> None:
+    """Two promotion rows -> endpoint returns them newest-first."""
+    rows = [
+        {
+            "ts": "2026-05-22T20:00:00+00:00",
+            "decision_id": "d1",
+            "regime": "bull",
+            "verdict": {
+                "pattern_name": "tech-momentum",
+                "symbols": ["QQQ"],
+                "horizon_days": 5,
+                "confidence": 0.6,
+                "sharpe": 1.3,
+                "max_dd": 0.05,
+                "cagr": 0.18,
+                "n_bars": 80,
+                "passed": True,
+                "reasons": ["passed floor"],
+            },
+            "human_status": "pending",
+        },
+        {
+            "ts": "2026-05-23T20:00:00+00:00",
+            "decision_id": "d2",
+            "regime": "chop",
+            "verdict": {
+                "pattern_name": "yield-curve-rotation",
+                "symbols": ["TLT", "GLD"],
+                "horizon_days": 10,
+                "confidence": 0.5,
+                "sharpe": 1.1,
+                "max_dd": 0.07,
+                "cagr": 0.12,
+                "n_bars": 90,
+                "passed": True,
+                "reasons": ["passed floor"],
+            },
+            "human_status": "pending",
+        },
+    ]
+    with fake_promotion_log.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+    r = client.get("/api/agents/promotion_candidates")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["total"] == 2
+    assert data["candidates"][0]["decision_id"] == "d2"
+    assert data["candidates"][0]["verdict"]["pattern_name"] == "yield-curve-rotation"
+    assert data["candidates"][1]["decision_id"] == "d1"
+
+
+def test_scorecard_limit_clamps_returned_rows(
+    client: TestClient,
+    fake_scorecard_log: Path,
+) -> None:
+    """The limit query param must truncate the rows list (newest kept)."""
+    rows = [
+        {
+            "decision_id": f"r{i}",
+            "ts": f"2026-05-{20+i:02d}T20:00:00+00:00",
+            "regime": "bull",
+            "used_llm": True,
+            "signals": [{"symbol": "SPY", "side": "buy", "strength": 0.5,
+                         "horizon_returns_bps": {"5": 50.0}}],
+        }
+        for i in range(5)
+    ]
+    with fake_scorecard_log.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+    r = client.get("/api/agents/scorecard?limit=2")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data["runs"]) == 2
+    assert data["runs"][0]["decision_id"] == "r4"

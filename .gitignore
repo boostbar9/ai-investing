@@ -78,3 +78,5 @@ data/cockpit/
 data/sentiment_cache.json
 data/agents_log.jsonl
 data/discoveries_log.jsonl
+data/agent_scorecard.jsonl
+data/promotion_candidates.jsonl
