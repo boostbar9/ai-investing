@@ -995,3 +995,70 @@ def test_models_page_includes_ollama_panel(client: TestClient) -> None:
     assert 'id="ollama-setup-btn"' in html
     assert "/api/ollama/status" in html
     assert "/api/ollama/setup" in html
+
+
+# ---------------------------------------------------------------------------
+# Health snapshot endpoints (/api/health-snapshot, /api/health-snapshot/save)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def snapshot_client(
+    fake_log: Path,
+    fake_state: Path,
+    fake_agent_log: Path,
+    fake_scorecard_log: Path,
+    fake_promotion_log: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> TestClient:
+    """Client with every snapshot input pointed at tmp files plus the output
+    path redirected so the test never writes into the real ``docs/`` dir."""
+    out = tmp_path / "docs" / "health-snapshot.md"
+    monkeypatch.setattr(srv, "HEALTH_SNAPSHOT_PATH", out)
+
+    # Make the noisy / process-y collectors hermetic.
+    from packages.cockpit import health_snapshot as hs
+
+    monkeypatch.setattr(hs, "collect_errors", lambda **_kw: [])
+    monkeypatch.setattr(
+        hs,
+        "collect_ollama",
+        lambda: {"daemon": "down", "profile": "test", "missing": [], "installed": []},
+    )
+    return TestClient(srv.app)
+
+
+def test_health_snapshot_preview_returns_markdown(snapshot_client: TestClient) -> None:
+    r = snapshot_client.get("/api/health-snapshot")
+    assert r.status_code == 200
+    body = r.json()
+    assert "markdown" in body and body["markdown"].startswith("# ai-investing health snapshot")
+    assert "json" in body and "paper_kpis" in body["json"]
+    assert body["size_bytes"] > 0
+    # Preview must NOT have written the file to disk.
+    assert not srv.HEALTH_SNAPSHOT_PATH.exists()
+
+
+def test_health_snapshot_save_writes_file(snapshot_client: TestClient) -> None:
+    r = snapshot_client.post("/api/health-snapshot/save", json={})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["path"].endswith("health-snapshot.md")
+    assert body["size_bytes"] > 0
+    saved = Path(body["path"])
+    assert saved.exists()
+    text = saved.read_text(encoding="utf-8")
+    assert text.startswith("# ai-investing health snapshot")
+
+
+def test_errors_page_includes_share_snapshot_card(snapshot_client: TestClient) -> None:
+    """Pin distinctive markers from the /errors snapshot card so a future
+    refactor doesn't silently delete the operator's share entry-point."""
+    r = snapshot_client.get("/errors")
+    assert r.status_code == 200
+    html = r.text
+    assert "Share health snapshot" in html
+    assert 'id="snap-preview-btn"' in html
+    assert 'id="snap-save-btn"' in html
+    assert "/api/health-snapshot" in html

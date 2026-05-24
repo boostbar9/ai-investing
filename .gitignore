@@ -23,6 +23,8 @@ out/
 __pycache__/
 # Generated paper-trading dashboard (rebuilt from data/paper_log/runs.jsonl)
 docs/paper-dashboard.html
+# Generated operator health snapshot (scrubbed but still local-by-default)
+docs/health-snapshot.md
 *.py[cod]
 *$py.class
 *.so

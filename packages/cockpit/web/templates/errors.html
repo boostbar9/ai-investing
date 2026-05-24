@@ -86,6 +86,37 @@
       </div>
     </section>
 
+    <section class="card p-4 mb-4" data-tt="Generate a scrubbed health snapshot you can paste into a chat for troubleshooting.">
+      <div class="flex items-center gap-3 flex-wrap">
+        <h2 class="text-sm font-medium">Share health snapshot</h2>
+        <span class="text-xs text-gray-400">Local-only, secrets scrubbed. Review before sharing.</span>
+        <div class="ml-auto flex items-center gap-2">
+          <button id="snap-preview-btn" class="btn btn-sm" data-tt="Generate a fresh markdown preview.">Refresh preview</button>
+          <button id="snap-copy-btn" class="btn btn-sm" data-tt="Copy the markdown to your clipboard.">Copy</button>
+          <button id="snap-save-btn" class="btn btn-sm btn-primary" data-tt="Save to docs/health-snapshot.md (gitignored).">Save to disk</button>
+        </div>
+      </div>
+      <div class="mt-3 text-xs text-gray-400 flex items-center gap-3 flex-wrap">
+        <span id="snap-status">Click Refresh preview to generate a snapshot.</span>
+        <span id="snap-size" class="text-gray-500"></span>
+      </div>
+      <details class="mt-2">
+        <summary class="text-xs text-gray-400 cursor-pointer">What gets shared</summary>
+        <ul class="text-xs text-gray-400 mt-2 ml-4 list-disc space-y-1">
+          <li>Build info: git sha, branch, python version, platform</li>
+          <li>Paper KPIs (bps deltas only, no equity values) over a 14-day window</li>
+          <li>Agent scorecard summary and last 5 promotion candidates</li>
+          <li>Last 20 error log entries (tracebacks collapsed, secrets scrubbed)</li>
+          <li>Ollama daemon + required-model status</li>
+        </ul>
+        <p class="text-xs text-gray-500 mt-2">Scrubber strips API keys, tokens, bearer headers, JWTs, env-style exports, and 32+ char hex blobs.</p>
+      </details>
+      <details class="mt-2" id="snap-md-wrap" style="display:none">
+        <summary class="text-xs text-gray-400 cursor-pointer">Show markdown preview</summary>
+        <pre id="snap-md" class="mt-2 p-2 text-xs bg-black/30 rounded overflow-auto" style="max-height:400px; white-space:pre-wrap; word-break:break-word"></pre>
+      </details>
+    </section>
+
     <section id="entries" class="space-y-2">
       <div class="card p-6 text-center text-gray-500"><span class="skel" style="display:inline-block;width:120px;height:14px">&nbsp;</span></div>
     </section>
@@ -222,10 +253,73 @@
       }
     }
 
+    let snapMarkdown = '';
+
+    async function loadSnapshot() {
+      const statusEl = document.getElementById('snap-status');
+      const sizeEl = document.getElementById('snap-size');
+      statusEl.textContent = 'Generating...';
+      sizeEl.textContent = '';
+      try {
+        const j = await Cockpit.api.get('/api/health-snapshot');
+        snapMarkdown = j.markdown || '';
+        document.getElementById('snap-md').textContent = snapMarkdown;
+        document.getElementById('snap-md-wrap').style.display = '';
+        const kb = ((j.size_bytes || snapMarkdown.length) / 1024).toFixed(1);
+        statusEl.textContent = 'Preview ready (not saved).';
+        sizeEl.textContent = kb + ' KB';
+        Cockpit.toastSuccess('Snapshot ready');
+      } catch (e) {
+        statusEl.textContent = 'Failed: ' + e.message;
+        Cockpit.toastError('Snapshot failed: ' + e.message);
+      }
+    }
+
+    async function copySnapshot() {
+      if (!snapMarkdown) {
+        await loadSnapshot();
+        if (!snapMarkdown) return;
+      }
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(snapMarkdown);
+          Cockpit.toastSuccess('Copied to clipboard');
+        } else {
+          const ta = document.createElement('textarea');
+          ta.value = snapMarkdown;
+          ta.style.position = 'fixed'; ta.style.left = '0'; ta.style.top = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          try { document.execCommand('copy'); Cockpit.toastSuccess('Copied (fallback)'); }
+          catch (e) { Cockpit.toastError('Copy failed'); }
+          setTimeout(() => ta.remove(), 4000);
+        }
+      } catch (e) {
+        Cockpit.toastError('Copy failed: ' + e.message);
+      }
+    }
+
+    async function saveSnapshot() {
+      const statusEl = document.getElementById('snap-status');
+      const sizeEl = document.getElementById('snap-size');
+      try {
+        const j = await Cockpit.api.post('/api/health-snapshot/save', {});
+        statusEl.textContent = 'Saved to ' + (j.path || 'docs/health-snapshot.md');
+        if (j.size_bytes) sizeEl.textContent = (j.size_bytes / 1024).toFixed(1) + ' KB';
+        Cockpit.toastSuccess('Saved');
+      } catch (e) {
+        statusEl.textContent = 'Save failed: ' + e.message;
+        Cockpit.toastError('Save failed: ' + e.message);
+      }
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
       document.getElementById('refresh-btn').addEventListener('click', load);
       document.getElementById('copy-md-btn').addEventListener('click', copyMarkdown);
       document.getElementById('clear-btn').addEventListener('click', clearLog);
+      document.getElementById('snap-preview-btn').addEventListener('click', loadSnapshot);
+      document.getElementById('snap-copy-btn').addEventListener('click', copySnapshot);
+      document.getElementById('snap-save-btn').addEventListener('click', saveSnapshot);
       document.getElementById('sev-filter').addEventListener('change', (e) => {
         currentSeverity = e.target.value;
         load();

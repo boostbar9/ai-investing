@@ -808,6 +808,67 @@ def api_ollama_stop() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Health snapshot (operator-shareable, scrubbed troubleshooting bundle)
+# --------------------------------------------------------------------------
+
+HEALTH_SNAPSHOT_PATH = REPO_ROOT / "docs" / "health-snapshot.md"
+
+
+def _build_snapshot():
+    """Collect a fresh snapshot using the cockpit's tracked log paths.
+
+    Imported lazily so the cockpit boots even if a dev removes the module.
+    Tests can also patch the log paths via the module-level constants here.
+    """
+    from packages.cockpit.health_snapshot import collect_snapshot
+
+    return collect_snapshot(
+        repo_root=REPO_ROOT,
+        paper_log=PAPER_LOG,
+        scorecard_path=SCORECARD_LOG,
+        promotion_log=SCORECARD_PROMOTION_LOG,
+    )
+
+
+@app.get("/api/health-snapshot")
+def api_health_snapshot_preview() -> dict[str, Any]:
+    """Return a freshly-rendered snapshot WITHOUT writing it to disk.
+
+    The /errors page calls this so the operator can review exactly what
+    would be shared before clicking Save. Body is the markdown plus a
+    JSON form for any future tooling.
+    """
+    from packages.cockpit.health_snapshot import render_markdown
+
+    snap = _build_snapshot()
+    return {
+        "generated_at": snap.generated_at,
+        "markdown": render_markdown(snap),
+        "json": snap.to_jsonable(),
+        "size_bytes": len(render_markdown(snap).encode("utf-8")),
+    }
+
+
+@app.post("/api/health-snapshot/save")
+def api_health_snapshot_save() -> dict[str, Any]:
+    """Write the snapshot to ``docs/health-snapshot.md``.
+
+    Path is gitignored by default — the operator opts in explicitly later
+    if they want to push it to a private repo.
+    """
+    from packages.cockpit.health_snapshot import render_markdown, save_markdown
+
+    snap = _build_snapshot()
+    body = render_markdown(snap)
+    saved = save_markdown(body, HEALTH_SNAPSHOT_PATH)
+    return {
+        "path": str(saved),
+        "size_bytes": len(body.encode("utf-8")),
+        "generated_at": snap.generated_at,
+    }
+
+
+# --------------------------------------------------------------------------
 # Paper-trade loop control
 # --------------------------------------------------------------------------
 
