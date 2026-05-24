@@ -60,7 +60,42 @@ ai-investing/
 - **Docker + docker-compose** (Postgres/Timescale, DragonflyDB, Temporal, Grafana, MLflow, Ollama)
 - **Make** (one-command setup)
 
-## Quickstart
+## Quickstart (one command)
+
+The full stack (Docker, LLMs, Postgres) is overkill for paper trading. The fastest path to a working paper-trading runner:
+
+**Windows (PowerShell):**
+
+```powershell
+iwr https://raw.githubusercontent.com/boostbar9/ai-investing/main/scripts/install.ps1 -UseBasicParsing | iex
+```
+
+**macOS / Linux:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/boostbar9/ai-investing/main/scripts/install.sh | bash
+```
+
+The installer:
+
+1. Verifies Python 3.12+ and Git
+2. Clones the repo to `~/ai-investing`
+3. Creates a `.venv` and installs Python deps
+4. Creates `.env` from `.env.example`
+5. Runs the doctor smoke test
+
+Then edit `.env` with your [Alpaca paper keys](https://app.alpaca.markets/paper/dashboard/overview) and run:
+
+```bash
+source .venv/bin/activate                                 # Windows: .\.venv\Scripts\Activate.ps1
+PYTHONPATH=. python -m packages.data.pretrain             # download 20yr daily + 90d intraday
+PYTHONPATH=. python tools/paper_trade.py --strategy ensemble --dry-run
+PYTHONPATH=. python tools/paper_dashboard.py && open docs/paper-dashboard.html
+```
+
+## Full stack (advanced)
+
+For the full Docker + Ollama + Postgres + LangGraph stack:
 
 ```bash
 make setup        # install all deps, pull LLM models, init DB

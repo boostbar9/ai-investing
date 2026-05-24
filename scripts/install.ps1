@@ -1,131 +1,165 @@
-# ai-investing Windows installer
-# ----------------------------------------------------------------------------
-# Run this once on a fresh Windows 11 PC. It will:
-#   1. Verify prerequisites (or install them via winget where possible).
-#   2. Clone the repo to %USERPROFILE%\ai-investing (if not already present).
-#   3. Create a .env file from .env.example.
-#   4. Run `make setup-windows` then `make pull-models` (rx_7900_xt profile).
-#   5. Drop a desktop shortcut for the tray launcher.
-#
-# Usage (in PowerShell, NOT cmd):
-#   irm https://raw.githubusercontent.com/boostbar9/ai-investing/main/scripts/install.ps1 | iex
-#
-# Or, if you already cloned the repo:
-#   cd <repo>; .\scripts\install.ps1
-#
-# Re-running this script is safe. It is idempotent.
-# ----------------------------------------------------------------------------
+<#
+.SYNOPSIS
+  One-command installer for ai-investing on Windows.
 
-$ErrorActionPreference = 'Stop'
+.DESCRIPTION
+  Run from a fresh PowerShell window in any directory. The script will:
+    1. Verify Python 3.12+ and Git are installed
+    2. Clone the repo (or update it if present)
+    3. Create a virtual environment
+    4. Install Python dependencies
+    5. Create a .env file from .env.example if missing
+    6. Run the doctor smoke test
 
-function Write-Step { param([string]$msg) Write-Host ""; Write-Host ">>> $msg" -ForegroundColor Cyan }
-function Write-Ok   { param([string]$msg) Write-Host "    [ok] $msg" -ForegroundColor Green }
-function Write-Warn { param([string]$msg) Write-Host "    [!]  $msg" -ForegroundColor Yellow }
-function Have-Cmd   { param([string]$name) return [bool](Get-Command $name -ErrorAction SilentlyContinue) }
+  Designed to be re-runnable: safe to invoke any number of times.
 
-# ----- 1. Prerequisites ------------------------------------------------------
-Write-Step "Checking prerequisites"
+.EXAMPLE
+  PS> iwr https://raw.githubusercontent.com/boostbar9/ai-investing/main/scripts/install.ps1 -UseBasicParsing | iex
 
-if (-not (Have-Cmd winget)) {
-    Write-Warn "winget is not installed. Install 'App Installer' from the Microsoft Store, then re-run this script."
-    exit 1
-}
+.EXAMPLE
+  PS> .\scripts\install.ps1 -InstallDir C:\dev\ai-investing
+#>
 
-$prereqs = @(
-    @{ name = 'git';          id = 'Git.Git' },
-    @{ name = 'node';         id = 'OpenJS.NodeJS.LTS' },
-    @{ name = 'python';       id = 'Python.Python.3.12' },
-    @{ name = 'docker';       id = 'Docker.DockerDesktop' },
-    @{ name = 'ollama';       id = 'Ollama.Ollama' }
+[CmdletBinding()]
+param(
+  [string]$InstallDir = (Join-Path $env:USERPROFILE "ai-investing"),
+  [string]$RepoUrl    = "https://github.com/boostbar9/ai-investing.git",
+  [switch]$SkipDoctor
 )
 
-foreach ($p in $prereqs) {
-    if (Have-Cmd $p.name) {
-        Write-Ok "$($p.name) already installed"
-    } else {
-        Write-Host "    installing $($p.name)..."
-        winget install --id $p.id --silent --accept-package-agreements --accept-source-agreements
-    }
+$ErrorActionPreference = "Stop"
+
+function Write-Section([string]$msg) {
+  Write-Host ""
+  Write-Host "=== $msg ===" -ForegroundColor Cyan
 }
 
-# pnpm via corepack, uv via pip
-if (-not (Have-Cmd pnpm)) {
-    Write-Host "    enabling pnpm via corepack..."
-    corepack enable
-    corepack prepare pnpm@9 --activate
-}
-if (-not (Have-Cmd uv)) {
-    Write-Host "    installing uv..."
-    pip install --user uv
+function Write-Ok([string]$msg) {
+  Write-Host "  [ok] $msg" -ForegroundColor Green
 }
 
-# Make is not on Windows by default. Try chocolatey-style winget id.
-if (-not (Have-Cmd make)) {
-    Write-Host "    installing make..."
-    winget install --id GnuWin32.Make --silent --accept-package-agreements --accept-source-agreements
+function Write-Warn([string]$msg) {
+  Write-Host "  [warn] $msg" -ForegroundColor Yellow
 }
 
-# ----- 2. Clone repo ---------------------------------------------------------
-$RepoDir = Join-Path $env:USERPROFILE 'ai-investing'
-Write-Step "Locating repo at $RepoDir"
-if (-not (Test-Path $RepoDir)) {
-    git clone https://github.com/boostbar9/ai-investing $RepoDir
-    Write-Ok "cloned"
+function Fail([string]$msg) {
+  Write-Host ""
+  Write-Host "  [error] $msg" -ForegroundColor Red
+  Write-Host ""
+  exit 1
+}
+
+# ----------------------------------------------------------------------
+# 1. Prereq checks
+# ----------------------------------------------------------------------
+Write-Section "Checking prerequisites"
+
+# Python
+try {
+  $pyVersion = (& python --version 2>&1).ToString()
+} catch {
+  Fail "Python is not on PATH. Install Python 3.12+ from https://python.org/downloads/ and check 'Add to PATH'."
+}
+if ($pyVersion -notmatch "Python 3\.(1[2-9]|[2-9][0-9])") {
+  Fail "Need Python 3.12+. Found: $pyVersion. Get it from https://python.org/downloads/."
+}
+Write-Ok $pyVersion
+
+# Git
+try {
+  $gitVersion = (& git --version 2>&1).ToString()
+} catch {
+  Fail "Git is not on PATH. Install from https://git-scm.com/download/win."
+}
+Write-Ok $gitVersion
+
+# ----------------------------------------------------------------------
+# 2. Clone or update repo
+# ----------------------------------------------------------------------
+Write-Section "Getting the code"
+
+if (Test-Path (Join-Path $InstallDir ".git")) {
+  Write-Ok "Repo already exists at $InstallDir — pulling latest"
+  Push-Location $InstallDir
+  git pull --ff-only
+  Pop-Location
 } else {
-    Write-Ok "already cloned — pulling latest"
-    git -C $RepoDir pull --ff-only origin main
+  if (Test-Path $InstallDir) {
+    Fail "$InstallDir exists but is not a git repo. Move or delete it, then re-run."
+  }
+  Write-Ok "Cloning into $InstallDir"
+  git clone $RepoUrl $InstallDir
 }
-Set-Location $RepoDir
 
-# ----- 3. .env ---------------------------------------------------------------
-Write-Step "Configuring .env"
-$envFile = Join-Path $RepoDir '.env'
-$envExample = Join-Path $RepoDir '.env.example'
+Set-Location $InstallDir
+
+# ----------------------------------------------------------------------
+# 3. Virtual environment
+# ----------------------------------------------------------------------
+Write-Section "Creating virtual environment"
+
+$venvPath = Join-Path $InstallDir ".venv"
+if (-not (Test-Path (Join-Path $venvPath "Scripts\python.exe"))) {
+  python -m venv .venv
+  Write-Ok ".venv created"
+} else {
+  Write-Ok ".venv already exists"
+}
+
+$venvPython = Join-Path $venvPath "Scripts\python.exe"
+$venvPip    = Join-Path $venvPath "Scripts\pip.exe"
+
+# ----------------------------------------------------------------------
+# 4. Install dependencies
+# ----------------------------------------------------------------------
+Write-Section "Installing Python dependencies (this takes 2-5 minutes)"
+
+& $venvPython -m pip install --upgrade pip --quiet
+Write-Ok "pip upgraded"
+
+& $venvPip install -e ".[dev]" --quiet
+Write-Ok "ai-investing + dev extras installed"
+
+# ----------------------------------------------------------------------
+# 5. Environment file
+# ----------------------------------------------------------------------
+Write-Section "Setting up .env"
+
+$envFile = Join-Path $InstallDir ".env"
 if (-not (Test-Path $envFile)) {
-    if (Test-Path $envExample) {
-        Copy-Item $envExample $envFile
-        Write-Ok ".env created from .env.example — open it to add your Alpaca paper keys"
-    } else {
-        Write-Warn ".env.example not found; you'll need to create .env manually"
-    }
+  Copy-Item (Join-Path $InstallDir ".env.example") $envFile
+  Write-Ok ".env created from .env.example"
+  Write-Warn "Edit $envFile and fill in your Alpaca paper keys before running paper trading."
 } else {
-    Write-Ok ".env already exists"
+  Write-Ok ".env already exists (not overwriting)"
 }
 
-# Pin the hardware profile for Devin's RX 7900 XT
-if (-not (Select-String -Path $envFile -Pattern '^HARDWARE_PROFILE=' -Quiet -ErrorAction SilentlyContinue)) {
-    Add-Content -Path $envFile -Value "`nHARDWARE_PROFILE=rx_7900_xt"
-    Write-Ok "set HARDWARE_PROFILE=rx_7900_xt"
+# ----------------------------------------------------------------------
+# 6. Doctor smoke test
+# ----------------------------------------------------------------------
+if (-not $SkipDoctor) {
+  Write-Section "Running doctor"
+  $env:PYTHONPATH = "."
+  try {
+    & $venvPython tools/doctor.py
+  } catch {
+    Write-Warn "Doctor reported issues — review the output above. Most often this means .env still needs Alpaca keys."
+  }
 }
 
-# ----- 4. Setup + model pulls -----------------------------------------------
-Write-Step "Running setup-windows + pull-models (this takes a while; ~30GB of models)"
-make setup-windows
-$env:HARDWARE_PROFILE = 'rx_7900_xt'
-make pull-models
-
-# ----- 5. Tray launcher deps + desktop shortcut ------------------------------
-Write-Step "Installing tray launcher deps"
-pip install --user pystray Pillow
-
-Write-Step "Creating desktop shortcut"
-$desktop  = [Environment]::GetFolderPath('Desktop')
-$lnkPath  = Join-Path $desktop 'ai-investing.lnk'
-$wsh      = New-Object -ComObject WScript.Shell
-$shortcut = $wsh.CreateShortcut($lnkPath)
-$shortcut.TargetPath       = (Get-Command pythonw).Source
-$shortcut.Arguments        = "-m tools.tray.launcher"
-$shortcut.WorkingDirectory = $RepoDir
-$shortcut.IconLocation     = (Get-Command pythonw).Source
-$shortcut.Description      = "Launch ai-investing tray app"
-$shortcut.Save()
-Write-Ok "shortcut placed on Desktop"
+# ----------------------------------------------------------------------
+# Done
+# ----------------------------------------------------------------------
+Write-Section "Install complete"
 
 Write-Host ""
-Write-Host "============================================================" -ForegroundColor Green
-Write-Host " Setup complete." -ForegroundColor Green
-Write-Host " 1. Edit .env and paste your Alpaca paper keys." -ForegroundColor Green
-Write-Host "    (Get them from https://app.alpaca.markets/paper/dashboard/overview)" -ForegroundColor Green
-Write-Host " 2. Double-click the 'ai-investing' desktop shortcut." -ForegroundColor Green
-Write-Host " 3. Use the tray icon to start the stack and open cockpit." -ForegroundColor Green
-Write-Host "============================================================" -ForegroundColor Green
+Write-Host "Project installed at: " -NoNewline
+Write-Host $InstallDir -ForegroundColor Yellow
+Write-Host ""
+Write-Host "Next steps:" -ForegroundColor Cyan
+Write-Host "  1. Edit .env and add your Alpaca paper keys (from https://app.alpaca.markets/paper/dashboard/overview)"
+Write-Host "  2. Activate the venv:    cd $InstallDir; .\.venv\Scripts\Activate.ps1"
+Write-Host "  3. Download market data: `$env:PYTHONPATH='.'; python -m packages.data.pretrain"
+Write-Host "  4. First dry-run:        python tools/paper_trade.py --strategy ensemble --dry-run"
+Write-Host "  5. Open the dashboard:   python tools/paper_dashboard.py; start docs/paper-dashboard.html"
+Write-Host ""
