@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agents - ai-investing</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/cockpit.css" />
+  <script src="/static/cockpit.js" defer></script>
+  <style>
+    .agent-card { background: #0b1220; border: 1px solid #1f2937; border-radius: 12px; padding: 16px; transition: border-color .2s; }
+    .agent-card.ok    { border-color: #10b98155; }
+    .agent-card.warn  { border-color: #f59e0b55; }
+    .agent-card.halt  { border-color: #ef444455; }
+    .agent-card.idle  { border-color: #1f2937; }
+    .agent-light { width: 12px; height: 12px; border-radius: 999px; display: inline-block; margin-right: 8px; box-shadow: 0 0 8px currentColor; }
+    .agent-light.ok    { background: #10b981; color: #10b981; }
+    .agent-light.warn  { background: #f59e0b; color: #f59e0b; }
+    .agent-light.halt  { background: #ef4444; color: #ef4444; }
+    .agent-light.idle  { background: #6b7280; color: transparent; box-shadow: none; }
+    .pipeline-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .pipeline-arrow { color: #4b5563; text-align: center; font-size: 18px; }
+    .audit-row td { padding: 6px 8px; border-bottom: 1px solid #1f2937; font-size: 12px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .kv { font-size: 12px; color: #9ca3af; }
+    .kv b { color: #e5e7eb; font-weight: 600; }
+    .signal-pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; margin: 2px 4px 2px 0; background: #0f172a; border: 1px solid #1f2937; }
+    .signal-pill.buy { color: #34d399; border-color: #10b98155; }
+    .signal-pill.sell { color: #fca5a5; border-color: #ef444455; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="topbar"><div class="topbar-inner">
+    <a href="/" class="topbar-brand">
+      <span id="cockpit-conn-dot" class="topbar-brand-dot idle"></span>
+      <span>ai-investing</span>
+    </a>
+    <div id="cockpit-topbar"></div>
+  </div></div>
+
+  <div class="max-w-6xl mx-auto p-6">
+    <nav class="nav flex items-center gap-1 mb-4 text-sm">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/trading" class="nav-link">Trading</a>
+      <a href="/agents" class="nav-link nav-active">Agents</a>
+      <a href="/models" class="nav-link">Models</a>
+      <a href="/settings" class="nav-link">Settings</a>
+      <a href="/updates" class="nav-link">Updates</a>
+      <a href="/errors" class="nav-link">Errors<span id="nav-err-badge" class="nav-badge" data-err-badge style="display:none">0</span></a>
+      <button id="shortcuts-btn" class="btn btn-ghost btn-sm ml-auto" data-tt="Keyboard shortcuts (press ?)">?</button>
+    </nav>
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold">LangGraph agent pipeline <span class="tt" data-tt="Spec §5 — Research → Strategy → Risk → Execution. Runs in advisory mode by default; the paper loop still owns real orders.">?</span></h1>
+      <p class="text-sm text-gray-400 mt-1">Research → Strategy → Risk → Execution. Each agent emits a Pydantic-validated payload and a span; risk halts kill the chain before any order.</p>
+    </header>
+
+    <section class="card p-5 mb-4">
+      <div class="flex flex-wrap items-end gap-3">
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Symbols <span class="tt" data-tt="Comma-separated tickers fed to Research. Default uses SPY/TLT/QQQ.">?</span></label>
+          <input id="symbols-input" class="select" style="min-width:240px" value="SPY,TLT,QQQ" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Regime <span class="tt" data-tt="Forces the Strategy agent's gate. Leave on Auto to use the dashboard's current detection.">?</span></label>
+          <select id="regime-select" class="select">
+            <option value="">Auto (use current)</option>
+            <option value="bull">bull</option>
+            <option value="chop">chop</option>
+            <option value="bear">bear</option>
+            <option value="crisis">crisis</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Backend <span class="tt" data-tt="Stub = deterministic, no LLM. LLM = call Ollama (DeepSeek R1 / Qwen 2.5 / Llama 3.x per hardware profile). LLM fails closed.">?</span></label>
+          <label class="flex items-center gap-2 mt-2 text-sm">
+            <input id="use-llm" type="checkbox" />
+            <span>Use Ollama LLM runners</span>
+          </label>
+        </div>
+        <div class="ml-auto flex gap-2">
+          <button id="run-btn" class="btn btn-primary" data-tt="Run one advisory pass through all four agents. Safe — no orders are placed.">Run pipeline</button>
+        </div>
+      </div>
+      <div class="mt-3 flex items-center gap-3">
+        <span id="run-status" class="pill pill-gray">idle</span>
+        <span id="run-meta" class="text-xs text-gray-400"></span>
+      </div>
+    </section>
+
+    <section class="mb-4">
+      <div class="pipeline-row">
+        <div id="card-research" class="agent-card idle">
+          <div class="flex items-center justify-between mb-2">
+            <div class="font-semibold text-sm"><span class="agent-light idle" id="light-research"></span>Research</div>
+            <span class="pill pill-gray text-xs" id="status-research">idle</span>
+          </div>
+          <div class="kv mb-2" id="detail-research">awaiting run</div>
+          <div class="text-xs text-gray-300" id="thesis-research" style="min-height: 36px;">—</div>
+        </div>
+        <div id="card-strategy" class="agent-card idle">
+          <div class="flex items-center justify-between mb-2">
+            <div class="font-semibold text-sm"><span class="agent-light idle" id="light-strategy"></span>Strategy</div>
+            <span class="pill pill-gray text-xs" id="status-strategy">idle</span>
+          </div>
+          <div class="kv mb-2" id="detail-strategy">awaiting run</div>
+          <div class="text-xs" id="signals-strategy" style="min-height: 36px;">—</div>
+        </div>
+        <div id="card-risk" class="agent-card idle">
+          <div class="flex items-center justify-between mb-2">
+            <div class="font-semibold text-sm"><span class="agent-light idle" id="light-risk"></span>Risk</div>
+            <span class="pill pill-gray text-xs" id="status-risk">idle</span>
+          </div>
+          <div class="kv mb-2" id="detail-risk">awaiting run</div>
+          <div class="text-xs text-gray-300" id="halt-risk" style="min-height: 36px;">—</div>
+        </div>
+        <div id="card-execution" class="agent-card idle">
+          <div class="flex items-center justify-between mb-2">
+            <div class="font-semibold text-sm"><span class="agent-light idle" id="light-execution"></span>Execution</div>
+            <span class="pill pill-gray text-xs" id="status-execution">idle</span>
+          </div>
+          <div class="kv mb-2" id="detail-execution">awaiting run</div>
+          <div class="text-xs text-gray-300" style="min-height: 36px;">Advisory mode — actual orders route through the paper loop.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card p-5">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium">Audit trail <span class="tt" data-tt="Every agent_call and approval emitted by the most recent graph run. Stored locally — feed the audit ledger for the live log.">?</span></div>
+        <span class="text-xs text-gray-500" id="audit-meta">no run yet</span>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left">
+          <thead>
+            <tr class="text-xs uppercase tracking-wider text-gray-500">
+              <th class="pb-2 pr-3">Actor</th>
+              <th class="pb-2 pr-3">Event</th>
+              <th class="pb-2 pr-3">Payload</th>
+            </tr>
+          </thead>
+          <tbody id="audit-body">
+            <tr><td colspan="3" class="text-xs text-gray-500 py-3">Run the pipeline to populate the audit trail.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    function setAgentCard(name, agent) {
+      const status = (agent && agent.status) || 'idle';
+      const detail = (agent && agent.detail) || '';
+      const card = document.getElementById('card-' + name);
+      const light = document.getElementById('light-' + name);
+      const pill = document.getElementById('status-' + name);
+      const detEl = document.getElementById('detail-' + name);
+      card.className = 'agent-card ' + status;
+      light.className = 'agent-light ' + status;
+      pill.textContent = status;
+      pill.className = 'pill text-xs ' + (
+        status === 'ok' ? 'pill-green' :
+        status === 'warn' ? 'pill-yellow' :
+        status === 'halt' ? 'pill-red' : 'pill-gray'
+      );
+      detEl.textContent = detail;
+    }
+
+    function paintRun(j) {
+      if (!j || !j.agents) return;
+      setAgentCard('research',  j.agents.research);
+      setAgentCard('strategy',  j.agents.strategy);
+      setAgentCard('risk',      j.agents.risk);
+      setAgentCard('execution', j.agents.execution);
+
+      const r = j.agents.research || {};
+      document.getElementById('thesis-research').textContent = r.thesis || '—';
+
+      const s = j.agents.strategy || {};
+      const sigs = s.signals || [];
+      const sigsEl = document.getElementById('signals-strategy');
+      if (!sigs.length) {
+        sigsEl.textContent = 'no signals';
+      } else {
+        sigsEl.innerHTML = sigs.map(sg =>
+          `<span class="signal-pill ${sg.side}">${Cockpit.fmt.escape(sg.symbol)} ${sg.side} ${Number(sg.strength).toFixed(2)}</span>`
+        ).join('');
+      }
+
+      const rk = j.agents.risk || {};
+      document.getElementById('halt-risk').textContent = j.halted
+        ? ('HALT: ' + (j.halt_reason || rk.detail || 'unknown'))
+        : ((rk.approved || []).length + ' approved / ' + (rk.rejected || []).length + ' rejected');
+
+      const audit = j.audit || [];
+      const body = document.getElementById('audit-body');
+      if (!audit.length) {
+        body.innerHTML = '<tr><td colspan="3" class="text-xs text-gray-500 py-3">Run the pipeline to populate the audit trail.</td></tr>';
+      } else {
+        body.innerHTML = audit.map(ev =>
+          `<tr class="audit-row"><td>${Cockpit.fmt.escape(ev.actor)}</td><td>${Cockpit.fmt.escape(ev.event_type)}</td><td><code>${Cockpit.fmt.escape(JSON.stringify(ev.payload))}</code></td></tr>`
+        ).join('');
+      }
+      const meta = document.getElementById('audit-meta');
+      meta.textContent = j.ran_at
+        ? `decision ${(j.decision_id || '').slice(0,8)} · ${j.ran_at} · ${j.used_llm ? 'LLM' : 'stub'}${j.regime ? ' · regime=' + j.regime : ''}`
+        : 'no run yet';
+    }
+
+    async function loadLast() {
+      try {
+        const j = await Cockpit.api.get('/api/agents/last');
+        paintRun(j);
+        Cockpit.markConnection('live');
+      } catch (e) {
+        Cockpit.markConnection('offline');
+      }
+    }
+
+    async function runPipeline() {
+      const symbolsRaw = document.getElementById('symbols-input').value || '';
+      const symbols = symbolsRaw.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+      const regime = document.getElementById('regime-select').value || null;
+      const useLlm = document.getElementById('use-llm').checked;
+      const btn = document.getElementById('run-btn');
+      const pill = document.getElementById('run-status');
+      const meta = document.getElementById('run-meta');
+      btn.disabled = true;
+      pill.textContent = 'running';
+      pill.className = 'pill pill-blue';
+      meta.textContent = useLlm ? 'calling Ollama...' : 'running deterministic stubs...';
+      const t0 = performance.now();
+      try {
+        const j = await Cockpit.api.post('/api/agents/run', {symbols, regime, use_llm: useLlm});
+        const dt = ((performance.now() - t0) / 1000).toFixed(2);
+        paintRun(j);
+        if (j.halted) {
+          pill.textContent = 'halted';
+          pill.className = 'pill pill-red';
+          Cockpit.toastWarn('Pipeline halted: ' + (j.halt_reason || 'risk gate'));
+        } else {
+          pill.textContent = 'ok';
+          pill.className = 'pill pill-green';
+          Cockpit.toastSuccess(`Pipeline complete in ${dt}s`);
+        }
+        meta.textContent = `decision ${(j.decision_id || '').slice(0,8)} · ${dt}s`;
+      } catch (e) {
+        pill.textContent = 'error';
+        pill.className = 'pill pill-red';
+        meta.textContent = e.message;
+        Cockpit.toastError('Run failed: ' + e.message);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function refreshTopbar() {
+      try { Cockpit.renderTopbar(await Cockpit.api.get('/api/state')); } catch (e) { /* ignore */ }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('run-btn').addEventListener('click', runPipeline);
+      document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
+      refreshTopbar();
+      loadLast();
+      setInterval(refreshTopbar, 5000);
+    });
+  </script>
+</body>
+</html>

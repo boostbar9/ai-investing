@@ -310,6 +310,86 @@ def test_errors_page_renders(client: TestClient) -> None:
     assert "Error console" in r.text or "errors" in r.text.lower()
 
 
+def test_dashboard_shows_agent_strip(client: TestClient) -> None:
+    """Dashboard must expose the agent status strip so users see state at a glance."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "agent-lights" in r.text
+    assert "/api/agents/last" in r.text
+
+
+def test_agents_page_renders(client: TestClient) -> None:
+    r = client.get("/agents")
+    assert r.status_code == 200
+    body = r.text.lower()
+    assert "langgraph" in body or "agent" in body
+    # Pipeline cards should be present so the dashboard JS can paint them.
+    for name in ("card-research", "card-strategy", "card-risk", "card-execution"):
+        assert name in r.text
+
+
+def test_agents_last_idle_before_first_run(client: TestClient) -> None:
+    """/api/agents/last must respond with idle defaults before any run."""
+    # Reset the module-level cache so this test is order-independent.
+    srv._LAST_AGENT_RUN.clear()
+    srv._LAST_AGENT_RUN.update(
+        {
+            "ran_at": None,
+            "decision_id": None,
+            "halted": False,
+            "halt_reason": None,
+            "used_llm": False,
+            "agents": {
+                "research": {"status": "idle", "detail": ""},
+                "strategy": {"status": "idle", "detail": ""},
+                "risk": {"status": "idle", "detail": ""},
+                "execution": {"status": "idle", "detail": ""},
+            },
+            "audit": [],
+        }
+    )
+    r = client.get("/api/agents/last")
+    assert r.status_code == 200
+    j = r.json()
+    assert j["ran_at"] is None
+    assert set(j["agents"].keys()) == {"research", "strategy", "risk", "execution"}
+    for a in j["agents"].values():
+        assert a["status"] == "idle"
+
+
+def test_agents_run_stub_returns_full_pipeline(client: TestClient) -> None:
+    """POST /api/agents/run with stub backend must walk all four agents."""
+    r = client.post(
+        "/api/agents/run",
+        json={"symbols": ["SPY", "QQQ"], "regime": "chop", "use_llm": False},
+    )
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["used_llm"] is False
+    assert j["regime"] == "chop"
+    assert j["decision_id"]
+    # Stub research is neutral by default -> sentiment ~0 -> status ok.
+    assert j["agents"]["research"]["status"] in {"ok", "warn"}
+    # With weights for SPY+QQQ the strategy stub produces signals.
+    assert j["agents"]["strategy"]["status"] in {"ok", "warn"}
+    assert isinstance(j["agents"]["strategy"]["signals"], list)
+    assert isinstance(j["audit"], list) and len(j["audit"]) >= 3
+    # /last must now reflect the run.
+    r2 = client.get("/api/agents/last").json()
+    assert r2["decision_id"] == j["decision_id"]
+
+
+def test_agents_run_crisis_regime_halts_strategy(client: TestClient) -> None:
+    """Crisis regime must short-circuit the strategy gate per spec §5."""
+    r = client.post(
+        "/api/agents/run",
+        json={"symbols": ["SPY"], "regime": "crisis", "use_llm": False},
+    )
+    assert r.status_code == 200
+    j = r.json()
+    assert j["agents"]["strategy"]["status"] == "halt"
+
+
 def test_state_endpoint_handles_empty_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """No runs.jsonl yet -> still returns 200 with sensible empty values."""
     empty = tmp_path / "runs.jsonl"

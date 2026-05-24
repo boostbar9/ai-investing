@@ -278,6 +278,11 @@ def errors_page() -> HTMLResponse:
     return _render("errors.html")
 
 
+@app.get("/agents", response_class=HTMLResponse)
+def agents_page() -> HTMLResponse:
+    return _render("agents.html")
+
+
 def _render(name: str) -> HTMLResponse:
     path = Path(__file__).parent / "templates" / name
     if not path.exists():
@@ -768,6 +773,190 @@ def api_mode_set(req: ModeRequest) -> dict[str, Any]:
     state = record_action(state, f"Trading mode -> {req.mode} (bot auto-paused)")
     save_state(state)
     return {"mode": state.trading_mode, "paused": state.paused}
+
+
+# --------------------------------------------------------------------------
+# Agent graph (§5)
+# --------------------------------------------------------------------------
+
+
+class AgentRunRequest(BaseModel):
+    """Trigger a single LangGraph advisory run."""
+
+    symbols: list[str] | None = None
+    regime: str | None = None
+    use_llm: bool = False
+
+
+# In-memory cache of the most recent agent graph run. Kept on the module so
+# the dashboard /api/agents/last endpoint can show status lights without
+# re-running the graph on every poll.
+_LAST_AGENT_RUN: dict[str, Any] = {
+    "ran_at": None,
+    "decision_id": None,
+    "halted": False,
+    "halt_reason": None,
+    "used_llm": False,
+    "agents": {
+        "research": {"status": "idle", "detail": ""},
+        "strategy": {"status": "idle", "detail": ""},
+        "risk": {"status": "idle", "detail": ""},
+        "execution": {"status": "idle", "detail": ""},
+    },
+    "audit": [],
+}
+
+
+def _last_run_payload() -> dict[str, Any]:
+    """Return a deep-ish copy of the cached run so callers can't mutate it."""
+    return json.loads(json.dumps(_LAST_AGENT_RUN, default=str))
+
+
+@app.get("/api/agents/last")
+def api_agents_last() -> dict[str, Any]:
+    """Last advisory graph result (for the dashboard status lights)."""
+    return _last_run_payload()
+
+
+@app.post("/api/agents/run")
+async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
+    """Run one advisory pass of the LangGraph agent graph.
+
+    Defaults to the deterministic stub agents in ``paper_bridge`` so we don't
+    require a running Ollama. ``use_llm=true`` swaps in the LLM-backed
+    runners; if Ollama isn't reachable, those runners fall back to safe
+    defaults (no signals, risk halts), which we surface to the UI.
+    """
+    from packages.agents import paper_bridge
+    from packages.shared.schemas import Position
+
+    symbols = req.symbols or ["SPY", "TLT", "QQQ"]
+    regime = (req.regime or latest_regime().get("regime") or "chop").lower()
+    if regime not in ("bull", "bear", "chop", "crisis"):
+        regime = "chop"
+
+    # Equal-weight stub for the advisory run; real weights come from the
+    # paper loop. The graph treats these as candidate signals only.
+    target_weights = {s: 1.0 / len(symbols) for s in symbols}
+
+    if req.use_llm:
+        # LLM-backed runners (Ollama). Build a fresh graph so we don't have
+        # to import inside the bridge module.
+        from packages.agents.graph import AgentGraph
+        from packages.agents.llm_router import LLMRouter
+        from packages.agents.runners import (
+            build_execution_runner,
+            build_research_runner,
+            build_risk_runner,
+            build_strategy_runner,
+        )
+
+        async def _auto_approve(sigs, _did):  # type: ignore[no-untyped-def]
+            return sigs
+
+        router = LLMRouter()
+        try:
+            graph = AgentGraph(
+                research=build_research_runner(router),
+                strategy=build_strategy_runner(router),
+                risk=build_risk_runner(router),
+                execution=build_execution_runner(router),
+                approval=_auto_approve,
+            )
+            result = await graph.run(
+                symbols=symbols,
+                regime=regime,
+                positions=[Position(symbol=s, qty=0.0, avg_price=0.0) for s in symbols],
+                features={},
+            )
+        finally:
+            await router.aclose()
+    else:
+        result = await paper_bridge.advise(
+            symbols=symbols,
+            regime=regime,
+            positions=[Position(symbol=s, qty=0.0, avg_price=0.0) for s in symbols],
+            target_weights=target_weights,
+            sentiment_scores=None,
+        )
+
+    # Build per-agent status. "ok" / "warn" / "halt" maps cleanly to the
+    # cockpit pill classes (green / yellow / red).
+    n_signals = len(result.strategy.signals)
+    n_approved = len(result.risk.approved)
+    n_rejected = len(result.risk.rejected)
+    research_status = "ok"
+    if abs(result.research.sentiment) > 0.5:
+        research_status = "warn"
+    strategy_status = "ok" if n_signals else "warn"
+    if regime == "crisis":
+        strategy_status = "halt"
+    if result.risk.halted:
+        risk_status = "halt"
+    elif n_rejected and not n_approved:
+        risk_status = "warn"
+    else:
+        risk_status = "ok"
+    if result.execution is None:
+        execution_status = "halt" if result.halted else "idle"
+        n_fills = 0
+    else:
+        execution_status = "ok"
+        n_fills = len(result.execution.fills)
+
+    payload: dict[str, Any] = {
+        "ran_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "decision_id": str(result.decision_id),
+        "halted": bool(result.halted),
+        "halt_reason": result.risk.halt_reason,
+        "used_llm": bool(req.use_llm),
+        "regime": regime,
+        "symbols": symbols,
+        "agents": {
+            "research": {
+                "status": research_status,
+                "detail": f"sentiment={result.research.sentiment:+.2f}",
+                "thesis": result.research.thesis,
+                "citations": list(result.research.citations),
+            },
+            "strategy": {
+                "status": strategy_status,
+                "detail": f"{n_signals} signal(s)",
+                "signals": [s.model_dump() for s in result.strategy.signals],
+            },
+            "risk": {
+                "status": risk_status,
+                "detail": (
+                    result.risk.halt_reason
+                    or f"{n_approved} approved, {n_rejected} rejected"
+                ),
+                "approved": [s.model_dump() for s in result.risk.approved],
+                "rejected": [s.model_dump() for s in result.risk.rejected],
+            },
+            "execution": {
+                "status": execution_status,
+                "detail": (
+                    "no orders (risk halt)" if result.execution is None
+                    else f"{n_fills} fill(s)"
+                ),
+                "fills": (
+                    [] if result.execution is None
+                    else [f.model_dump(mode="json") for f in result.execution.fills]
+                ),
+            },
+        },
+        "audit": [
+            {
+                "actor": ev.actor,
+                "event_type": ev.event_type,
+                "payload": ev.payload,
+            }
+            for ev in result.audit
+        ],
+    }
+    _LAST_AGENT_RUN.clear()
+    _LAST_AGENT_RUN.update(payload)
+    return payload
 
 
 # --------------------------------------------------------------------------

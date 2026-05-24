@@ -29,6 +29,7 @@
     <nav class="nav">
       <a href="/" class="nav-link nav-active">Dashboard</a>
       <a href="/trading" class="nav-link">Trading</a>
+      <a href="/agents" class="nav-link">Agents</a>
       <a href="/models" class="nav-link">Models</a>
       <a href="/settings" class="nav-link">Settings</a>
       <a href="/updates" class="nav-link">Updates</a>
@@ -168,6 +169,39 @@
         </div>
       </div>
     </section>
+
+    <section class="card p-4 mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <div class="section-h" data-tt="Spec §5 — last run of the LangGraph advisory pipeline. Open the Agents page to trigger a new run.">Agent pipeline</div>
+        <a href="/agents" class="text-xs text-blue-300 hover:text-blue-200">Open agents page →</a>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm" id="agent-lights">
+        <div class="flex items-center gap-2" data-agent="research">
+          <span class="agent-dot idle"></span><span class="font-medium">Research</span>
+          <span class="text-xs text-gray-500 ml-auto agent-detail">idle</span>
+        </div>
+        <div class="flex items-center gap-2" data-agent="strategy">
+          <span class="agent-dot idle"></span><span class="font-medium">Strategy</span>
+          <span class="text-xs text-gray-500 ml-auto agent-detail">idle</span>
+        </div>
+        <div class="flex items-center gap-2" data-agent="risk">
+          <span class="agent-dot idle"></span><span class="font-medium">Risk</span>
+          <span class="text-xs text-gray-500 ml-auto agent-detail">idle</span>
+        </div>
+        <div class="flex items-center gap-2" data-agent="execution">
+          <span class="agent-dot idle"></span><span class="font-medium">Execution</span>
+          <span class="text-xs text-gray-500 ml-auto agent-detail">idle</span>
+        </div>
+      </div>
+      <div class="text-xs text-gray-500 mt-2" id="agent-meta">No run yet — open the Agents page to trigger one.</div>
+    </section>
+    <style>
+      .agent-dot { display:inline-block; width:10px; height:10px; border-radius:999px; background:#6b7280; }
+      .agent-dot.ok   { background:#10b981; box-shadow:0 0 8px #10b981; }
+      .agent-dot.warn { background:#f59e0b; box-shadow:0 0 8px #f59e0b; }
+      .agent-dot.halt { background:#ef4444; box-shadow:0 0 8px #ef4444; }
+      .agent-dot.idle { background:#6b7280; box-shadow:none; }
+    </style>
 
     <footer class="text-center text-xs text-gray-600 py-6">
       Polling every 5s · <a href="/api/state" class="hover:text-gray-400">/api/state</a> · press <span class="kbd">?</span> for shortcuts
@@ -464,6 +498,29 @@
     // Boot
     refresh();
     setInterval(refresh, 5000);
+
+    // ----- agent pipeline status lights -----
+    async function refreshAgents() {
+      try {
+        const j = await Cockpit.api.get("/api/agents/last");
+        document.querySelectorAll("#agent-lights [data-agent]").forEach(row => {
+          const name = row.getAttribute("data-agent");
+          const agent = (j.agents || {})[name] || {status: "idle", detail: ""};
+          const dot = row.querySelector(".agent-dot");
+          const det = row.querySelector(".agent-detail");
+          dot.className = "agent-dot " + (agent.status || "idle");
+          det.textContent = agent.detail || agent.status || "idle";
+        });
+        const meta = document.getElementById("agent-meta");
+        if (j.ran_at) {
+          const tag = j.used_llm ? "LLM" : "stub";
+          const halt = j.halted ? " · HALTED" : "";
+          meta.textContent = `last run ${j.ran_at} · ${tag}${halt}`;
+        }
+      } catch (e) { /* ignore */ }
+    }
+    refreshAgents();
+    setInterval(refreshAgents, 8000);
   </script>
 </body>
 </html>
