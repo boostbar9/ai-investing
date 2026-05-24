@@ -419,9 +419,27 @@ async def run(
         except Exception as e:
             log.warning("could not fetch positions for agent advisory: %s", e)
 
+        # Detect the live regime from the same panel the strategy uses so the
+        # advisory chain gates on real conditions (spec §7).
+        try:
+            _panel = load_panel(symbols)
+            if not _panel.empty:
+                _regimes = _build_regime_series(_panel)
+                _live_regime = (
+                    str(_regimes.iloc[-1]).lower() if len(_regimes) else "chop"
+                )
+            else:
+                _live_regime = "chop"
+        except Exception as e:
+            log.warning("regime detection failed (%s); defaulting to chop", e)
+            _live_regime = "chop"
+        if _live_regime not in ("bull", "bear", "chop", "crisis"):
+            _live_regime = "chop"
+        log.info("agent advisory regime: %s", _live_regime)
+
         agent_result = await agent_advise(
             symbols=symbols,
-            regime="bull",  # placeholder; regime agent lands later
+            regime=_live_regime,
             positions=agent_positions,
             target_weights=target,
             sentiment_scores=sentiment_scores,

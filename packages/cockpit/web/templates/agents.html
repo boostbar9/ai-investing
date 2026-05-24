@@ -124,6 +124,66 @@
       </div>
     </section>
 
+    <section class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium">Auto-scheduler <span class="tt" data-tt="Runs the agent pipeline on a recurring cadence. Disabled by default. Respects the global pause toggle — paused cockpit means skipped ticks.">?</span></div>
+        <span id="sched-status" class="pill pill-gray text-xs">disabled</span>
+      </div>
+      <div class="flex flex-wrap items-end gap-3">
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Enabled <span class="tt" data-tt="Toggle on to start the in-process loop. Resets to off on cockpit restart.">?</span></label>
+          <label class="flex items-center gap-2 mt-2 text-sm">
+            <input id="sched-enabled" type="checkbox" />
+            <span>Run automatically</span>
+          </label>
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Interval (seconds) <span class="tt" data-tt="Seconds between ticks. Minimum 60.">?</span></label>
+          <input id="sched-interval" type="number" min="60" step="60" class="select" style="width:140px" value="1800" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Symbols <span class="tt" data-tt="Comma-separated tickers passed to every scheduled run.">?</span></label>
+          <input id="sched-symbols" class="select" style="min-width:200px" value="SPY,TLT,QQQ" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Backend <span class="tt" data-tt="Off = deterministic stub (safe). On = Ollama LLM runners.">?</span></label>
+          <label class="flex items-center gap-2 mt-2 text-sm">
+            <input id="sched-use-llm" type="checkbox" />
+            <span>Use LLM</span>
+          </label>
+        </div>
+        <div class="ml-auto flex gap-2">
+          <button id="sched-save-btn" class="btn btn-primary" data-tt="Apply settings. Starts or stops the loop.">Save</button>
+          <button id="sched-tick-btn" class="btn" data-tt="Run one tick now (respects global pause).">Tick now</button>
+        </div>
+      </div>
+      <div class="mt-3 text-xs text-gray-400" id="sched-meta">never run</div>
+    </section>
+
+    <section class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium">Recent runs <span class="tt" data-tt="Append-only log at data/agents_log.jsonl. Capped at 500 rows.">?</span></div>
+        <span class="text-xs text-gray-500" id="history-meta">—</span>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left">
+          <thead>
+            <tr class="text-xs uppercase tracking-wider text-gray-500">
+              <th class="pb-2 pr-3">When</th>
+              <th class="pb-2 pr-3">Decision</th>
+              <th class="pb-2 pr-3">Regime</th>
+              <th class="pb-2 pr-3">Backend</th>
+              <th class="pb-2 pr-3">Status</th>
+              <th class="pb-2 pr-3">Reason</th>
+            </tr>
+          </thead>
+          <tbody id="history-body">
+            <tr><td colspan="6" class="text-xs text-gray-500 py-3">No runs yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="card p-5">
       <div class="flex items-center justify-between mb-3">
         <div class="text-sm font-medium">Audit trail <span class="tt" data-tt="Every agent_call and approval emitted by the most recent graph run. Stored locally — feed the audit ledger for the live log.">?</span></div>
@@ -257,12 +317,109 @@
       try { Cockpit.renderTopbar(await Cockpit.api.get('/api/state')); } catch (e) { /* ignore */ }
     }
 
+    function paintSchedule(j) {
+      if (!j) return;
+      const pill = document.getElementById('sched-status');
+      const running = !!j.running;
+      const enabled = !!j.enabled;
+      pill.textContent = running ? 'running' : (enabled ? 'enabled' : 'disabled');
+      pill.className = 'pill text-xs ' + (running ? 'pill-green' : (enabled ? 'pill-yellow' : 'pill-gray'));
+      document.getElementById('sched-enabled').checked = enabled;
+      document.getElementById('sched-interval').value = j.interval_seconds || 1800;
+      document.getElementById('sched-symbols').value = (j.symbols || []).join(',');
+      document.getElementById('sched-use-llm').checked = !!j.use_llm;
+      const meta = document.getElementById('sched-meta');
+      const last = j.last_run_at ? `last ${j.last_run_at} · ${j.last_run_status || '—'}` : 'never run';
+      const err = j.last_error ? ` · err: ${j.last_error}` : '';
+      meta.textContent = last + err;
+    }
+
+    async function loadSchedule() {
+      try {
+        const j = await Cockpit.api.get('/api/agents/schedule');
+        paintSchedule(j);
+      } catch (e) { /* ignore */ }
+    }
+
+    async function saveSchedule() {
+      const symbolsRaw = document.getElementById('sched-symbols').value || '';
+      const body = {
+        enabled: document.getElementById('sched-enabled').checked,
+        interval_seconds: parseInt(document.getElementById('sched-interval').value || '1800', 10),
+        use_llm: document.getElementById('sched-use-llm').checked,
+        symbols: symbolsRaw.split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+      };
+      try {
+        const j = await Cockpit.api.post('/api/agents/schedule', body);
+        paintSchedule(j);
+        Cockpit.toastSuccess(body.enabled ? 'Scheduler enabled' : 'Scheduler disabled');
+      } catch (e) {
+        Cockpit.toastError('Save failed: ' + e.message);
+      }
+    }
+
+    async function tickNow() {
+      const btn = document.getElementById('sched-tick-btn');
+      btn.disabled = true;
+      try {
+        const j = await Cockpit.api.post('/api/agents/schedule/tick', {});
+        if (j && j.skipped) {
+          Cockpit.toastWarn('Tick skipped: ' + (j.reason || 'paused'));
+        } else if (j && j.halted) {
+          Cockpit.toastWarn('Tick halted: ' + (j.halt_reason || 'risk gate'));
+        } else {
+          Cockpit.toastSuccess('Tick complete');
+        }
+        await loadSchedule();
+        await loadHistory();
+        await loadLast();
+      } catch (e) {
+        Cockpit.toastError('Tick failed: ' + e.message);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function loadHistory() {
+      try {
+        const j = await Cockpit.api.get('/api/agents/history?limit=10');
+        const runs = (j && j.runs) || [];
+        const body = document.getElementById('history-body');
+        const meta = document.getElementById('history-meta');
+        meta.textContent = `${runs.length} of ${j.total || 0} shown`;
+        if (!runs.length) {
+          body.innerHTML = '<tr><td colspan="6" class="text-xs text-gray-500 py-3">No runs yet.</td></tr>';
+          return;
+        }
+        body.innerHTML = runs.map(r => {
+          const status = r.halted ? 'halt' : 'ok';
+          const cls = r.halted ? 'pill-red' : 'pill-green';
+          return `<tr class="audit-row">`
+            + `<td>${Cockpit.fmt.escape(r.ts || '')}</td>`
+            + `<td><code>${Cockpit.fmt.escape((r.decision_id || '').slice(0,8))}</code></td>`
+            + `<td>${Cockpit.fmt.escape(r.regime || '—')}</td>`
+            + `<td>${r.used_llm ? 'LLM' : 'stub'}</td>`
+            + `<td><span class="pill text-xs ${cls}">${status}</span></td>`
+            + `<td>${Cockpit.fmt.escape(r.halt_reason || '')}</td>`
+            + `</tr>`;
+        }).join('');
+      } catch (e) { /* ignore */ }
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
-      document.getElementById('run-btn').addEventListener('click', runPipeline);
+      document.getElementById('run-btn').addEventListener('click', async () => {
+        await runPipeline();
+        await loadHistory();
+      });
+      document.getElementById('sched-save-btn').addEventListener('click', saveSchedule);
+      document.getElementById('sched-tick-btn').addEventListener('click', tickNow);
       document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
       refreshTopbar();
       loadLast();
+      loadSchedule();
+      loadHistory();
       setInterval(refreshTopbar, 5000);
+      setInterval(loadSchedule, 7000);
     });
   </script>
 </body>

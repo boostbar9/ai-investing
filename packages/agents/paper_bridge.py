@@ -81,9 +81,16 @@ def make_research_agent(
 
 
 def make_strategy_agent(target_weights: dict[str, float]) -> Any:
-    """Strategy agent mirrors the deterministic target weights as signals."""
+    """Strategy agent mirrors the deterministic target weights as signals.
+
+    Honors spec §5: in ``crisis`` regime the strategy MUST emit zero signals
+    so the downstream risk/execution legs have nothing to approve.
+    """
 
     async def _strategy(inp: StrategyInput) -> StrategyOutput:
+        # Spec §5 hard rule: crisis regime kills the chain.
+        if inp.regime == "crisis":
+            return StrategyOutput(decision_id=inp.decision_id, signals=[])
         signals = []
         for sym, w in target_weights.items():
             if abs(w) < 1e-6:

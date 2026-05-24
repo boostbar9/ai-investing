@@ -66,7 +66,15 @@ def fake_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
-def client(fake_log: Path, fake_state: Path) -> TestClient:
+def fake_agent_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect the agent run log to a tmp file so /api/agents/run is hermetic."""
+    log = tmp_path / "agents_log.jsonl"
+    monkeypatch.setattr(srv, "AGENT_LOG", log)
+    return log
+
+
+@pytest.fixture
+def client(fake_log: Path, fake_state: Path, fake_agent_log: Path) -> TestClient:
     return TestClient(srv.app)
 
 
@@ -388,6 +396,124 @@ def test_agents_run_crisis_regime_halts_strategy(client: TestClient) -> None:
     assert r.status_code == 200
     j = r.json()
     assert j["agents"]["strategy"]["status"] == "halt"
+
+
+def test_agents_crisis_regime_kills_chain_in_stub(client: TestClient) -> None:
+    """Spec §5: crisis regime → zero signals from strategy AND zero approved by risk."""
+    r = client.post(
+        "/api/agents/run",
+        json={"symbols": ["SPY", "QQQ"], "regime": "crisis", "use_llm": False},
+    )
+    assert r.status_code == 200
+    j = r.json()
+    strat = j["agents"]["strategy"]
+    assert strat["status"] == "halt"
+    assert strat.get("signals") == []
+    risk = j["agents"]["risk"]
+    assert (risk.get("approved") or []) == []
+
+
+def test_agents_run_persists_to_log(client: TestClient, fake_agent_log: Path) -> None:
+    """Each /api/agents/run must append one row to data/agents_log.jsonl and be readable via /history."""
+    assert not fake_agent_log.exists()
+    r = client.post(
+        "/api/agents/run",
+        json={"symbols": ["SPY"], "regime": "chop", "use_llm": False},
+    )
+    assert r.status_code == 200
+    assert fake_agent_log.exists()
+    lines = [line for line in fake_agent_log.read_text().splitlines() if line.strip()]
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["decision_id"]
+    assert row["regime"] == "chop"
+    assert "agents" in row
+    # And /history surfaces it.
+    h = client.get("/api/agents/history?limit=10").json()
+    assert h["total"] == 1
+    assert h["runs"][0]["decision_id"] == row["decision_id"]
+
+
+def test_agents_schedule_get_default(client: TestClient) -> None:
+    """Scheduler must start disabled with sane defaults."""
+    # Reset module-level state so this test is order-independent.
+    srv._AGENT_SCHED["enabled"] = False
+    srv._AGENT_SCHED["interval_seconds"] = 1800
+    srv._AGENT_SCHED["use_llm"] = False
+    srv._AGENT_SCHED["symbols"] = ["SPY", "QQQ", "TLT"]
+    srv._AGENT_SCHED["last_run_at"] = None
+    srv._AGENT_SCHED["last_run_status"] = None
+    srv._AGENT_SCHED["last_error"] = None
+    srv._AGENT_SCHED["_task"] = None
+    r = client.get("/api/agents/schedule")
+    assert r.status_code == 200
+    j = r.json()
+    assert j["enabled"] is False
+    assert j["running"] is False
+    assert j["interval_seconds"] == 1800
+    assert j["use_llm"] is False
+    assert isinstance(j["symbols"], list)
+
+
+def test_agents_schedule_set_validates_interval(client: TestClient) -> None:
+    """Intervals below 60s must be rejected with 400."""
+    r = client.post(
+        "/api/agents/schedule",
+        json={"enabled": False, "interval_seconds": 10},
+    )
+    assert r.status_code == 400
+
+
+def test_agents_schedule_tick_runs_pipeline(
+    client: TestClient, fake_agent_log: Path
+) -> None:
+    """POST /api/agents/schedule/tick must run one pipeline pass and log it."""
+    # Make sure cockpit isn't paused.
+    from packages.cockpit import state as st
+
+    s = st.load_state()
+    s.paused = False
+    st.save_state(s)
+    # Ensure stub backend with default symbols.
+    srv._AGENT_SCHED["use_llm"] = False
+    srv._AGENT_SCHED["symbols"] = ["SPY", "QQQ"]
+
+    r = client.post("/api/agents/schedule/tick", json={})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert not j.get("skipped")
+    assert j.get("decision_id")
+    # Run was persisted to log.
+    assert fake_agent_log.exists()
+    # Schedule reflects the run.
+    sched = client.get("/api/agents/schedule").json()
+    assert sched["last_run_status"] in {"ok", "halted"}
+
+
+def test_agents_schedule_tick_skips_when_paused(
+    client: TestClient, fake_agent_log: Path
+) -> None:
+    """When cockpit is paused, schedule tick must skip without running."""
+    from packages.cockpit import state as st
+
+    s = st.load_state()
+    s.paused = True
+    st.save_state(s)
+    # Clear any prior log.
+    if fake_agent_log.exists():
+        fake_agent_log.unlink()
+
+    r = client.post("/api/agents/schedule/tick", json={})
+    assert r.status_code == 200
+    j = r.json()
+    assert j.get("skipped") is True
+    assert "paus" in (j.get("reason") or "").lower()
+    # No log row should have been written.
+    assert not fake_agent_log.exists() or fake_agent_log.read_text().strip() == ""
+    # Restore for other tests.
+    s = st.load_state()
+    s.paused = False
+    st.save_state(s)
 
 
 def test_state_endpoint_handles_empty_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

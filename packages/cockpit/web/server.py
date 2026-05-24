@@ -62,9 +62,48 @@ log = logging.getLogger("cockpit")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 PAPER_LOG = Path("data/paper_log/runs.jsonl")
+# Append-only log of every LangGraph agent advisory run. Capped at AGENT_LOG_MAX
+# lines via simple tail-trim so it never grows unbounded.
+AGENT_LOG = Path("data/agents_log.jsonl")
+AGENT_LOG_MAX = 500
 # packages/cockpit/web/server.py -> repo root is 3 levels up.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 INDEX_HTML = Path(__file__).parent / "templates" / "index.html"
+
+
+def _append_agent_log(payload: dict[str, Any]) -> None:
+    """Persist one agent-graph run so the dashboard can show history.
+
+    Writes a compact one-line JSON row and tail-trims the file to
+    ``AGENT_LOG_MAX`` lines so it never grows without bound.
+    """
+    try:
+        AGENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "ts": payload.get("ran_at"),
+            "decision_id": payload.get("decision_id"),
+            "halted": payload.get("halted"),
+            "halt_reason": payload.get("halt_reason"),
+            "used_llm": payload.get("used_llm"),
+            "regime": payload.get("regime"),
+            "symbols": payload.get("symbols"),
+            "agents": {
+                n: {"status": a.get("status"), "detail": a.get("detail")}
+                for n, a in (payload.get("agents") or {}).items()
+            },
+        }
+        with AGENT_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+        # Tail-trim if needed.
+        try:
+            with AGENT_LOG.open(encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > AGENT_LOG_MAX:
+                AGENT_LOG.write_text("".join(lines[-AGENT_LOG_MAX:]), encoding="utf-8")
+        except OSError:
+            pass
+    except OSError as e:
+        log.warning("failed to persist agents log: %s", e)
 
 
 # --------------------------------------------------------------------------
@@ -831,7 +870,14 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
     from packages.shared.schemas import Position
 
     symbols = req.symbols or ["SPY", "TLT", "QQQ"]
-    regime = (req.regime or latest_regime().get("regime") or "chop").lower()
+    # latest_regime() exposes keys auto/effective/override; we prefer the
+    # effective (after manual override) and fall back to chop if everything
+    # is missing so the chain still runs.
+    reg_info = latest_regime()
+    fallback_regime = (
+        reg_info.get("effective") or reg_info.get("auto") or "chop"
+    )
+    regime = (req.regime or fallback_regime or "chop").lower()
     if regime not in ("bull", "bear", "chop", "crisis"):
         regime = "chop"
 
@@ -956,7 +1002,192 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
     }
     _LAST_AGENT_RUN.clear()
     _LAST_AGENT_RUN.update(payload)
+    _append_agent_log(payload)
     return payload
+
+
+# --------------------------------------------------------------------------
+# Agent auto-scheduler
+# --------------------------------------------------------------------------
+#
+# Single in-process asyncio task that periodically POSTs to the same
+# pipeline used by the manual Run button. Defaults are:
+#   * disabled until the operator turns it on
+#   * 30 minute interval (well above the 15-min paper loop cadence)
+#   * stub backend so it never depends on Ollama
+#
+# The task is fully self-contained: it skips runs while the cockpit is
+# paused, retries on transport failure with an exponential backoff capped
+# at the interval, and emits the same _LAST_AGENT_RUN / agent log a manual
+# run would. Config is in-memory (resets on restart) by design — the user
+# explicitly opts in each session.
+
+_AGENT_SCHED: dict[str, Any] = {
+    "enabled": False,
+    "interval_seconds": 1800,  # 30 minutes
+    "use_llm": False,
+    "symbols": ["SPY", "QQQ", "TLT"],
+    "last_run_at": None,
+    "last_run_status": None,
+    "last_error": None,
+    "_task": None,
+}
+
+
+class AgentScheduleConfig(BaseModel):
+    """Toggle and tune the auto-scheduler."""
+
+    enabled: bool | None = None
+    interval_seconds: int | None = None
+    use_llm: bool | None = None
+    symbols: list[str] | None = None
+
+
+async def _scheduler_tick_once() -> dict[str, Any]:
+    """Execute one auto-scheduled pipeline pass.
+
+    Skips when the cockpit is paused so the user's pause button universally
+    halts background work. Returns the same payload shape as /api/agents/run.
+    """
+    cstate = load_state()
+    if cstate.paused:
+        _AGENT_SCHED["last_run_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+        _AGENT_SCHED["last_run_status"] = "skipped_paused"
+        return {"skipped": True, "reason": "cockpit paused"}
+    req = AgentRunRequest(
+        symbols=list(_AGENT_SCHED["symbols"] or []),
+        regime=None,
+        use_llm=bool(_AGENT_SCHED["use_llm"]),
+    )
+    result = await api_agents_run(req)
+    _AGENT_SCHED["last_run_at"] = result.get("ran_at")
+    _AGENT_SCHED["last_run_status"] = "halted" if result.get("halted") else "ok"
+    return result
+
+
+async def _scheduler_loop() -> None:  # pragma: no cover — long-lived task
+    """Background loop — sleeps `interval_seconds` between ticks."""
+    backoff = 5
+    while _AGENT_SCHED.get("enabled"):
+        try:
+            await _scheduler_tick_once()
+            backoff = 5
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _AGENT_SCHED["last_error"] = str(e)[:300]
+            log.warning("agent scheduler tick failed: %s", e)
+            backoff = min(backoff * 2, int(_AGENT_SCHED["interval_seconds"]) or 60)
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
+            continue
+        try:
+            await asyncio.sleep(int(_AGENT_SCHED["interval_seconds"]))
+        except asyncio.CancelledError:
+            raise
+
+
+def _start_scheduler_task() -> None:
+    """Spawn the background loop if not already running."""
+    task = _AGENT_SCHED.get("_task")
+    if task is not None and not task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no loop yet — will be started by FastAPI startup hook
+    _AGENT_SCHED["_task"] = loop.create_task(_scheduler_loop())
+
+
+def _stop_scheduler_task() -> None:
+    task = _AGENT_SCHED.get("_task")
+    if task is not None and not task.done():
+        task.cancel()
+    _AGENT_SCHED["_task"] = None
+
+
+@app.on_event("startup")
+async def _agent_scheduler_startup() -> None:  # pragma: no cover
+    if _AGENT_SCHED.get("enabled"):
+        _start_scheduler_task()
+
+
+@app.on_event("shutdown")
+async def _agent_scheduler_shutdown() -> None:  # pragma: no cover
+    _stop_scheduler_task()
+
+
+@app.get("/api/agents/schedule")
+def api_agents_schedule_get() -> dict[str, Any]:
+    """Current auto-scheduler config + status."""
+    task = _AGENT_SCHED.get("_task")
+    running = bool(task is not None and not task.done())
+    return {
+        "enabled": bool(_AGENT_SCHED["enabled"]),
+        "running": running,
+        "interval_seconds": int(_AGENT_SCHED["interval_seconds"]),
+        "use_llm": bool(_AGENT_SCHED["use_llm"]),
+        "symbols": list(_AGENT_SCHED["symbols"] or []),
+        "last_run_at": _AGENT_SCHED["last_run_at"],
+        "last_run_status": _AGENT_SCHED["last_run_status"],
+        "last_error": _AGENT_SCHED["last_error"],
+    }
+
+
+@app.post("/api/agents/schedule")
+async def api_agents_schedule_set(cfg: AgentScheduleConfig) -> dict[str, Any]:
+    """Update the auto-scheduler config. Starts/stops the loop as needed."""
+    if cfg.interval_seconds is not None:
+        if cfg.interval_seconds < 60:
+            raise HTTPException(
+                status_code=400,
+                detail="interval_seconds must be >= 60",
+            )
+        _AGENT_SCHED["interval_seconds"] = int(cfg.interval_seconds)
+    if cfg.use_llm is not None:
+        _AGENT_SCHED["use_llm"] = bool(cfg.use_llm)
+    if cfg.symbols is not None:
+        cleaned = [s.strip().upper() for s in cfg.symbols if s and s.strip()]
+        if cleaned:
+            _AGENT_SCHED["symbols"] = cleaned
+    if cfg.enabled is not None:
+        _AGENT_SCHED["enabled"] = bool(cfg.enabled)
+        if _AGENT_SCHED["enabled"]:
+            _start_scheduler_task()
+        else:
+            _stop_scheduler_task()
+    return api_agents_schedule_get()
+
+
+@app.post("/api/agents/schedule/tick")
+async def api_agents_schedule_tick() -> dict[str, Any]:
+    """Manually execute one scheduler tick (for tests and ad-hoc triggers)."""
+    return await _scheduler_tick_once()
+
+
+@app.get("/api/agents/history")
+def api_agents_history(limit: int = 50) -> dict[str, Any]:
+    """Return up to ``limit`` most-recent persisted agent runs (newest first)."""
+    rows: list[dict[str, Any]] = []
+    try:
+        if AGENT_LOG.exists():
+            with AGENT_LOG.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except OSError as e:
+        log.warning("failed to read agents log: %s", e)
+    rows.reverse()
+    if limit > 0:
+        rows = rows[:limit]
+    return {"runs": rows, "total": len(rows)}
 
 
 # --------------------------------------------------------------------------
