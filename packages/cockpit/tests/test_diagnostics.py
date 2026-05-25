@@ -303,7 +303,7 @@ def test_check_last_pretrain_unreadable(monkeypatch: pytest.MonkeyPatch, tmp_pat
 # ---------------------------------------------------------------------------
 
 
-def test_run_all_returns_seven_checks_in_order(
+def test_run_all_returns_all_checks_in_order(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _redirect_paths(monkeypatch, tmp_path)
@@ -320,6 +320,7 @@ def test_run_all_returns_seven_checks_in_order(
         "orphan_pythons",
         "ollama_installed",
         "ollama_running",
+        "models_pulled",
         "last_pretrain",
     ]
 
@@ -401,3 +402,151 @@ def test_heal_orphan_pythons_nothing_to_kill(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(diag, "_list_orphan_repo_pythons", lambda: [])
     out = diag._heal_orphan_pythons()
     assert out["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# check_models_pulled (the 8th check — defends against the 404 storm)
+# ---------------------------------------------------------------------------
+
+
+def test_check_models_pulled_skipped_without_ollama(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diag.shutil, "which", lambda _name: None)
+    c = diag.check_models_pulled()
+    assert c.status == "info"
+    assert c.auto_fixable is False
+
+
+def test_check_models_pulled_skipped_when_daemon_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diag.shutil, "which", lambda _name: "/usr/bin/ollama")
+    import tools.check_ollama as co
+
+    monkeypatch.setattr(
+        co,
+        "status_snapshot",
+        lambda: {
+            "daemon_alive": False,
+            "profile": {"name": "rx_7900_xt"},
+            "required": ["x"],
+            "installed": [],
+            "missing": ["x"],
+        },
+    )
+    c = diag.check_models_pulled()
+    # When the daemon is down, that's check_ollama_running's job to report --
+    # this check stays out of the way so the operator sees one red row, not two.
+    assert c.status == "info"
+    assert c.auto_fixable is False
+
+
+def test_check_models_pulled_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diag.shutil, "which", lambda _name: "/usr/bin/ollama")
+    import tools.check_ollama as co
+
+    monkeypatch.setattr(
+        co,
+        "status_snapshot",
+        lambda: {
+            "daemon_alive": True,
+            "profile": {"name": "rx_7900_xt"},
+            "required": ["qwen3:14b", "deepseek-r1:32b"],
+            "installed": ["qwen3:14b", "deepseek-r1:32b"],
+            "missing": [],
+        },
+    )
+    c = diag.check_models_pulled()
+    assert c.status == "ok"
+    assert "rx_7900_xt" in c.message
+    assert c.auto_fixable is False
+
+
+def test_check_models_pulled_error_lists_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diag.shutil, "which", lambda _name: "/usr/bin/ollama")
+    import tools.check_ollama as co
+
+    monkeypatch.setattr(
+        co,
+        "status_snapshot",
+        lambda: {
+            "daemon_alive": True,
+            "profile": {"name": "rx_7900_xt"},
+            "required": ["qwen3:14b", "deepseek-r1:32b", "deepseek-r1:14b"],
+            "installed": [],
+            "missing": ["qwen3:14b", "deepseek-r1:32b", "deepseek-r1:14b"],
+        },
+    )
+    c = diag.check_models_pulled()
+    assert c.status == "error"
+    assert c.auto_fixable is True
+    assert "qwen3:14b" in c.message
+    assert c.detail and c.detail.get("missing") == [
+        "qwen3:14b",
+        "deepseek-r1:32b",
+        "deepseek-r1:14b",
+    ]
+
+
+def test_check_models_pulled_truncates_long_missing_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Five missing models should show three names plus a (+2 more) suffix."""
+    monkeypatch.setattr(diag.shutil, "which", lambda _name: "/usr/bin/ollama")
+    import tools.check_ollama as co
+
+    missing = ["m1", "m2", "m3", "m4", "m5"]
+    monkeypatch.setattr(
+        co,
+        "status_snapshot",
+        lambda: {
+            "daemon_alive": True,
+            "profile": {"name": "rx_7900_xt"},
+            "required": missing,
+            "installed": [],
+            "missing": missing,
+        },
+    )
+    c = diag.check_models_pulled()
+    assert "m1" in c.message and "m2" in c.message and "m3" in c.message
+    assert "(+2 more)" in c.message
+
+
+def test_check_models_pulled_handles_snapshot_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken snapshot must degrade to a warning rather than crashing."""
+    monkeypatch.setattr(diag.shutil, "which", lambda _name: "/usr/bin/ollama")
+    import tools.check_ollama as co
+
+    def _boom() -> dict:
+        raise RuntimeError("network blew up")
+
+    monkeypatch.setattr(co, "status_snapshot", _boom)
+    c = diag.check_models_pulled()
+    assert c.status == "warn"
+    assert "network blew up" in c.message
+
+
+def test_heal_models_pulled_starts_setup_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    from packages.cockpit import proc as job_mgr
+
+    seen: dict[str, object] = {}
+
+    class _Info:
+        pid = 4242
+
+        def to_dict(self) -> dict:
+            return {"pid": 4242}
+
+    def _fake_start(kind: str, cmd: list[str]):
+        seen["kind"] = kind
+        seen["cmd"] = cmd
+        return _Info()
+
+    monkeypatch.setattr(job_mgr, "start", _fake_start)
+    out = diag._heal_models_pulled()
+    assert out["ok"] is True
+    assert out.get("pid") == 4242
+    assert seen["kind"] == "ollama_setup"
+    cmd = seen["cmd"]
+    assert isinstance(cmd, list)
+    assert "tools/check_ollama.py" in cmd
+    assert "--auto" in cmd

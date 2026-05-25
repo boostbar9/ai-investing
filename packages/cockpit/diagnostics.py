@@ -279,6 +279,88 @@ def check_ollama_running(timeout: float = 1.5) -> Check:
     )
 
 
+def check_models_pulled() -> Check:
+    """Are the active hardware profile's models actually pulled?
+
+    Symptom this catches: Ollama responds 200 on ``/api/tags`` (so
+    :func:`check_ollama_running` is green) but every ``/api/generate``
+    call returns 404 because the agent chain asks for a model that has
+    never been pulled. The log fills with hundreds of ``404 Not Found``
+    lines and the operator has no idea why the agents are silently
+    producing nothing.
+
+    The fix is to kick off ``tools/check_ollama.py --auto`` which pulls
+    every model the active profile needs. We reuse the existing
+    cockpit job so progress streams to the Ollama panel for free.
+    """
+    if not shutil.which("ollama"):
+        return Check(
+            name="models_pulled",
+            title="Agent models pulled",
+            status="info",
+            message="Skipping -- Ollama is not installed.",
+        )
+    try:
+        from tools.check_ollama import status_snapshot
+    except ImportError as exc:  # pragma: no cover - defensive
+        return Check(
+            name="models_pulled",
+            title="Agent models pulled",
+            status="warn",
+            message=f"Could not load model inventory: {exc!r}",
+        )
+    try:
+        snap = status_snapshot()
+    except Exception as exc:  # pragma: no cover - defensive
+        return Check(
+            name="models_pulled",
+            title="Agent models pulled",
+            status="warn",
+            message=f"Model inventory failed: {exc!r}",
+        )
+    if not snap.get("daemon_alive", False):
+        return Check(
+            name="models_pulled",
+            title="Agent models pulled",
+            status="info",
+            message="Skipping -- Ollama daemon is not running yet.",
+        )
+    missing = list(snap.get("missing", []))
+    required = list(snap.get("required", []))
+    installed = list(snap.get("installed", []))
+    profile_name = (snap.get("profile") or {}).get("name", "?")
+    if not missing:
+        return Check(
+            name="models_pulled",
+            title="Agent models pulled",
+            status="ok",
+            message=(
+                f"All {len(required)} model(s) for profile '{profile_name}' "
+                "are pulled."
+            ),
+            detail={"profile": profile_name, "installed": installed},
+        )
+    sample = ", ".join(missing[:3])
+    more = f" (+{len(missing) - 3} more)" if len(missing) > 3 else ""
+    return Check(
+        name="models_pulled",
+        title="Agent models pulled",
+        status="error",
+        message=(
+            f"{len(missing)} agent model(s) are not pulled for profile "
+            f"'{profile_name}': {sample}{more}. Agents will fail with 404 "
+            "until these are pulled. Click 'Fix it' to pull them now."
+        ),
+        auto_fixable=True,
+        detail={
+            "profile": profile_name,
+            "missing": missing,
+            "required": required,
+            "installed": installed,
+        },
+    )
+
+
 def check_last_pretrain() -> Check:
     """When was pretrain last successful?"""
     if not PRETRAIN_STATE.exists():
@@ -343,6 +425,7 @@ def auto_heal(check_name: str) -> dict[str, object]:
         "port_8765_clear": _heal_port,
         "orphan_pythons": _heal_orphan_pythons,
         "ollama_running": _heal_ollama_running,
+        "models_pulled": _heal_models_pulled,
         "last_pretrain": _heal_run_pretrain,
     }
     fn = fixers.get(check_name)
@@ -432,6 +515,31 @@ def _heal_ollama_running() -> dict[str, object]:
     }
 
 
+def _heal_models_pulled() -> dict[str, object]:
+    """Pull the active profile's missing models via the existing setup job.
+
+    Reusing ``tools/check_ollama.py --auto`` (the same driver the
+    Ollama panel uses) means progress is already streamable through
+    ``/api/jobs/ollama_setup/stream`` -- the operator doesn't need a
+    separate channel for Fix-It pulls.
+    """
+    try:
+        from packages.cockpit import proc as job_mgr
+    except ImportError as exc:
+        return {"ok": False, "message": f"Job manager unavailable: {exc!r}"}
+    cmd = [sys.executable, "tools/check_ollama.py", "--auto"]
+    info = job_mgr.start("ollama_setup", cmd)
+    return {
+        "ok": True,
+        "message": (
+            f"Pulling missing models in the background (PID {info.pid}). "
+            "Watch the Ollama panel or /api/jobs/ollama_setup/stream for "
+            "live progress -- this can take a while for large models."
+        ),
+        "pid": info.pid,
+    }
+
+
 def _heal_run_pretrain() -> dict[str, object]:
     """Kick off a pretrain in-process via the existing job manager.
 
@@ -475,6 +583,7 @@ def run_all() -> list[Check]:
         check_orphan_pythons(),
         check_ollama_installed(),
         check_ollama_running(),
+        check_models_pulled(),
         check_last_pretrain(),
     ]
 
