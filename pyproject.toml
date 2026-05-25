@@ -59,6 +59,13 @@ dev = [
   "types-redis",
   "types-requests",
 ]
+# System-tray launcher (tools/tray/cockpit_tray.py).
+# Only installed on the operator's desktop -- not needed for CI, headless
+# servers, or the test suite. Install with:  pip install -e ".[tray]"
+tray = [
+  "pystray>=0.19",
+  "Pillow>=10.0",
+]
 
 # ----- setuptools: pick the Python source dirs explicitly -----
 # Without this, auto-discovery finds 'apps', 'data', 'infra', 'baselines',
