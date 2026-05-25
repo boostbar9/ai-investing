@@ -1200,3 +1200,157 @@ def test_api_health_fix_unknown_name(client: TestClient) -> None:
     body = r.json()
     assert body["ok"] is False
     assert "this_is_not_a_check" in body["message"]
+
+
+# ---------------------------------------------------------------------------
+# Autopilot + watchdog + /promote (Commit D/E/G)
+# ---------------------------------------------------------------------------
+
+
+def test_autopilot_get_default_shape(client: TestClient) -> None:
+    """``GET /api/autopilot`` returns the canonical config shape."""
+    r = client.get("/api/autopilot")
+    assert r.status_code == 200
+    j = r.json()
+    for key in (
+        "enabled",
+        "running",
+        "strategy",
+        "dry_run",
+        "open_trigger",
+        "close_offset_minutes",
+        "last_fire_by_trigger",
+        "recent_fires",
+    ):
+        assert key in j, f"missing {key} in autopilot payload"
+    assert isinstance(j["recent_fires"], list)
+
+
+def test_autopilot_set_strategy_persists(client: TestClient) -> None:
+    """``POST /api/autopilot`` round-trips the strategy field."""
+    r = client.post("/api/autopilot", json={"strategy": "ensemble_test"})
+    assert r.status_code == 200, r.text
+    assert r.json()["strategy"] == "ensemble_test"
+    # And the GET reflects the change.
+    r2 = client.get("/api/autopilot")
+    assert r2.json()["strategy"] == "ensemble_test"
+
+
+def test_autopilot_set_dry_run_toggle(client: TestClient) -> None:
+    """``dry_run=True`` is reflected on subsequent reads."""
+    r = client.post("/api/autopilot", json={"dry_run": True})
+    assert r.status_code == 200
+    assert r.json()["dry_run"] is True
+
+
+def test_autopilot_tick_outside_window_returns_no_fire(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the autopilot is disabled, ``/tick`` reports no fire."""
+    # Make sure autopilot is off so the trigger window is gated out.
+    client.post("/api/autopilot", json={"enabled": False, "dry_run": True})
+    r = client.post("/api/autopilot/tick")
+    assert r.status_code == 200
+    j = r.json()
+    assert j["fired"] is False
+    assert "reason" in j
+
+
+def test_watchdog_get_shape(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``GET /api/watchdog`` returns the verdict + halt summary."""
+    from packages.cockpit import watchdog as wd
+
+    tmp_halt = tmp_path / "halt.json"
+    monkeypatch.setattr(wd, "HALT_FILE", tmp_halt)
+
+    r = client.get("/api/watchdog")
+    assert r.status_code == 200
+    j = r.json()
+    assert "verdict" in j
+    assert "halt_active" in j
+    for key in (
+        "breach",
+        "current_drawdown",
+        "peak_equity",
+        "current_equity",
+        "threshold",
+        "message",
+    ):
+        assert key in j["verdict"], f"missing {key} in watchdog verdict"
+
+
+def test_watchdog_tick_no_breach_with_flat_curve(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A flat equity curve must not breach the watchdog."""
+    from packages.cockpit import watchdog as wd
+
+    monkeypatch.setattr(wd, "HALT_FILE", tmp_path / "halt.json")
+
+    r = client.post("/api/watchdog/tick")
+    assert r.status_code == 200
+    j = r.json()
+    assert "breach" in j
+    assert j["breach"] is False
+
+
+def test_watchdog_clear_returns_ack_payload(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``/api/watchdog/clear`` returns the acknowledgement record."""
+    from packages.cockpit import watchdog as wd
+
+    tmp_halt = tmp_path / "halt.json"
+    monkeypatch.setattr(wd, "HALT_FILE", tmp_halt)
+    monkeypatch.setattr(wd, "DATA_DIR", tmp_path)
+    # Pre-write a halt record to clear.
+    wd.write_halt(
+        wd.WatchdogVerdict(
+            breach=True,
+            current_drawdown=0.12,
+            peak_equity=100.0,
+            current_equity=88.0,
+            threshold=0.08,
+            message="test breach",
+        )
+    )
+    r = client.post("/api/watchdog/clear", json={"acknowledged_by": "test"})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["cleared"] is True
+    assert j["record"]["released_by"] == "test"
+    assert j["record"]["active"] is False
+
+
+def test_promote_api_shape_when_not_ready(client: TestClient) -> None:
+    """``GET /api/promote`` returns the full readiness payload."""
+    r = client.get("/api/promote")
+    assert r.status_code == 200, r.text
+    j = r.json()
+    for key in ("live_enabled", "capital_fraction", "readiness", "requirements", "progress"):
+        assert key in j, f"missing {key} in promote payload"
+    for key in ("paper_min_days", "paper_max_dd", "paper_min_sharpe"):
+        assert key in j["requirements"]
+    for key in ("paper_days", "days_remaining", "telegram_connected", "enable_live_flag"):
+        assert key in j["progress"]
+    # With the fake 2-row log, we are nowhere near the soak threshold.
+    assert j["live_enabled"] is False
+    assert j["progress"]["days_remaining"] > 0
+
+
+def test_promote_page_renders_html(client: TestClient) -> None:
+    """``GET /promote`` returns the readiness HTML page."""
+    r = client.get("/promote")
+    assert r.status_code == 200
+    assert "text/html" in r.headers.get("content-type", "")
+    assert "Promote to live" in r.text
+
+
+def test_autopilot_page_renders_html(client: TestClient) -> None:
+    """``GET /autopilot`` returns the autopilot HTML page."""
+    r = client.get("/autopilot")
+    assert r.status_code == 200
+    assert "text/html" in r.headers.get("content-type", "")
+    assert "autopilot" in r.text.lower()

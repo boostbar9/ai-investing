@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Promote to live - ai-investing</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/cockpit.css" />
+  <script src="/static/cockpit.js" defer></script>
+  <style>
+    .gate-row { border: 1px solid #1f2937; border-radius: 10px; padding: 14px 16px; background: #0b1220; display: flex; align-items: flex-start; gap: 12px; }
+    .gate-row.sev-ok    { border-left: 4px solid #22c55e; }
+    .gate-row.sev-warn  { border-left: 4px solid #f59e0b; }
+    .gate-row.sev-error { border-left: 4px solid #ef4444; }
+    .gate-row.sev-info  { border-left: 4px solid #6b7280; }
+    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 999px; flex-shrink: 0; margin-top: 6px; }
+    .dot.ok    { background: #22c55e; box-shadow: 0 0 8px #22c55e80; }
+    .dot.warn  { background: #f59e0b; box-shadow: 0 0 8px #f59e0b80; }
+    .dot.error { background: #ef4444; box-shadow: 0 0 8px #ef444480; }
+    .dot.info  { background: #6b7280; }
+    .summary-tile { background: #0b1220; border: 1px solid #1f2937; border-radius: 10px; padding: 14px 18px; text-align: center; }
+    .summary-tile .n { font-size: 28px; font-weight: 600; }
+    .summary-tile .label { font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.06em; margin-top: 4px; }
+    .progress-bar { width: 100%; height: 12px; background: #1f2937; border-radius: 999px; overflow: hidden; }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, #22c55e, #16a34a); transition: width 0.4s ease; }
+    .progress-fill.warn { background: linear-gradient(90deg, #f59e0b, #d97706); }
+    .stoplight { display: inline-flex; align-items: center; gap: 14px; padding: 18px 22px; border-radius: 14px; border: 1px solid #1f2937; background: #0b1220; }
+    .stoplight .big-dot { width: 28px; height: 28px; border-radius: 999px; }
+    .stoplight.ready .big-dot { background: #22c55e; box-shadow: 0 0 18px #22c55e; }
+    .stoplight.not-ready .big-dot { background: #ef4444; box-shadow: 0 0 18px #ef4444; }
+    .stoplight .label { font-size: 18px; font-weight: 600; }
+    .stoplight .sub { font-size: 12px; color: #9ca3af; margin-top: 2px; }
+    .canary-card { background: #0b1220; border: 1px solid #1f2937; border-left: 4px solid #6366f1; border-radius: 12px; padding: 16px 18px; }
+    .cmd { background: #050810; border: 1px solid #1f2937; border-radius: 6px; padding: 8px 10px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; color: #d1d5db; white-space: pre-wrap; overflow-x: auto; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="topbar"><div class="topbar-inner">
+    <a href="/" class="topbar-brand">
+      <span id="cockpit-conn-dot" class="topbar-brand-dot idle"></span>
+      <span>ai-investing</span>
+    </a>
+    <div id="cockpit-topbar"></div>
+  </div></div>
+
+  <div class="max-w-5xl mx-auto p-6">
+    <nav class="nav flex items-center gap-1 mb-4 text-sm">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/trading" class="nav-link">Trading</a>
+      <a href="/autopilot" class="nav-link">Autopilot</a>
+      <a href="/promote" class="nav-link nav-active">Promote</a>
+      <a href="/agents" class="nav-link">Agents</a>
+      <a href="/models" class="nav-link">Models</a>
+      <a href="/settings" class="nav-link">Settings</a>
+      <a href="/updates" class="nav-link">Updates</a>
+      <a href="/health" class="nav-link">Health</a>
+      <a href="/errors" class="nav-link">Errors<span id="nav-err-badge" class="nav-badge" data-err-badge style="display:none">0</span></a>
+    </nav>
+
+    <header class="flex items-center justify-between mb-5 flex-wrap gap-3">
+      <div>
+        <h1 class="text-2xl font-semibold tracking-tight">Promote to live trading</h1>
+        <p class="text-sm text-gray-400">Auto-refreshes every 60s. Live capital unlocks only when every gate is green.</p>
+      </div>
+      <button id="refresh-btn" class="btn btn-ghost">Refresh now</button>
+    </header>
+
+    <!-- Big stoplight + summary tiles -->
+    <section class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+      <div id="stoplight" class="stoplight not-ready md:col-span-1">
+        <div class="big-dot"></div>
+        <div>
+          <div class="label" id="stoplight-label">Loading…</div>
+          <div class="sub" id="stoplight-sub">Checking readiness…</div>
+        </div>
+      </div>
+      <div class="summary-tile">
+        <div class="n" id="days-n">–</div>
+        <div class="label">Paper days complete</div>
+        <div class="text-xs text-gray-500 mt-2"><span id="days-target">of 60</span></div>
+      </div>
+      <div class="summary-tile">
+        <div class="n" id="dd-n">–</div>
+        <div class="label">Max drawdown</div>
+        <div class="text-xs text-gray-500 mt-2">Limit 8.0%</div>
+      </div>
+    </section>
+
+    <!-- Days progress bar -->
+    <section class="mb-6">
+      <div class="flex items-center justify-between text-xs text-gray-500 mb-1">
+        <span>Paper soak progress</span>
+        <span id="days-pct">–</span>
+      </div>
+      <div class="progress-bar">
+        <div id="days-fill" class="progress-fill" style="width:0%"></div>
+      </div>
+    </section>
+
+    <!-- Gate rows -->
+    <h2 class="text-lg font-medium mb-3">Promotion gates</h2>
+    <section id="gates" class="flex flex-col gap-3 mb-6">
+      <div class="gate-row sev-info"><span class="dot info"></span><div>Loading gates…</div></div>
+    </section>
+
+    <!-- Canary tier card (only when ready) -->
+    <section id="canary-section" class="mb-6" style="display:none">
+      <h2 class="text-lg font-medium mb-3">Canary ramp</h2>
+      <div class="canary-card">
+        <div class="flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <div class="text-sm text-gray-400">Current capital fraction</div>
+            <div class="text-3xl font-semibold" id="canary-fraction">–</div>
+          </div>
+          <div>
+            <div class="text-sm text-gray-400">Days in current tier</div>
+            <div class="text-2xl font-semibold" id="canary-days">–</div>
+            <div class="text-xs text-gray-500" id="canary-dwell">of – required</div>
+          </div>
+          <div>
+            <div class="text-sm text-gray-400">Next tier</div>
+            <div class="text-2xl font-semibold" id="canary-next">–</div>
+          </div>
+        </div>
+        <p class="text-xs text-gray-500 mt-3">
+          Capital ramps in stages: 5% → 10% → 25% → 100%. Each tier requires the
+          dwell period above without breaching the §16 drawdown ceiling.
+        </p>
+      </div>
+    </section>
+
+    <!-- Telegram setup help (only when missing) -->
+    <section id="telegram-help" class="mb-6" style="display:none">
+      <h2 class="text-lg font-medium mb-3">Connect Telegram bot</h2>
+      <div class="gate-row sev-warn">
+        <span class="dot warn"></span>
+        <div class="flex-1">
+          <div class="font-medium">Telegram approval bot is required for live trading.</div>
+          <p class="text-sm text-gray-300 mt-2">
+            Live trades pause until you approve them from Telegram. Add the
+            following lines to your <code>.env</code> file:
+          </p>
+          <div class="cmd mt-2">TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_CHAT_ID=your_chat_id_here</div>
+          <p class="text-xs text-gray-500 mt-2">
+            Get a bot token from <a href="https://t.me/BotFather" class="text-indigo-400 underline" target="_blank" rel="noopener">@BotFather</a>
+            on Telegram. Find your chat id by messaging <a href="https://t.me/userinfobot" class="text-indigo-400 underline" target="_blank" rel="noopener">@userinfobot</a>.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <p class="text-xs text-gray-500 mt-6">
+      The promotion gate is enforced server-side. Even after every check
+      passes, <code>ENABLE_LIVE_TRADING=true</code> must be set in your
+      <code>.env</code> for the trader to use real capital, and Telegram
+      approval is still required per trade.
+    </p>
+  </div>
+
+  <script>
+    (function () {
+      const gatesEl = document.getElementById("gates");
+      const refreshBtn = document.getElementById("refresh-btn");
+
+      function escapeHtml(s) {
+        return String(s == null ? "" : s)
+          .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+      }
+
+      function fmtPct(x, digits) {
+        if (x == null || isNaN(x)) return "–";
+        return (x * 100).toFixed(digits == null ? 1 : digits) + "%";
+      }
+
+      function fmtNum(x, digits) {
+        if (x == null || isNaN(x)) return "–";
+        return Number(x).toFixed(digits == null ? 2 : digits);
+      }
+
+      function gateRow(status, title, message) {
+        const sev = status === "ok" ? "sev-ok" : status === "warn" ? "sev-warn" : status === "error" ? "sev-error" : "sev-info";
+        const dot = status === "ok" ? "ok" : status === "warn" ? "warn" : status === "error" ? "error" : "info";
+        const div = document.createElement("div");
+        div.className = "gate-row " + sev;
+        div.innerHTML =
+          '<span class="dot ' + dot + '"></span>' +
+          '<div class="flex-1">' +
+            '<div class="font-medium">' + escapeHtml(title) + '</div>' +
+            '<div class="text-sm text-gray-300 mt-1">' + escapeHtml(message) + '</div>' +
+          '</div>';
+        return div;
+      }
+
+      async function load() {
+        try {
+          const j = await Cockpit.api.get("/api/promote");
+          renderStoplight(j);
+          renderSummary(j);
+          renderGates(j);
+          renderCanary(j);
+          renderTelegramHelp(j);
+        } catch (e) {
+          gatesEl.innerHTML = '<div class="gate-row sev-error"><span class="dot error"></span><div>Failed to load: ' + escapeHtml(e.message || "unknown error") + '</div></div>';
+        }
+      }
+
+      function renderStoplight(j) {
+        const el = document.getElementById("stoplight");
+        const label = document.getElementById("stoplight-label");
+        const sub = document.getElementById("stoplight-sub");
+        const ready = !!(j.readiness && j.readiness.ready);
+        el.className = "stoplight " + (ready ? "ready" : "not-ready");
+        if (ready) {
+          label.textContent = "Ready for live";
+          if (j.progress.enable_live_flag) {
+            sub.textContent = "All gates green. ENABLE_LIVE_TRADING is set. Canary capital active.";
+          } else {
+            sub.textContent = "All gates green. Set ENABLE_LIVE_TRADING=true in .env to arm.";
+          }
+        } else {
+          label.textContent = "Not ready yet";
+          const n = (j.readiness.reasons || []).length;
+          sub.textContent = n + " gate" + (n === 1 ? "" : "s") + " still blocking promotion.";
+        }
+      }
+
+      function renderSummary(j) {
+        const days = j.progress.paper_days || 0;
+        const target = (j.requirements && j.requirements.paper_min_days) || 60;
+        const ddMax = (j.readiness.metrics && j.readiness.metrics.max_drawdown) || 0;
+        const ddLimit = (j.requirements && j.requirements.paper_max_dd) || 0.08;
+
+        document.getElementById("days-n").textContent = days;
+        document.getElementById("days-target").textContent = "of " + target;
+        const pct = Math.min(100, (days / target) * 100);
+        document.getElementById("days-pct").textContent = pct.toFixed(0) + "%";
+        const fill = document.getElementById("days-fill");
+        fill.style.width = pct + "%";
+        fill.className = "progress-fill" + (days >= target ? "" : " warn");
+
+        const ddEl = document.getElementById("dd-n");
+        ddEl.textContent = fmtPct(ddMax, 2);
+        ddEl.style.color = ddMax > ddLimit ? "#ef4444" : "#22c55e";
+      }
+
+      function renderGates(j) {
+        gatesEl.innerHTML = "";
+        const m = j.readiness.metrics || {};
+        const req = j.requirements || {};
+        const prog = j.progress || {};
+
+        // Gate 1: paper days
+        const daysOk = (prog.paper_days || 0) >= (req.paper_min_days || 60);
+        gatesEl.appendChild(gateRow(
+          daysOk ? "ok" : "warn",
+          "Paper days ≥ " + (req.paper_min_days || 60),
+          daysOk
+            ? "Soak complete (" + prog.paper_days + " days observed)."
+            : "Still soaking: " + (prog.days_remaining || 0) + " day" + ((prog.days_remaining || 0) === 1 ? "" : "s") + " remaining (" + (prog.paper_days || 0) + "/" + (req.paper_min_days || 60) + ")."
+        ));
+
+        // Gate 2: drawdown
+        const ddOk = (m.max_drawdown || 0) <= (req.paper_max_dd || 0.08);
+        gatesEl.appendChild(gateRow(
+          ddOk ? "ok" : "error",
+          "Max drawdown ≤ " + fmtPct(req.paper_max_dd || 0.08, 1),
+          ddOk
+            ? "Observed max DD " + fmtPct(m.max_drawdown || 0, 2) + " is within the §16 ceiling."
+            : "Observed max DD " + fmtPct(m.max_drawdown || 0, 2) + " breaches the 8% live-trading ceiling."
+        ));
+
+        // Gate 3: Sharpe
+        const shOk = (m.sharpe || 0) >= (req.paper_min_sharpe || 0.8);
+        gatesEl.appendChild(gateRow(
+          shOk ? "ok" : "warn",
+          "Sharpe ≥ " + fmtNum(req.paper_min_sharpe || 0.8, 2),
+          "Current Sharpe " + fmtNum(m.sharpe || 0, 2) + " (target " + fmtNum(req.paper_min_sharpe || 0.8, 2) + ")."
+        ));
+
+        // Gate 4: telegram
+        const tg = !!prog.telegram_connected;
+        gatesEl.appendChild(gateRow(
+          tg ? "ok" : "warn",
+          "Telegram approval bot connected",
+          tg
+            ? "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set."
+            : "Not configured. See the setup card below."
+        ));
+
+        // Gate 5: ENABLE_LIVE_TRADING -- informational only
+        gatesEl.appendChild(gateRow(
+          prog.enable_live_flag ? "ok" : "info",
+          "ENABLE_LIVE_TRADING flag",
+          prog.enable_live_flag
+            ? "Flag is set in .env. Live capital will activate once every gate above is green."
+            : "Not set. This is informational only — flip it to true when you're ready to arm live trading."
+        ));
+
+        // Extra reasons from the gate (non-redundant only)
+        const extras = (j.readiness.reasons || []).filter(function (r) {
+          const s = String(r).toLowerCase();
+          return !s.includes("paper") && !s.includes("drawdown") && !s.includes("sharpe") && !s.includes("telegram");
+        });
+        extras.forEach(function (r) {
+          gatesEl.appendChild(gateRow("warn", "Additional gating reason", r));
+        });
+      }
+
+      function renderCanary(j) {
+        const sec = document.getElementById("canary-section");
+        const c = j.canary;
+        if (!j.readiness.ready || !c) { sec.style.display = "none"; return; }
+        sec.style.display = "";
+        document.getElementById("canary-fraction").textContent = fmtPct(c.fraction, 0);
+        document.getElementById("canary-days").textContent = c.days_in_tier;
+        document.getElementById("canary-dwell").textContent = "of " + c.dwell_required + " required";
+        document.getElementById("canary-next").textContent = c.next_fraction == null ? "Full size" : fmtPct(c.next_fraction, 0);
+      }
+
+      function renderTelegramHelp(j) {
+        const el = document.getElementById("telegram-help");
+        el.style.display = j.progress.telegram_connected ? "none" : "";
+      }
+
+      refreshBtn.onclick = load;
+      load();
+      setInterval(load, 60000);
+    })();
+  </script>
+</body>
+</html>

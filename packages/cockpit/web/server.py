@@ -37,7 +37,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from packages.cockpit import diagnostics, updater
+from packages.cockpit import diagnostics, paper_autopilot, updater, watchdog
 from packages.cockpit import errors as err_log
 from packages.cockpit import proc as job_mgr
 from packages.cockpit.state import (
@@ -1519,6 +1519,265 @@ def api_agents_discoveries(limit: int = 50) -> dict[str, Any]:
     if limit > 0:
         rows = rows[:limit]
     return {"discoveries": rows, "total": len(rows), "advisory_only": True}
+
+
+# --------------------------------------------------------------------------
+# Paper-trading autopilot (§16 60-day soak)
+# --------------------------------------------------------------------------
+#
+# Wires :mod:`packages.cockpit.paper_autopilot` into the running cockpit:
+# one shared AutopilotState lives here, the asyncio loop polls it every
+# 30s, and the existing paper_loop job slot is what we spawn into.
+
+_AUTOPILOT_STATE = paper_autopilot.AutopilotState(
+    pause_checker=lambda: bool(load_state().paused),
+    halt_checker=watchdog.is_halt_active,
+    job_starter=lambda cmd: job_mgr.start(PAPER_LOOP_KIND, cmd),
+)
+_AUTOPILOT_TASK: dict[str, Any] = {"_task": None}
+
+
+class AutopilotConfig(BaseModel):
+    """Toggle and tune the paper autopilot."""
+
+    enabled: bool | None = None
+    strategy: str | None = None
+    dry_run: bool | None = None
+
+
+def _start_autopilot_task() -> None:
+    task = _AUTOPILOT_TASK.get("_task")
+    if task is not None and not task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _AUTOPILOT_TASK["_task"] = loop.create_task(
+        paper_autopilot.autopilot_loop(_AUTOPILOT_STATE, _python_exe)
+    )
+
+
+def _stop_autopilot_task() -> None:
+    task = _AUTOPILOT_TASK.get("_task")
+    if task is not None and not task.done():
+        task.cancel()
+    _AUTOPILOT_TASK["_task"] = None
+
+
+@app.get("/api/autopilot")
+def api_autopilot_get() -> dict[str, Any]:
+    """Current autopilot config + last-fire status."""
+    task = _AUTOPILOT_TASK.get("_task")
+    running = bool(task is not None and not task.done())
+    history = [
+        {
+            "trigger": f.trigger,
+            "fired_at_utc": f.fired_at_utc,
+            "ok": f.ok,
+            "note": f.note,
+            "job_pid": f.job_pid,
+        }
+        for f in _AUTOPILOT_STATE.history[-20:]
+    ]
+    history.reverse()
+    return {
+        "enabled": _AUTOPILOT_STATE.enabled,
+        "running": running,
+        "strategy": _AUTOPILOT_STATE.paper_strategy,
+        "dry_run": _AUTOPILOT_STATE.dry_run,
+        "open_trigger": _AUTOPILOT_STATE.open_trigger.isoformat(timespec="minutes"),
+        "close_offset_minutes": _AUTOPILOT_STATE.close_offset_minutes,
+        "last_fire_by_trigger": {
+            k: v.isoformat() for k, v in _AUTOPILOT_STATE.last_fire_by_trigger.items()
+        },
+        "last_error": _AUTOPILOT_STATE.last_error,
+        "recent_fires": history,
+    }
+
+
+@app.post("/api/autopilot")
+async def api_autopilot_set(cfg: AutopilotConfig) -> dict[str, Any]:
+    """Enable/disable the autopilot or change its strategy."""
+    if cfg.strategy is not None:
+        s = cfg.strategy.strip()
+        if s:
+            _AUTOPILOT_STATE.paper_strategy = s
+    if cfg.dry_run is not None:
+        _AUTOPILOT_STATE.dry_run = bool(cfg.dry_run)
+    if cfg.enabled is not None:
+        _AUTOPILOT_STATE.enabled = bool(cfg.enabled)
+        if _AUTOPILOT_STATE.enabled:
+            _start_autopilot_task()
+        else:
+            _stop_autopilot_task()
+    return api_autopilot_get()
+
+
+@app.post("/api/autopilot/tick")
+async def api_autopilot_tick() -> dict[str, Any]:
+    """Manually execute one autopilot tick (tests + ad-hoc fires)."""
+    fire = paper_autopilot.run_tick(
+        _AUTOPILOT_STATE, datetime.now(UTC), _python_exe()
+    )
+    if fire is None:
+        return {"fired": False, "reason": "no trigger window or autopilot disabled"}
+    return {
+        "fired": True,
+        "trigger": fire.trigger,
+        "ok": fire.ok,
+        "note": fire.note,
+        "job_pid": fire.job_pid,
+    }
+
+
+@app.get("/autopilot", response_class=HTMLResponse)
+def autopilot_page() -> HTMLResponse:
+    return _render("autopilot.html")
+
+
+@app.on_event("startup")
+async def _autopilot_startup() -> None:  # pragma: no cover
+    if _AUTOPILOT_STATE.enabled:
+        _start_autopilot_task()
+
+
+@app.on_event("shutdown")
+async def _autopilot_shutdown() -> None:  # pragma: no cover
+    _stop_autopilot_task()
+
+
+# --------------------------------------------------------------------------
+# Drawdown watchdog (§16 8% halt)
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/watchdog")
+def api_watchdog_get() -> dict[str, Any]:
+    """Current watchdog status: live verdict + persistent halt record."""
+    verdict = watchdog.evaluate_curve(equity_curve_points())
+    return {
+        "verdict": {
+            "breach": verdict.breach,
+            "current_drawdown": verdict.current_drawdown,
+            "peak_equity": verdict.peak_equity,
+            "current_equity": verdict.current_equity,
+            "threshold": verdict.threshold,
+            "message": verdict.message,
+        },
+        "halt": watchdog.read_halt(),
+        "halt_active": watchdog.is_halt_active(),
+    }
+
+
+@app.post("/api/watchdog/tick")
+def api_watchdog_tick() -> dict[str, Any]:
+    """Force one evaluate-and-persist pass; stop paper loop if breached."""
+    verdict = watchdog.evaluate_and_persist(equity_curve_points())
+    if verdict.breach:
+        try:
+            job_mgr.stop(PAPER_LOOP_KIND)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("watchdog: could not stop paper loop: %s", exc)
+    return {
+        "breach": verdict.breach,
+        "message": verdict.message,
+        "halt": watchdog.read_halt(),
+    }
+
+
+class ClearHaltRequest(BaseModel):
+    acknowledged_by: str = "operator"
+
+
+@app.post("/api/watchdog/clear")
+def api_watchdog_clear(req: ClearHaltRequest) -> dict[str, Any]:
+    """Operator acknowledges an active halt and releases it."""
+    record = watchdog.clear_halt(acknowledged_by=req.acknowledged_by)
+    return {"cleared": True, "record": record}
+
+
+# --------------------------------------------------------------------------
+# /promote -- the live-trading readiness gate
+# --------------------------------------------------------------------------
+
+
+@app.get("/promote", response_class=HTMLResponse)
+def promote_page() -> HTMLResponse:
+    return _render("promote.html")
+
+
+@app.get("/api/promote")
+def api_promote() -> dict[str, Any]:
+    """Return the full live-trading readiness picture.
+
+    Pulls the paper equity curve, runs the §16 readiness gate, and
+    surfaces every reason live capital is (or isn't) allowed. Includes
+    the Telegram-bot-not-yet-connected line item so the operator knows
+    that channel is still required even after the metrics pass.
+    """
+    import pandas as pd
+
+    from packages.backtests import live_promotion as lp
+
+    points = equity_curve_points(window=200)
+    series = pd.Series([float(p.get("equity", 0.0)) for p in points])
+    decision = lp.decide_live_capital(series)
+
+    paper_days = int(decision.readiness.metrics.get("paper_days", len(series)))
+    days_remaining = max(0, lp.PAPER_MIN_DAYS - paper_days)
+    telegram_connected = bool(os.getenv("TELEGRAM_BOT_TOKEN")) and bool(
+        os.getenv("TELEGRAM_CHAT_ID")
+    )
+    enable_flag = os.getenv("ENABLE_LIVE_TRADING", "").strip().lower() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
+
+    gating_reasons = list(decision.readiness.reasons)
+    if not telegram_connected:
+        gating_reasons.append(
+            "Telegram approval bot is not configured "
+            "(set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env)"
+        )
+
+    return {
+        "live_enabled": bool(decision.live_enabled and telegram_connected),
+        "capital_fraction": (
+            decision.capital_fraction
+            if decision.live_enabled and telegram_connected
+            else 0.0
+        ),
+        "readiness": {
+            "ready": decision.readiness.ready and telegram_connected,
+            "reasons": gating_reasons,
+            "metrics": decision.readiness.metrics,
+        },
+        "requirements": {
+            "paper_min_days": lp.PAPER_MIN_DAYS,
+            "paper_max_dd": lp.PAPER_MAX_DD,
+            "paper_min_sharpe": lp.PAPER_MIN_SHARPE,
+        },
+        "progress": {
+            "paper_days": paper_days,
+            "days_remaining": days_remaining,
+            "telegram_connected": telegram_connected,
+            "enable_live_flag": enable_flag,
+        },
+        "canary": (
+            {
+                "tier_index": decision.canary.tier_index,
+                "fraction": decision.canary.fraction,
+                "days_in_tier": decision.canary.days_in_tier,
+                "dwell_required": decision.canary.dwell_required,
+                "next_fraction": decision.canary.next_fraction,
+            }
+            if decision.canary is not None
+            else None
+        ),
+    }
 
 
 # --------------------------------------------------------------------------
