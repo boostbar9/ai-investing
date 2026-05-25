@@ -138,6 +138,67 @@ def test_check_env_file_ok(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     assert c.status == "ok"
 
 
+def test_check_paper_trading_enabled_missing_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _redirect_paths(monkeypatch, tmp_path)
+    c = diag.check_paper_trading_enabled()
+    assert c.status == "info"  # defer to the env_file row
+    assert c.name == "paper_trading_enabled"
+
+
+def test_check_paper_trading_enabled_flag_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _redirect_paths(monkeypatch, tmp_path)
+    (tmp_path / ".env").write_text(
+        "ALPACA_PAPER_KEY_ID=PKREAL123\nALPACA_PAPER_SECRET=somerealsecret\n",
+        encoding="utf-8",
+    )
+    c = diag.check_paper_trading_enabled()
+    assert c.status == "error"
+    assert "missing" in c.message.lower()
+    assert c.fix_command
+
+
+def test_check_paper_trading_enabled_flag_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _redirect_paths(monkeypatch, tmp_path)
+    (tmp_path / ".env").write_text(
+        "ENABLE_PAPER_TRADING=false\n",
+        encoding="utf-8",
+    )
+    c = diag.check_paper_trading_enabled()
+    assert c.status == "error"
+    assert "false" in c.message.lower()
+
+
+def test_check_paper_trading_enabled_flag_true(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _redirect_paths(monkeypatch, tmp_path)
+    (tmp_path / ".env").write_text(
+        "ENABLE_PAPER_TRADING=true\n",
+        encoding="utf-8",
+    )
+    c = diag.check_paper_trading_enabled()
+    assert c.status == "ok"
+
+
+def test_check_paper_trading_enabled_strips_inline_comment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``ENABLE_PAPER_TRADING=true   # comment`` must still resolve ok."""
+    _redirect_paths(monkeypatch, tmp_path)
+    (tmp_path / ".env").write_text(
+        'ENABLE_PAPER_TRADING="true"   # master kill switch\n',
+        encoding="utf-8",
+    )
+    c = diag.check_paper_trading_enabled()
+    assert c.status == "ok"
+
+
 def test_looks_blank_helper() -> None:
     text = "FOO=\nBAR=change_me\nBAZ=actualvalue\nQUUX=  ...  \n"
     assert diag._looks_blank(text, "FOO") is True
@@ -316,6 +377,7 @@ def test_run_all_returns_all_checks_in_order(
     assert names == [
         "venv",
         "env_file",
+        "paper_trading_enabled",
         "port_8765_clear",
         "orphan_pythons",
         "ollama_installed",

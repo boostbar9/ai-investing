@@ -149,6 +149,63 @@ def check_env_file() -> Check:
     )
 
 
+def check_paper_trading_enabled() -> Check:
+    """Is ``ENABLE_PAPER_TRADING=true`` set in ``.env``?
+
+    The paper loop halts every fire with ``ENABLE_PAPER_TRADING != true``
+    when this flag is missing, so an autonomous soak makes zero progress.
+    Surface it loudly as a red row so the operator notices on day 1
+    rather than discovering it 60 days in.
+    """
+    if not ENV_FILE.exists():
+        return Check(
+            name="paper_trading_enabled",
+            title="Paper trading enabled",
+            status="info",
+            message=".env is missing -- fix the .env row above first.",
+        )
+    text = ENV_FILE.read_text(encoding="utf-8", errors="replace")
+    value: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("ENABLE_PAPER_TRADING="):
+            _, _, raw = stripped.partition("=")
+            # Trim any inline '# comment' tail and surrounding quotes.
+            raw = raw.split("#", 1)[0].strip().strip('"').strip("'")
+            value = raw
+            break
+    if value is None:
+        return Check(
+            name="paper_trading_enabled",
+            title="Paper trading enabled",
+            status="error",
+            message=(
+                "ENABLE_PAPER_TRADING is missing from .env. The paper loop "
+                "will halt on every fire and the 60-day soak makes zero "
+                "progress until you add 'ENABLE_PAPER_TRADING=true'."
+            ),
+            fix_command="notepad .env",
+        )
+    if value.lower() != "true":
+        return Check(
+            name="paper_trading_enabled",
+            title="Paper trading enabled",
+            status="error",
+            message=(
+                f"ENABLE_PAPER_TRADING={value!r} in .env. Set it to 'true' "
+                "so the paper loop can actually submit orders to Alpaca "
+                "paper. Otherwise the soak halts on every fire."
+            ),
+            fix_command="notepad .env",
+        )
+    return Check(
+        name="paper_trading_enabled",
+        title="Paper trading enabled",
+        status="ok",
+        message="ENABLE_PAPER_TRADING=true -- paper loop can submit orders.",
+    )
+
+
 def _looks_blank(env_text: str, key: str) -> bool:
     """Return True when ``KEY=`` appears in the env file with no value."""
     for line in env_text.splitlines():
@@ -579,6 +636,7 @@ def run_all() -> list[Check]:
     return [
         check_venv(),
         check_env_file(),
+        check_paper_trading_enabled(),
         check_port(),
         check_orphan_pythons(),
         check_ollama_installed(),
