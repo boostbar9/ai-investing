@@ -498,6 +498,18 @@ def _heal_port() -> dict[str, object]:
     pid = _foreign_pid_on_port(8765)
     if pid is None:
         return {"ok": True, "message": "Port 8765 is already free."}
+    # Hard guard: never let auto-heal kill the running cockpit itself, even
+    # if the foreign/our identification upstream got confused. Killing the
+    # process answering this request would crash the page mid-click.
+    try:
+        if pid == os.getpid() or pid == os.getppid():
+            return {
+                "ok": True,
+                "message": f"Port 8765 is held by this cockpit (PID {pid}); nothing to free.",
+                "pid": pid,
+            }
+    except OSError:
+        pass
     # Only kill if it's a python.exe we recognise from our repo -- never kill
     # a stranger's process from a cockpit auto-fix.
     if not _is_our_repo_python(pid):
@@ -698,9 +710,28 @@ def _foreign_pid_on_port(port: int) -> int | None:
 
 
 def _our_cockpit_pid_on_port(port: int) -> int | None:
+    """Return the PID listening on ``port`` if it's *us* (or one of our
+    workers), else None.
+
+    The cheapest, most reliable signal is the running process itself: this
+    function is called from inside the cockpit answering an HTTP request, so
+    if the PID listening on the port equals ``os.getpid()`` it's literally
+    us. Falling back to the WMI walk handles the case where the cockpit is
+    launched via a multiprocessing/uvicorn worker whose PID differs from the
+    one serving the request (a parent/child relationship).
+    """
     pid = _pid_listening_on(port)
     if pid is None:
         return None
+    if pid == os.getpid():
+        return pid
+    # If the listener is our parent (uvicorn reload supervisor, PowerShell
+    # launcher running -m uvicorn, etc.), treat it as ours too.
+    try:
+        if pid == os.getppid():
+            return pid
+    except OSError:
+        pass
     return pid if _is_our_repo_python(pid) else None
 
 
@@ -750,7 +781,14 @@ def _pid_listening_on(port: int) -> int | None:
 
 
 def _list_repo_python_pids() -> list[dict[str, object]]:
-    """Every python.exe whose command line points at our repo."""
+    """Every python.exe / pythonw.exe whose command line points at our repo.
+
+    Originally only matched ``python.exe``. That missed cockpits launched
+    via ``pythonw.exe`` (no-console variant some launchers use) or via a
+    renamed venv interpreter, which caused the port health check to flag
+    the running cockpit as a foreign process. Widening the WMI filter to
+    ``LIKE 'python%'`` covers both.
+    """
     if os.name != "nt":
         # On POSIX we don't bother -- this is a Windows-orphan problem.
         return []
@@ -760,7 +798,7 @@ def _list_repo_python_pids() -> list[dict[str, object]]:
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+                "Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | "
                 "Select-Object ProcessId, ParentProcessId, ExecutablePath, CommandLine | "
                 "ConvertTo-Json -Compress",
             ],

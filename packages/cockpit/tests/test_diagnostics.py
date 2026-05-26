@@ -237,6 +237,47 @@ def test_check_port_held_by_foreign_is_auto_fixable(monkeypatch: pytest.MonkeyPa
     assert c.detail == {"holder_pid": 9999}
 
 
+def test_our_cockpit_pid_recognises_self(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The running process serving this request must always be recognised
+    as 'us', regardless of whether the WMI walk succeeds. Otherwise the
+    health check flags the running cockpit as a foreign port-holder.
+    """
+    import os
+
+    my_pid = os.getpid()
+    monkeypatch.setattr(diag, "_pid_listening_on", lambda _p: my_pid)
+    # Even if WMI lookup fails (returns nothing), we still detect ourselves.
+    monkeypatch.setattr(diag, "_list_repo_python_pids", lambda: [])
+    assert diag._our_cockpit_pid_on_port(8765) == my_pid
+
+
+def test_our_cockpit_pid_recognises_parent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When uvicorn runs under a reload supervisor, the listener PID is the
+    parent process. That should still count as us.
+    """
+    import os
+
+    parent_pid = os.getppid()
+    monkeypatch.setattr(diag, "_pid_listening_on", lambda _p: parent_pid)
+    monkeypatch.setattr(diag, "_list_repo_python_pids", lambda: [])
+    assert diag._our_cockpit_pid_on_port(8765) == parent_pid
+
+
+def test_heal_port_refuses_to_kill_self(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If somehow check_port misidentifies the running cockpit as foreign,
+    the auto-heal endpoint must still refuse to kill os.getpid() — clicking
+    'Fix it' should never crash the page you're looking at.
+    """
+    import os
+
+    monkeypatch.setattr(diag, "_foreign_pid_on_port", lambda _p: os.getpid())
+    # If this kill ran, the test process would die. Sentinel-guard it.
+    monkeypatch.setattr(diag, "_kill_pid", lambda _pid: pytest.fail("would kill self"))
+    out = diag._heal_port()
+    assert out["ok"] is True
+    assert "this cockpit" in out["message"].lower()
+
+
 def test_check_orphan_pythons_none(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(diag, "_list_orphan_repo_pythons", lambda: [])
     c = diag.check_orphan_pythons()
