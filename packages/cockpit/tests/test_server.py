@@ -1406,3 +1406,19 @@ def test_every_page_links_favicon_and_og(client: TestClient) -> None:
         assert "/static/brand/apple-touch-icon.png" in body, f"{path} missing apple icon"
         assert "/static/brand/og-image.png" in body, f"{path} missing OG card"
         assert 'property="og:title"' in body, f"{path} missing og:title"
+
+
+def test_jinja_comments_are_stripped_from_rendered_html(client: TestClient) -> None:
+    """Partials use ``{# ... #}`` doc comments. The renderer must strip those
+    so they never reach the browser as visible page text. Regression guard
+    for the 'Brand icons + social preview...' banner that leaked at the top
+    of every page when the comment-stripper was missing.
+    """
+    for path in ("/", "/errors", "/agents"):
+        body = client.get(path).text
+        assert "{#" not in body, f"{path} leaked a Jinja open-comment"
+        assert "#}" not in body, f"{path} leaked a Jinja close-comment"
+        # And the specific phrase from _head_icons.html that the user saw:
+        assert "Brand icons + social preview" not in body, (
+            f"{path} leaked the head_icons doc-comment"
+        )

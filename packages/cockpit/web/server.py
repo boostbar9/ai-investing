@@ -367,6 +367,8 @@ def health_page() -> HTMLResponse:
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 _INCLUDE_PATTERN = re.compile(r"\{%\s*include\s+['\"]([^'\"]+)['\"]\s*%\}")
+# Strip Jinja-style comments {# ... #}. DOTALL so multi-line blocks vanish too.
+_COMMENT_PATTERN = re.compile(r"\{#.*?#\}", re.DOTALL)
 
 
 def _render(name: str) -> HTMLResponse:
@@ -374,14 +376,18 @@ def _render(name: str) -> HTMLResponse:
 
     A full Jinja2 dependency would be overkill for the handful of partials
     the cockpit needs (currently just ``_head_icons.html``), so we do a
-    one-pass include expansion ourselves. Includes resolve relative to the
-    templates directory; missing partials degrade gracefully with an HTML
-    comment so a typo doesn't break the whole page.
+    one-pass include expansion ourselves, then strip Jinja-style comments
+    ``{# ... #}`` so partials can document themselves without that
+    documentation leaking out as visible text in the browser. Includes
+    resolve relative to the templates directory; missing partials degrade
+    gracefully with an HTML comment so a typo doesn't break the whole page.
     """
     path = _TEMPLATES_DIR / name
     if not path.exists():
         return HTMLResponse(f"<h1>template missing: {name}</h1>", status_code=500)
-    return HTMLResponse(_expand_includes(path.read_text(encoding="utf-8")))
+    body = _expand_includes(path.read_text(encoding="utf-8"))
+    body = _COMMENT_PATTERN.sub("", body)
+    return HTMLResponse(body)
 
 
 def _expand_includes(body: str, _depth: int = 0) -> str:
