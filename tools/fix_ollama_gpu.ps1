@@ -406,20 +406,63 @@ foreach ($f in $expected) {
     }
 }
 
+# RDNA3-specific: rocblas needs the gfx1100 tensor files. The consolidated
+# v0.30.0 7z usually ships them but the standard upstream Ollama 7z does
+# not. If gfx1100 is missing, GPU detection silently falls back to CPU.
+$libDir = Join-Path $rocmDir "rocblas\library"
+if (Test-Path $libDir) {
+    $gfx1100Files = Get-ChildItem -Path $libDir -Filter "*gfx1100*" -ErrorAction SilentlyContinue
+    if ($gfx1100Files -and $gfx1100Files.Count -gt 0) {
+        Write-Ok ("Found {0} gfx1100 tensor file(s) for RDNA3" -f $gfx1100Files.Count)
+    } else {
+        Write-Warn2 "No gfx1100 tensor files in rocblas\library -- this is the most common"
+        Write-Host  "           cause of 'no compatible GPUs' on RX 7900 XT. The consolidated"
+        Write-Host  "           upstream 7z dropped them; grab the RDNA3-specific pack from"
+        Write-Host  "           https://github.com/likelovewant/ROCmLibs-for-gfx1103-AMD780M-APU"
+        Write-Host  "           or an older likelovewant/ollama-for-amd release (<=v0.16.1)."
+    }
+}
+
 # ----- 7. Restart Ollama and verify GPU detection -----------------------------
 Write-Step "Starting Ollama and verifying GPU detection"
 
 $logFile = Join-Path $env:TEMP "ollama-startup-$timestamp.log"
+$errFile = "$logFile.err"
 
 # Start ollama serve in a detached process so this script can poll its log.
 # We capture both stdout and stderr to the same file because the GPU detection
 # lines come from a mix of structured logging and warnings.
 $ollama = Start-Process -FilePath "ollama" -ArgumentList "serve" `
-    -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err" `
+    -RedirectStandardOutput $logFile -RedirectStandardError $errFile `
     -WindowStyle Hidden -PassThru
 
 Write-Host "  Started ollama serve (PID $($ollama.Id))"
 Write-Host "  Streaming startup log from $logFile ..."
+
+# Helper to read a file even while another process holds a write handle.
+# Get-Content with -ErrorAction SilentlyContinue silently returns nothing
+# when the file is locked by ollama, which is why the previous run's log
+# capture appeared empty even though ollama was writing to it.
+function Read-LockedFile {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return "" }
+    try {
+        $fs = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite
+        )
+        try {
+            $sr = New-Object System.IO.StreamReader($fs)
+            return $sr.ReadToEnd()
+        } finally {
+            $fs.Dispose()
+        }
+    } catch {
+        return ""
+    }
+}
 
 # Poll up to 30 seconds for the GPU detection lines.
 $gpuFound = $false
@@ -429,10 +472,8 @@ $deadline = (Get-Date).AddSeconds(30)
 
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 500
-    if (-not (Test-Path $logFile)) { continue }
-    $log = (Get-Content -Raw -Path $logFile -ErrorAction SilentlyContinue) + `
-           (Get-Content -Raw -Path "$logFile.err" -ErrorAction SilentlyContinue)
-    if (-not $log) { continue }
+    $log = (Read-LockedFile -Path $logFile) + "`n" + (Read-LockedFile -Path $errFile)
+    if (-not $log.Trim()) { continue }
 
     if ($log -match "library=rocm.*compute=gfx\d+") {
         $gpuFound = $true
@@ -459,7 +500,43 @@ if ($gpuFound) {
         Write-Host "  Log says: $cpuLine" -ForegroundColor Yellow
     }
     Write-Host ""
-    Write-Host "  Next step: paste the contents of $logFile back to the assistant."
+    Write-Host "  === Last 60 lines of the Ollama startup log ===" -ForegroundColor Yellow
+    $finalLog = (Read-LockedFile -Path $logFile) + "`n" + (Read-LockedFile -Path $errFile)
+    $finalLines = $finalLog -split "`r?`n" | Where-Object { $_.Trim() }
+    $tailCount = [Math]::Min(60, $finalLines.Count)
+    if ($tailCount -gt 0) {
+        $finalLines | Select-Object -Last $tailCount | ForEach-Object {
+            Write-Host "    $_"
+        }
+    } else {
+        Write-Host "    (the startup log was empty -- ollama may have failed to start)"
+        Write-Host "    Check that the 'ollama' binary is on PATH (try 'where.exe ollama')"
+    }
+    Write-Host ""
+    Write-Host "  === Local GPU environment ===" -ForegroundColor Yellow
+    Write-Host ("    HSA_OVERRIDE_GFX_VERSION = {0}" -f ([Environment]::GetEnvironmentVariable("HSA_OVERRIDE_GFX_VERSION", "User")))
+    Write-Host ("    HIP_VISIBLE_DEVICES      = {0}" -f ([Environment]::GetEnvironmentVariable("HIP_VISIBLE_DEVICES", "User")))
+    Write-Host ("    OLLAMA_VISIBLE_DEVICES   = {0}" -f ([Environment]::GetEnvironmentVariable("OLLAMA_VISIBLE_DEVICES", "User")))
+    try {
+        $gpus = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+            Select-Object Name, DriverVersion, Status
+        if ($gpus) {
+            Write-Host "    Display adapters detected:"
+            $gpus | ForEach-Object {
+                Write-Host ("      - {0}  driver={1}  status={2}" -f $_.Name, $_.DriverVersion, $_.Status)
+            }
+            $parsec = $gpus | Where-Object { $_.Name -match "Parsec|Virtual|Remote" }
+            if ($parsec) {
+                Write-Warn2 "A virtual/remote display adapter was detected. On some setups Ollama"
+                Write-Host  "           picks up the virtual adapter first and skips the real GPU."
+                Write-Host  "           Try setting HIP_VISIBLE_DEVICES=0 (or 1) to force the real GPU:"
+                Write-Host  "             [Environment]::SetEnvironmentVariable('HIP_VISIBLE_DEVICES','0','User')"
+                Write-Host  "           then run this script again."
+            }
+        }
+    } catch {}
+    Write-Host ""
+    Write-Host "  Full startup log: $logFile"
     Write-Host "  If you need to roll back: stop ollama, delete $rocmDir,"
     Write-Host "  rename $backupDir to $rocmDir, and restart ollama."
 }
