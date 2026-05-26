@@ -138,6 +138,91 @@ async def test_alpaca_account_endpoint():
         await broker.aclose()
 
 
+@pytest.mark.asyncio
+async def test_alpaca_liquidate_all_hits_bulk_endpoints():
+    """liquidate_all() must DELETE /v2/orders then DELETE /v2/positions and
+    return counts. This is the recovery path used by the cockpit Trading
+    page when buying power is stuck."""
+    calls: list[tuple[str, str]] = []
+
+    class _T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            calls.append((request.method, request.url.path))
+            if request.method == "DELETE" and request.url.path.endswith("/v2/orders"):
+                # Alpaca returns a list of {id, status} on bulk cancel.
+                return httpx.Response(
+                    207,
+                    json=[
+                        {"id": "o1", "status": 200},
+                        {"id": "o2", "status": 200},
+                    ],
+                )
+            if request.method == "DELETE" and request.url.path.endswith("/v2/positions"):
+                return httpx.Response(
+                    207,
+                    json=[
+                        {"symbol": "SPY", "status": 200},
+                        {"symbol": "NVDA", "status": 200},
+                        {"symbol": "AAPL", "status": 200},
+                    ],
+                )
+            return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=_T(), base_url="http://x")
+    broker = AlpacaPaperBroker(key_id="k", secret="s", base_url="http://x", client=client)
+    try:
+        result = await broker.liquidate_all()
+        assert result["cancelled_orders"] == 2
+        assert result["closed_positions"] == 3
+        # Verified both endpoints were called in the right order.
+        assert ("DELETE", "/v2/orders") in calls
+        assert ("DELETE", "/v2/positions") in calls
+        assert calls.index(("DELETE", "/v2/orders")) < calls.index(("DELETE", "/v2/positions"))
+    finally:
+        await broker.aclose()
+
+
+@pytest.mark.asyncio
+async def test_alpaca_liquidate_skips_order_cancel_when_disabled():
+    """cancel_orders=False -> only DELETE /v2/positions, no /v2/orders call."""
+    calls: list[tuple[str, str]] = []
+
+    class _T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            calls.append((request.method, request.url.path))
+            if request.method == "DELETE" and request.url.path.endswith("/v2/positions"):
+                return httpx.Response(207, json=[])
+            return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=_T(), base_url="http://x")
+    broker = AlpacaPaperBroker(key_id="k", secret="s", base_url="http://x", client=client)
+    try:
+        result = await broker.liquidate_all(cancel_orders=False)
+        assert result["cancelled_orders"] == 0
+        assert result["closed_positions"] == 0
+        assert ("DELETE", "/v2/orders") not in calls
+        assert ("DELETE", "/v2/positions") in calls
+    finally:
+        await broker.aclose()
+
+
+@pytest.mark.asyncio
+async def test_alpaca_liquidate_raises_on_hard_error():
+    """4xx/5xx on either bulk endpoint must raise BrokerError."""
+
+    class _T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, json={"error": "alpaca-down"})
+
+    client = httpx.AsyncClient(transport=_T(), base_url="http://x")
+    broker = AlpacaPaperBroker(key_id="k", secret="s", base_url="http://x", client=client)
+    try:
+        with pytest.raises(BrokerError):
+            await broker.liquidate_all()
+    finally:
+        await broker.aclose()
+
+
 def test_alpaca_live_uses_live_env(monkeypatch):
     from packages.execution.broker import AlpacaLiveBroker
 

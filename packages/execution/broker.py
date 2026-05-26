@@ -158,6 +158,53 @@ class AlpacaPaperBroker(Broker):
                     continue
             return out
 
+    async def liquidate_all(self, cancel_orders: bool = True) -> dict[str, Any]:
+        """Cancel open orders and close every open position at market.
+
+        Uses Alpaca's bulk endpoints:
+        - ``DELETE /v2/orders`` -- cancel all open orders
+        - ``DELETE /v2/positions?cancel_orders=true`` -- close all positions
+
+        Both endpoints are atomic on Alpaca's side. Returns a summary dict
+        with counts and the per-symbol responses from Alpaca. Raises
+        ``BrokerError`` if either call fails with HTTP >= 300.
+
+        This is the recommended way to free up buying power that's stuck in
+        old positions -- one round-trip, no per-symbol retries needed.
+        """
+        with span("broker.alpaca.liquidate_all"):
+            cancelled_orders: list[dict[str, Any]] = []
+            if cancel_orders:
+                ro = await self._client.delete(f"{self.base_url}/v2/orders")
+                # 207 multi-status is normal here; only fail on hard errors.
+                if ro.status_code >= 400:
+                    raise BrokerError(
+                        f"alpaca cancel-orders {ro.status_code}: {ro.text[:200]}"
+                    )
+                try:
+                    cancelled_orders = ro.json() if ro.text else []
+                except ValueError:
+                    cancelled_orders = []
+            rp = await self._client.delete(
+                f"{self.base_url}/v2/positions",
+                params={"cancel_orders": "true"} if cancel_orders else None,
+            )
+            # Alpaca returns 207 multi-status with a per-symbol list.
+            if rp.status_code >= 400:
+                raise BrokerError(
+                    f"alpaca liquidate {rp.status_code}: {rp.text[:200]}"
+                )
+            try:
+                closed = rp.json() if rp.text else []
+            except ValueError:
+                closed = []
+            return {
+                "cancelled_orders": len(cancelled_orders),
+                "closed_positions": len(closed) if isinstance(closed, list) else 0,
+                "orders_response": cancelled_orders,
+                "positions_response": closed,
+            }
+
     async def aclose(self) -> None:
         await self._client.aclose()
 

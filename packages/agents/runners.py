@@ -102,6 +102,35 @@ def _safe_discovery(payload: DiscoveryInput) -> DiscoveryOutput:
 # Generic runner
 # ---------------------------------------------------------------------------
 
+def _validation_repair_hint(err: ValidationError, output_model: type) -> str:
+    """Build a short repair instruction from a Pydantic validation error.
+
+    Used to give the LLM a second chance: we re-prompt with the original
+    instructions plus an explicit list of the fields it got wrong. Keeps
+    the hint short so we don't blow up the context window.
+    """
+    missing: list[str] = []
+    other: list[str] = []
+    for e in err.errors()[:6]:  # cap at 6 issues to keep hint small
+        loc = ".".join(str(p) for p in e.get("loc", ()))
+        if e.get("type") == "missing":
+            missing.append(loc)
+        else:
+            other.append(f"{loc}: {e.get('msg', 'invalid')}")
+    parts: list[str] = []
+    if missing:
+        parts.append("missing required field(s): " + ", ".join(missing))
+    if other:
+        parts.append("invalid: " + "; ".join(other))
+    schema_name = getattr(output_model, "__name__", "the output schema")
+    detail = "; ".join(parts) if parts else "schema mismatch"
+    return (
+        f"Your previous response did not match {schema_name} ({detail}). "
+        "Respond again with valid JSON that includes every required field. "
+        "Do not omit empty arrays -- return [] explicitly."
+    )
+
+
 async def _run(
     *,
     router: LLMRouter,
@@ -113,6 +142,7 @@ async def _run(
     payload,
 ):
     with span(f"agent.{agent}", {"decision_id": decision_id_str}) as s:
+        # ---- Attempt 1 -----------------------------------------------------
         try:
             raw = await router.generate_json(
                 agent=agent,
@@ -120,18 +150,50 @@ async def _run(
                 decision_id=decision_id_str,
             )
         except LLMError as e:
-            log.warning("agent %s LLM chain failed: %s", agent, e)
-            s.set_attribute("agent.fallback", "llm_error")
-            return safe_default(payload)
+            log.warning("agent %s LLM chain failed (will retry once): %s", agent, e)
+            s.set_attribute("agent.retry_reason", "llm_error")
+            try:
+                raw = await router.generate_json(
+                    agent=agent,
+                    prompt=prompt,
+                    decision_id=decision_id_str,
+                )
+            except LLMError as e2:
+                log.warning("agent %s LLM retry also failed: %s", agent, e2)
+                s.set_attribute("agent.fallback", "llm_error")
+                return safe_default(payload)
 
         # Trust server-side decision_id; never accept the model's value.
         raw["decision_id"] = decision_id_str
         try:
             return output_model.model_validate(raw)
         except ValidationError as e:
-            log.warning("agent %s invalid JSON: %s", agent, e)
-            s.set_attribute("agent.fallback", "validation_error")
-            return safe_default(payload)
+            log.warning(
+                "agent %s invalid JSON (will retry once with repair hint): %s", agent, e
+            )
+            s.set_attribute("agent.retry_reason", "validation_error")
+            # ---- Attempt 2 (validation repair) -----------------------------
+            repair_prompt = prompt + "\n\n" + _validation_repair_hint(e, output_model)
+            try:
+                raw2 = await router.generate_json(
+                    agent=agent,
+                    prompt=repair_prompt,
+                    decision_id=decision_id_str,
+                )
+            except LLMError as e_llm:
+                log.warning("agent %s repair retry LLM error: %s", agent, e_llm)
+                s.set_attribute("agent.fallback", "llm_error_on_repair")
+                return safe_default(payload)
+            raw2["decision_id"] = decision_id_str
+            try:
+                out = output_model.model_validate(raw2)
+                s.set_attribute("agent.recovered_via_repair", True)
+                log.info("agent %s recovered via repair retry", agent)
+                return out
+            except ValidationError as e2:
+                log.warning("agent %s repair retry still invalid: %s", agent, e2)
+                s.set_attribute("agent.fallback", "validation_error")
+                return safe_default(payload)
 
 
 # ---------------------------------------------------------------------------

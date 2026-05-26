@@ -116,6 +116,20 @@
       </div>
     </section>
 
+    <section class="card p-5 mb-4" id="recovery-card">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium">Recovery <span class="tt" data-tt="Reset the paper account back to all-cash so the 60-day soak streak can advance. Use when buying power is stuck near $0 because old positions are holding the cash.">?</span></div>
+        <span id="liquidate-meta" class="text-xs text-gray-500">paper only</span>
+      </div>
+      <div class="text-xs text-gray-400 mb-3">
+        If buying power is near $0 because old positions are tying up cash, click below to close every paper position at market via Alpaca's bulk endpoint. The loop will auto-pause so it can't immediately re-fill. Paper only — disabled in live mode.
+      </div>
+      <div class="flex items-center gap-2">
+        <button id="liquidate-btn" class="btn btn-danger" data-tt="Closes every open paper position at market and cancels open orders. Requires typed confirmation.">Liquidate all positions</button>
+        <span id="liquidate-result" class="text-xs text-gray-400"></span>
+      </div>
+    </section>
+
     <section class="card p-5">
       <div class="flex items-center justify-between mb-3">
         <div class="text-sm font-medium">Live log <span class="tt" data-tt="Streamed stdout from the paper_loop process. Useful for debugging.">?</span></div>
@@ -297,10 +311,41 @@
       }
     }
 
+    async function liquidate() {
+      if (currentMode === 'live') {
+        Cockpit.toastWarn('Liquidate is paper-only. Switch to paper mode first.');
+        return;
+      }
+      const phrase = prompt(
+        'WARNING: Close every paper position at market.\n\nThis cancels all open paper orders and sells every open paper position via Alpaca\'s bulk endpoint. The loop will auto-pause.\n\nType exactly:  LIQUIDATE  to confirm.'
+      );
+      if (phrase !== 'LIQUIDATE') {
+        if (phrase !== null) Cockpit.toastWarn('Phrase did not match. Liquidate cancelled.');
+        return;
+      }
+      const btn = document.getElementById('liquidate-btn');
+      const resultEl = document.getElementById('liquidate-result');
+      btn.disabled = true;
+      resultEl.textContent = 'Working...';
+      try {
+        const r = await Cockpit.api.post('/api/trading/liquidate', {confirm: true, cancel_orders: true});
+        const closed = r.closed_positions ?? 0;
+        const cancelled = r.cancelled_orders ?? 0;
+        resultEl.textContent = `Closed ${closed} position(s), cancelled ${cancelled} open order(s). Bot paused.`;
+        Cockpit.toastSuccess(`Liquidated ${closed} position(s).`, 'Paper account cleared');
+      } catch (e) {
+        resultEl.textContent = 'Failed: ' + e.message;
+        Cockpit.toastError('Liquidate failed: ' + e.message);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
       document.getElementById('mode-toggle-btn').addEventListener('click', toggleMode);
       document.getElementById('start-btn').addEventListener('click', start);
       document.getElementById('stop-btn').addEventListener('click', stop);
+      document.getElementById('liquidate-btn').addEventListener('click', liquidate);
       document.getElementById('clear-log').addEventListener('click', () => { document.getElementById('log').textContent = ''; });
       document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
 

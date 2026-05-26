@@ -14,6 +14,7 @@ POST /api/pause            -> toggle global pause
 POST /api/resume           -> resume from pause
 POST /api/override-regime  -> set manual regime override (bull/chop/bear/crisis/auto)
 POST /api/flatten          -> emergency: cancel orders + sell all positions
+POST /api/trading/liquidate -> bulk close all positions via Alpaca DELETE /v2/positions
 POST /api/run-now          -> trigger a paper run immediately (background task)
 
 Launch with ``python tools/cockpit.py`` or
@@ -250,6 +251,18 @@ class StartTradingRequest(BaseModel):
 
     strategy: str = "ensemble"
     dry_run: bool = False
+
+
+class LiquidateRequest(BaseModel):
+    """Body for /api/trading/liquidate.
+
+    Must include ``confirm: true`` -- guards against an accidental click that
+    blows away every paper position. The cockpit UI sends this only after a
+    typed-confirmation dialog.
+    """
+
+    confirm: bool = False
+    cancel_orders: bool = True
 
 
 # --------------------------------------------------------------------------
@@ -1371,6 +1384,55 @@ def api_trading_stop() -> dict[str, Any]:
 @app.get("/api/trading/status")
 def api_trading_status() -> dict[str, Any]:
     return job_mgr.status(PAPER_LOOP_KIND).to_dict()
+
+
+@app.post("/api/trading/liquidate")
+async def api_trading_liquidate(req: LiquidateRequest) -> dict[str, Any]:
+    """Cancel open orders and close every paper position via Alpaca bulk API.
+
+    Unlike ``/api/flatten`` which submits per-symbol market orders in a
+    background task, this hits Alpaca's ``DELETE /v2/positions`` directly
+    and returns the result synchronously. Use this to free buying power
+    that's tied up in old positions and unblock the soak run.
+
+    Requires ``confirm: true`` in the request body.
+    """
+    if not req.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="liquidate requires confirm=true; this closes every open position at market",
+        )
+    if not (os.getenv("ALPACA_PAPER_KEY_ID") and os.getenv("ALPACA_PAPER_SECRET")):
+        raise HTTPException(
+            status_code=400,
+            detail="Alpaca paper credentials missing -- set ALPACA_PAPER_KEY_ID / ALPACA_PAPER_SECRET",
+        )
+    # Pause the loop so it can't immediately re-fill what we just closed.
+    state = load_state()
+    state.paused = True
+    state = record_action(state, "Liquidate all positions from cockpit")
+    save_state(state)
+    broker = AlpacaPaperBroker()
+    try:
+        try:
+            result = await broker.liquidate_all(cancel_orders=req.cancel_orders)
+        except BrokerError as e:
+            log.error("liquidate failed: %s", e)
+            raise HTTPException(status_code=502, detail=f"liquidate failed: {e}") from e
+        log.info(
+            "liquidate: closed %d positions, cancelled %d orders",
+            result.get("closed_positions", 0),
+            result.get("cancelled_orders", 0),
+        )
+        return {
+            "ok": True,
+            "paused": True,
+            "closed_positions": result.get("closed_positions", 0),
+            "cancelled_orders": result.get("cancelled_orders", 0),
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            await broker.aclose()
 
 
 # --------------------------------------------------------------------------
