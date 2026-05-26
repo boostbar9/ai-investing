@@ -14,6 +14,8 @@
     .err-row.sev-error { border-left: 4px solid #ef4444; }
     .err-row.sev-warning { border-left: 4px solid #f59e0b; }
     .err-row.sev-info { border-left: 4px solid #3b82f6; }
+    .err-row.is-resolved { opacity: 0.55; border-left-color: #4b5563 !important; }
+    .resolved-badge { display: inline-block; background: #064e3b; color: #6ee7b7; font-size: 10px; padding: 2px 8px; border-radius: 999px; font-weight: 500; }
     .err-detail { background: #050810; border: 1px solid #1f2937; border-radius: 6px; padding: 10px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; color: #9ca3af; white-space: pre-wrap; overflow-x: auto; max-height: 280px; overflow-y: auto; }
     .ctx-chip { display: inline-block; background: #1f2937; color: #9ca3af; font-size: 10px; padding: 2px 8px; border-radius: 999px; margin: 2px 4px 2px 0; font-family: ui-monospace, Menlo, Consolas, monospace; }
     details > summary { cursor: pointer; user-select: none; }
@@ -57,6 +59,7 @@
       <div class="flex gap-2 flex-wrap">
         <button id="refresh-btn" class="btn btn-ghost" data-tt="Reload from /api/errors right now.">Refresh</button>
         <button id="copy-md-btn" class="btn btn-primary" data-tt="Copy a markdown debug bundle (last 100 entries) to your clipboard.">Copy as Markdown</button>
+        <button id="clear-resolved-btn" class="btn btn-ghost" data-tt="Permanently delete only entries that have been marked resolved. Active errors stay.">Clear resolved</button>
         <button id="clear-btn" class="btn btn-danger" data-tt="Delete every entry from the error log. Cannot be undone.">Clear log</button>
       </div>
     </header>
@@ -79,6 +82,10 @@
           <span id="count-total" class="text-gray-500">0 total</span>
         </div>
         <div class="ml-auto flex items-center gap-3 flex-wrap">
+          <label class="text-xs text-gray-400 flex items-center gap-2" data-tt="Show entries you've already marked resolved (kept for audit trail).">
+            <input id="show-resolved" type="checkbox" />
+            <span>Show resolved</span>
+          </label>
           <label class="text-xs text-gray-400 flex items-center gap-2" data-tt="Group entries by source process (paper_loop, cockpit, pretrain).">
             <input id="group-by-source" type="checkbox" />
             <span>Group by source</span>
@@ -131,6 +138,7 @@
     let refreshTimer = null;
     let currentSeverity = '';
     let groupBySource = false;
+    let showResolved = false;
 
     function pillForSev(sev) {
       if (sev === 'error') return 'pill pill-red';
@@ -142,6 +150,8 @@
     function renderEntry(e) {
       const sev = e.severity || 'error';
       const esc = Cockpit.fmt.escape;
+      const isResolved = !!e.resolved_at;
+      const entryId = e.id || '';
       const ctxChips = e.context ? Object.entries(e.context).map(([k,v]) =>
         `<span class="ctx-chip">${esc(k)}=${esc(typeof v === 'object' ? JSON.stringify(v) : v)}</span>`
       ).join('') : '';
@@ -150,20 +160,52 @@
           <summary class="text-xs text-gray-400">Show traceback / detail</summary>
           <div class="err-detail mt-2">${esc(e.detail)}</div>
         </details>` : '';
+      const resolvedBadge = isResolved
+        ? `<span class="resolved-badge" title="Resolved ${esc(e.resolved_at)}">resolved</span>`
+        : '';
+      const actionBtn = entryId
+        ? (isResolved
+            ? `<button class="btn btn-sm btn-ghost" data-action="unresolve" data-id="${esc(entryId)}" data-tt="Reopen this entry — it'll be counted as active again.">Reopen</button>`
+            : `<button class="btn btn-sm btn-primary" data-action="resolve" data-id="${esc(entryId)}" data-tt="Mark this entry resolved. Drops it from the active count and hides it by default.">Resolve</button>`)
+        : '';
       return `
-        <div class="err-row sev-${sev} fade-in">
+        <div class="err-row sev-${sev} ${isResolved ? 'is-resolved' : ''} fade-in">
           <div class="flex items-center justify-between gap-3 flex-wrap">
             <div class="flex items-center gap-2 flex-wrap">
               <span class="${pillForSev(sev)}">${esc(sev)}</span>
+              ${resolvedBadge}
               <span class="text-xs text-gray-500 font-mono">${esc(e.source || '?')}</span>
               <span class="text-xs text-gray-500">${esc(Cockpit.fmt.time(e.ts))}</span>
             </div>
+            <div class="flex items-center gap-2">${actionBtn}</div>
           </div>
           <div class="mt-2 text-sm text-gray-100">${esc(e.message || '(no message)')}</div>
           ${ctxChips ? `<div class="mt-2">${ctxChips}</div>` : ''}
           ${detailBlock}
         </div>
       `;
+    }
+
+    async function resolveEntry(entryId) {
+      try {
+        await Cockpit.api.post(`/api/errors/${encodeURIComponent(entryId)}/resolve`, {});
+        Cockpit.toastSuccess('Marked resolved');
+        load();
+        refreshTopbar();
+      } catch (e) {
+        Cockpit.toastError('Resolve failed: ' + e.message);
+      }
+    }
+
+    async function unresolveEntry(entryId) {
+      try {
+        await Cockpit.api.post(`/api/errors/${encodeURIComponent(entryId)}/unresolve`, {});
+        Cockpit.toastSuccess('Reopened');
+        load();
+        refreshTopbar();
+      } catch (e) {
+        Cockpit.toastError('Reopen failed: ' + e.message);
+      }
     }
 
     function setCounts(counts) {
@@ -177,19 +219,25 @@
 
     async function load() {
       try {
-        const sev = currentSeverity;
-        const url = sev ? `/api/errors?severity=${encodeURIComponent(sev)}` : '/api/errors';
+        const params = new URLSearchParams();
+        if (currentSeverity) params.set('severity', currentSeverity);
+        if (showResolved) params.set('include_resolved', 'true');
+        const qs = params.toString();
+        const url = qs ? `/api/errors?${qs}` : '/api/errors';
         const j = await Cockpit.api.get(url);
         setCounts(j.counts);
         Cockpit.markConnection('live');
         const entries = j.entries || [];
         const container = document.getElementById('entries');
         if (entries.length === 0) {
+          const filterSuffix = currentSeverity
+            ? ' for the selected filter'
+            : (showResolved ? '' : ' — no active errors right now');
           container.innerHTML = `
             <div class="empty-state">
               <div class="icon">◯</div>
-              <div class="text-base text-gray-300">All clear — no entries to show.</div>
-              <div class="text-xs text-gray-500 mt-2">The error log is empty${currentSeverity ? ' for the selected filter' : ''}. Things look healthy.</div>
+              <div class="text-base text-gray-300">All clear — nothing active.</div>
+              <div class="text-xs text-gray-500 mt-2">${showResolved ? 'No entries in the log' : 'Resolved entries are hidden by default'}${filterSuffix}.</div>
             </div>`;
           return;
         }
@@ -253,6 +301,19 @@
         const j = await Cockpit.api.post('/api/errors/clear', {});
         Cockpit.toastSuccess(`Cleared ${j.cleared || 0} entries`);
         load();
+        refreshTopbar();
+      } catch (e) {
+        Cockpit.toastError('Clear failed: ' + e.message);
+      }
+    }
+
+    async function clearResolved() {
+      if (!confirm('Permanently delete resolved entries? Active errors will stay.')) return;
+      try {
+        const j = await Cockpit.api.post('/api/errors/clear_resolved', {});
+        Cockpit.toastSuccess(`Cleared ${j.cleared || 0} resolved entries`);
+        load();
+        refreshTopbar();
       } catch (e) {
         Cockpit.toastError('Clear failed: ' + e.message);
       }
@@ -322,6 +383,21 @@
       document.getElementById('refresh-btn').addEventListener('click', load);
       document.getElementById('copy-md-btn').addEventListener('click', copyMarkdown);
       document.getElementById('clear-btn').addEventListener('click', clearLog);
+      document.getElementById('clear-resolved-btn').addEventListener('click', clearResolved);
+      document.getElementById('show-resolved').addEventListener('change', (e) => {
+        showResolved = e.target.checked;
+        load();
+      });
+      // Event delegation for per-row resolve / reopen buttons.
+      document.getElementById('entries').addEventListener('click', (ev) => {
+        const btn = ev.target.closest('button[data-action]');
+        if (!btn) return;
+        const id = btn.getAttribute('data-id');
+        if (!id) return;
+        const action = btn.getAttribute('data-action');
+        if (action === 'resolve') resolveEntry(id);
+        else if (action === 'unresolve') unresolveEntry(id);
+      });
       document.getElementById('snap-preview-btn').addEventListener('click', loadSnapshot);
       document.getElementById('snap-copy-btn').addEventListener('click', copySnapshot);
       document.getElementById('snap-save-btn').addEventListener('click', saveSnapshot);

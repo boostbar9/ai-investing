@@ -12,6 +12,7 @@ the file stays small.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import traceback
@@ -26,6 +27,17 @@ ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
 MAX_ENTRIES: Final[int] = 2000
 
 _lock = threading.Lock()
+
+
+def _entry_id(ts: str, source: str, message: str) -> str:
+    """Stable short ID for an entry. Used so the UI can address a single
+    row for resolve/unresolve without having to remember array indices.
+    Same (ts, source, message) yields the same ID across reads, which
+    means clicking Resolve in the UI hits the right row even if other
+    entries were added between the page load and the click.
+    """
+    h = hashlib.sha1(f"{ts}|{source}|{message}".encode()).hexdigest()
+    return h[:12]
 
 
 def record_error(
@@ -53,11 +65,17 @@ def record_error(
     context : dict | None
         Structured extra data (endpoint, args, exit code, etc.). Optional.
     """
+    ts = datetime.now(UTC).isoformat(timespec="seconds")
     entry: dict[str, Any] = {
-        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+        "id": _entry_id(ts, source, message),
+        "ts": ts,
         "source": source,
         "severity": severity,
         "message": message,
+        # `resolved_at` is None for live errors and an ISO timestamp once
+        # the operator (or a recovery hook) marks it fixed. Keeping the
+        # entry around even after resolution preserves the audit trail.
+        "resolved_at": None,
     }
     if detail:
         entry["detail"] = detail
@@ -87,28 +105,116 @@ def record_exception(source: str, exc: BaseException, **context: Any) -> dict[st
     )
 
 
-def list_errors(limit: int | None = 200, severity: str | None = None) -> list[dict[str, Any]]:
-    """Return entries newest-first, optionally filtered by severity."""
+def list_errors(
+    limit: int | None = 200,
+    severity: str | None = None,
+    include_resolved: bool = True,
+) -> list[dict[str, Any]]:
+    """Return entries newest-first.
+
+    Parameters
+    ----------
+    limit
+        Max number of entries to return.
+    severity
+        Only return entries with this severity if set.
+    include_resolved
+        When ``False``, hide entries that have been marked resolved.
+        Defaults to ``True`` for backward compatibility with the existing
+        endpoint; the UI passes ``False`` so a stale halt that has since
+        recovered doesn't keep cluttering the page.
+    """
     with _lock:
         entries = _read_all_unlocked()
     entries.reverse()  # newest first
     if severity:
         entries = [e for e in entries if e.get("severity") == severity]
+    if not include_resolved:
+        entries = [e for e in entries if not e.get("resolved_at")]
     if limit:
         entries = entries[:limit]
     return entries
 
 
 def count_unresolved() -> dict[str, int]:
-    """Return counts per severity across the whole log."""
+    """Return counts per severity — only entries with no ``resolved_at``.
+
+    The name is from the original API; we keep it but now it filters out
+    rows the operator has already marked resolved. That way the topbar
+    badge stops yelling at you about a stale halt.
+    """
     with _lock:
         entries = _read_all_unlocked()
     counts = {"error": 0, "warning": 0, "info": 0, "total": 0}
     for e in entries:
+        if e.get("resolved_at"):
+            continue
         sev = e.get("severity", "error")
         counts[sev] = counts.get(sev, 0) + 1
         counts["total"] += 1
     return counts
+
+
+def resolve(entry_id: str) -> bool:
+    """Mark a single entry resolved. Returns True if a row was updated."""
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    with _lock:
+        entries = _read_all_unlocked()
+        hit = False
+        for e in entries:
+            if e.get("id") == entry_id and not e.get("resolved_at"):
+                e["resolved_at"] = now
+                hit = True
+                break
+        if hit:
+            _write_all_unlocked(entries)
+    return hit
+
+
+def unresolve(entry_id: str) -> bool:
+    """Reopen a previously-resolved entry. Returns True if a row was updated."""
+    with _lock:
+        entries = _read_all_unlocked()
+        hit = False
+        for e in entries:
+            if e.get("id") == entry_id and e.get("resolved_at"):
+                e["resolved_at"] = None
+                hit = True
+                break
+        if hit:
+            _write_all_unlocked(entries)
+    return hit
+
+
+def resolve_by_source(source: str) -> int:
+    """Mark every unresolved entry from ``source`` as resolved. Returns count.
+
+    Used by recovery hooks — e.g. when the next research run succeeds, we
+    can call ``resolve_by_source("agents.research")`` to clear the stale
+    'all models failed' rows so the page reflects current health.
+    """
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    with _lock:
+        entries = _read_all_unlocked()
+        n = 0
+        for e in entries:
+            if e.get("source") == source and not e.get("resolved_at"):
+                e["resolved_at"] = now
+                n += 1
+        if n:
+            _write_all_unlocked(entries)
+    return n
+
+
+def clear_resolved() -> int:
+    """Delete only entries with a ``resolved_at`` set. Returns the count."""
+    with _lock:
+        entries = _read_all_unlocked()
+        kept = [e for e in entries if not e.get("resolved_at")]
+        removed = len(entries) - len(kept)
+        if removed:
+            _write_all_unlocked(kept)
+    return removed
 
 
 def clear() -> int:

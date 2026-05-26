@@ -1883,10 +1883,19 @@ def api_agents_promotion_candidates(limit: int = 50) -> dict[str, Any]:
 
 
 @app.get("/api/errors")
-def api_errors_list(limit: int = 200, severity: str | None = None) -> dict[str, Any]:
+def api_errors_list(
+    limit: int = 200,
+    severity: str | None = None,
+    include_resolved: bool = False,
+) -> dict[str, Any]:
+    # The UI defaults to hiding resolved rows so stale halts that have
+    # since recovered don't keep cluttering the page. Pass
+    # ``include_resolved=true`` to see the full audit trail.
     return {
         "counts": err_log.count_unresolved(),
-        "entries": err_log.list_errors(limit=limit, severity=severity),
+        "entries": err_log.list_errors(
+            limit=limit, severity=severity, include_resolved=include_resolved
+        ),
     }
 
 
@@ -1899,6 +1908,24 @@ def api_errors_markdown(limit: int = 50) -> dict[str, Any]:
 def api_errors_clear() -> dict[str, Any]:
     n = err_log.clear()
     return {"cleared": n}
+
+
+@app.post("/api/errors/clear_resolved")
+def api_errors_clear_resolved() -> dict[str, Any]:
+    n = err_log.clear_resolved()
+    return {"cleared": n}
+
+
+@app.post("/api/errors/{entry_id}/resolve")
+def api_errors_resolve(entry_id: str) -> dict[str, Any]:
+    ok = err_log.resolve(entry_id)
+    return {"ok": ok, "id": entry_id, "counts": err_log.count_unresolved()}
+
+
+@app.post("/api/errors/{entry_id}/unresolve")
+def api_errors_unresolve(entry_id: str) -> dict[str, Any]:
+    ok = err_log.unresolve(entry_id)
+    return {"ok": ok, "id": entry_id, "counts": err_log.count_unresolved()}
 
 
 # --------------------------------------------------------------------------

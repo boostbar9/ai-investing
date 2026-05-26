@@ -156,3 +156,77 @@ def test_corrupt_lines_are_skipped(isolated_log: Path) -> None:
     msgs = [e["message"] for e in entries]
     assert "good1" in msgs
     assert "good2" in msgs
+
+
+# --------------------------------------------------------------------------
+# Resolve / unresolve / clear_resolved
+# --------------------------------------------------------------------------
+
+
+def test_record_error_assigns_id_and_resolved_at(isolated_log: Path) -> None:
+    e = err_log.record_error(source="s", message="hello")
+    assert isinstance(e["id"], str) and len(e["id"]) == 12
+    assert e["resolved_at"] is None
+
+
+def test_resolve_toggles_resolved_at(isolated_log: Path) -> None:
+    e = err_log.record_error(source="paper_loop", message="halted")
+    entry_id = e["id"]
+    assert err_log.resolve(entry_id) is True
+    # Hidden by default
+    assert err_log.list_errors(include_resolved=False) == []
+    # Still present when include_resolved=True
+    visible = err_log.list_errors(include_resolved=True)
+    assert len(visible) == 1
+    assert visible[0]["resolved_at"] is not None
+    # Idempotent: resolving again is a no-op
+    assert err_log.resolve(entry_id) is False
+    # Missing id is also a no-op
+    assert err_log.resolve("deadbeef0000") is False
+
+
+def test_unresolve_reopens_entry(isolated_log: Path) -> None:
+    e = err_log.record_error(source="s", message="x")
+    err_log.resolve(e["id"])
+    assert err_log.unresolve(e["id"]) is True
+    # Now visible again with default filter
+    assert len(err_log.list_errors(include_resolved=False)) == 1
+    # Unresolving an already-active entry is a no-op
+    assert err_log.unresolve(e["id"]) is False
+
+
+def test_resolve_by_source_bulk_resolves(isolated_log: Path) -> None:
+    err_log.record_error(source="agents.research", message="all models failed 1")
+    err_log.record_error(source="agents.research", message="all models failed 2")
+    err_log.record_error(source="paper_loop", message="halted")
+    n = err_log.resolve_by_source("agents.research")
+    assert n == 2
+    active = err_log.list_errors(include_resolved=False)
+    # Only the paper_loop halt remains active
+    assert len(active) == 1
+    assert active[0]["source"] == "paper_loop"
+    # Re-running is a no-op (nothing left unresolved for that source)
+    assert err_log.resolve_by_source("agents.research") == 0
+
+
+def test_clear_resolved_keeps_active_rows(isolated_log: Path) -> None:
+    a = err_log.record_error(source="s", message="active")  # noqa: F841
+    b = err_log.record_error(source="s", message="resolved")
+    err_log.resolve(b["id"])
+    removed = err_log.clear_resolved()
+    assert removed == 1
+    remaining = err_log.list_errors(include_resolved=True)
+    assert len(remaining) == 1
+    assert remaining[0]["message"] == "active"
+
+
+def test_count_unresolved_filters_resolved(isolated_log: Path) -> None:
+    e1 = err_log.record_error(source="s", message="a", severity="error")
+    err_log.record_error(source="s", message="b", severity="error")
+    err_log.record_error(source="s", message="c", severity="warning")
+    err_log.resolve(e1["id"])
+    counts = err_log.count_unresolved()
+    # One error resolved, so error count drops from 2 to 1
+    assert counts["error"] == 1
+    assert counts["warning"] == 1
+    assert counts["total"] == 2
