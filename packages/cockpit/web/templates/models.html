@@ -9,7 +9,45 @@
   <link rel="stylesheet" href="/static/cockpit.css" />
   <script src="/static/cockpit.js" defer></script>
   <style>
-    .log-box { background: #050810; border: 1px solid #1f2937; border-radius: 8px; padding: 12px; max-height: 480px; overflow-y: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; color: #d1d5db; }
+    .log-box {
+      background: #050810;
+      border: 1px solid #1f2937;
+      border-radius: 8px;
+      padding: 10px 12px;
+      max-height: 520px;
+      min-height: 220px;
+      overflow-y: auto;
+      overflow-x: auto;
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #d1d5db;
+      scroll-behavior: smooth;
+    }
+    /* Use a real grid so very long lines don't push the gutter around. */
+    .log-line { display: grid; grid-template-columns: 56px 1fr; gap: 10px; padding: 1px 0; white-space: pre; }
+    .log-line.wrap { white-space: pre-wrap; word-break: break-word; }
+    .log-line .ln { color: #4b5563; text-align: right; user-select: none; font-variant-numeric: tabular-nums; }
+    .log-line .ts { color: #6b7280; }
+    .log-line .body { color: #d1d5db; }
+    .log-line.error  .body { color: #fca5a5; }
+    .log-line.warn   .body { color: #fcd34d; }
+    .log-line.info   .body { color: #93c5fd; }
+    .log-line.ok     .body { color: #6ee7b7; }
+    .log-line.muted  .body { color: #6b7280; }
+    .log-line.system { background: rgba(56, 189, 248, 0.06); }
+    .log-line.system .body { color: #7dd3fc; font-style: italic; }
+    .log-line.match  { background: rgba(250, 204, 21, 0.10); }
+    .log-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .log-toolbar input[type="search"] {
+      background: #0b1220; border: 1px solid #1f2937; border-radius: 6px;
+      padding: 4px 8px; font-size: 12px; color: #e5e7eb; min-width: 180px;
+    }
+    .log-toolbar input[type="search"]:focus { outline: none; border-color: #3b82f6; }
+    .log-meta { font-size: 11px; color: #6b7280; font-variant-numeric: tabular-nums; }
+    .log-follow-pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid #1f2937; color: #9ca3af; }
+    .log-follow-pill.on  { color: #6ee7b7; border-color: #064e3b; background: rgba(6, 78, 59, 0.25); }
+    .log-follow-pill.off { color: #fcd34d; border-color: #78350f; background: rgba(120, 53, 15, 0.25); cursor: pointer; }
     .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
   </style>
 </head>
@@ -114,25 +152,182 @@
 
     <section class="card p-5">
       <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
-        <div class="text-sm font-medium">Live log</div>
-        <div class="flex items-center gap-2">
-          <span class="text-xs text-gray-400">viewing:</span>
+        <div class="flex items-center gap-3">
+          <div class="text-sm font-medium">Live log</div>
+          <span id="log-follow-pill" class="log-follow-pill on" data-tt="Auto-scroll is on when you're at the bottom. Scroll up to pause; click to resume.">following</span>
+        </div>
+        <div class="log-toolbar">
+          <span class="text-xs text-gray-400">job:</span>
           <select id="log-pick" class="bg-gray-800 text-sm rounded px-2 py-1 border border-gray-700">
             <option value="pretrain">pretrain</option>
             <option value="retune_nightly">retune_nightly</option>
             <option value="retune_weekly">retune_weekly</option>
             <option value="ollama_setup">ollama_setup</option>
           </select>
-          <button id="clear-log" class="btn btn-ghost btn-sm">Clear view</button>
+          <input id="log-filter" type="search" placeholder="filter (regex ok)" autocomplete="off" data-tt="Hide lines that don't match. Supports plain text or /regex/ syntax." />
+          <button id="log-wrap" class="btn btn-ghost btn-sm" data-tt="Toggle word-wrap for long lines.">Wrap</button>
+          <button id="log-copy" class="btn btn-ghost btn-sm" data-tt="Copy visible lines to clipboard.">Copy</button>
+          <button id="log-download" class="btn btn-ghost btn-sm" data-tt="Download the full log file from the server.">Download</button>
+          <button id="clear-log" class="btn btn-ghost btn-sm" data-tt="Clear the on-screen view. Does not touch the file.">Clear view</button>
         </div>
       </div>
-      <div id="log" class="log-box">Pick a job and click Run to stream output here.</div>
+      <div id="log" class="log-box" tabindex="0" aria-live="polite" aria-atomic="false">Pick a job and click Run to stream output here.</div>
+      <div class="flex items-center justify-between mt-2">
+        <div class="log-meta"><span id="log-line-count">0</span> lines<span id="log-hidden"></span> &middot; <span id="log-rate">0</span>/s</div>
+        <div class="log-meta">cap 2,000 lines on screen &middot; file rotates at 2 MiB</div>
+      </div>
     </section>
   </div>
 
   <script>
     let currentSource = null;
     let currentKind = 'pretrain';
+    // ---- Log rendering ------------------------------------------------------
+    // Browser-side cap: the SSE stream can deliver tens of thousands of lines
+    // (long pretrain or chatty ollama_setup). Each line lives in its own DOM
+    // node so we can color/filter them, but we drop the oldest beyond LINE_CAP
+    // to keep the page snappy. The file on disk is the source of truth.
+    const LOG_LINE_CAP = 2000;
+    let logLineNo = 0;
+    let logHidden = 0;
+    let logFollow = true;
+    let logWrap = false;
+    let logFilterRe = null;
+    let logRecvWindow = []; // timestamps for rate calc
+
+    function classifyLine(text) {
+      // Strip ANSI escape sequences ollama / pip sometimes emit before classifying.
+      const clean = text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+      const lower = clean.toLowerCase();
+      if (clean.startsWith('===') && clean.endsWith('===')) return { cls: 'system', body: clean };
+      if (clean.startsWith('---') && clean.endsWith('---')) return { cls: 'system', body: clean };
+      if (clean.startsWith('[proc')) return { cls: 'system', body: clean };
+      if (/\b(error|exception|traceback|fatal|failed)\b/i.test(clean)) return { cls: 'error', body: clean };
+      if (/\b(warn(ing)?|deprecat)/i.test(clean)) return { cls: 'warn', body: clean };
+      if (/\b(success|done|ready|installed|pulled|complete)\b/i.test(lower)) return { cls: 'ok', body: clean };
+      if (/^(info|debug|trace)[:\s]/i.test(clean)) return { cls: 'info', body: clean };
+      if (clean.trim() === '') return { cls: 'muted', body: ' ' };
+      return { cls: '', body: clean };
+    }
+
+    function nowStamp() {
+      const d = new Date();
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
+      return `${hh}:${mm}:${ss}`;
+    }
+
+    function renderLine(logEl, text) {
+      logLineNo += 1;
+      logRecvWindow.push(performance.now());
+      const { cls, body } = classifyLine(text);
+      const row = document.createElement('div');
+      row.className = 'log-line' + (cls ? ' ' + cls : '') + (logWrap ? ' wrap' : '');
+      row.dataset.raw = text;
+      const gutter = document.createElement('span');
+      gutter.className = 'ln';
+      gutter.textContent = logLineNo;
+      const main = document.createElement('span');
+      main.className = 'body';
+      const ts = document.createElement('span');
+      ts.className = 'ts';
+      ts.textContent = nowStamp() + ' ';
+      main.appendChild(ts);
+      main.appendChild(document.createTextNode(body));
+      row.appendChild(gutter);
+      row.appendChild(main);
+      // Apply filter if active.
+      if (logFilterRe && !logFilterRe.test(text)) {
+        row.style.display = 'none';
+        logHidden += 1;
+      }
+      logEl.appendChild(row);
+      // Trim the oldest if we've exceeded the cap.
+      while (logEl.children.length > LOG_LINE_CAP) {
+        const drop = logEl.firstElementChild;
+        if (drop && drop.style.display === 'none') logHidden = Math.max(0, logHidden - 1);
+        logEl.removeChild(drop);
+      }
+      updateMeta();
+      if (logFollow) logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function resetLog() {
+      const logEl = document.getElementById('log');
+      logEl.textContent = '';
+      logLineNo = 0;
+      logHidden = 0;
+      logRecvWindow = [];
+      updateMeta();
+    }
+
+    function updateMeta() {
+      const lc = document.getElementById('log-line-count');
+      if (lc) lc.textContent = logLineNo.toLocaleString();
+      const hh = document.getElementById('log-hidden');
+      if (hh) hh.textContent = logHidden > 0 ? ` (${logHidden.toLocaleString()} hidden)` : '';
+      // Rate over last 5s.
+      const cutoff = performance.now() - 5000;
+      logRecvWindow = logRecvWindow.filter(t => t >= cutoff);
+      const rate = document.getElementById('log-rate');
+      if (rate) rate.textContent = (logRecvWindow.length / 5).toFixed(1);
+    }
+    setInterval(updateMeta, 1000);
+
+    function setFollow(on) {
+      logFollow = on;
+      const pill = document.getElementById('log-follow-pill');
+      if (!pill) return;
+      pill.className = 'log-follow-pill ' + (on ? 'on' : 'off');
+      pill.textContent = on ? 'following' : 'paused (click to resume)';
+    }
+
+    function applyFilter(value) {
+      logHidden = 0;
+      if (!value) {
+        logFilterRe = null;
+      } else {
+        try {
+          if (value.startsWith('/') && value.lastIndexOf('/') > 0) {
+            const last = value.lastIndexOf('/');
+            logFilterRe = new RegExp(value.slice(1, last), value.slice(last + 1) || 'i');
+          } else {
+            logFilterRe = new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+          }
+        } catch (e) {
+          logFilterRe = null;
+        }
+      }
+      const logEl = document.getElementById('log');
+      Array.from(logEl.children).forEach(row => {
+        const raw = row.dataset.raw || row.textContent;
+        const show = !logFilterRe || logFilterRe.test(raw);
+        row.style.display = show ? '' : 'none';
+        if (!show) logHidden += 1;
+      });
+      updateMeta();
+    }
+
+    function copyVisible() {
+      const logEl = document.getElementById('log');
+      const lines = Array.from(logEl.children)
+        .filter(r => r.style.display !== 'none')
+        .map(r => r.dataset.raw || r.textContent);
+      navigator.clipboard.writeText(lines.join('\n')).then(
+        () => Cockpit.toastSuccess(`Copied ${lines.length.toLocaleString()} lines`),
+        () => Cockpit.toastError('Copy failed')
+      );
+    }
+
+    function downloadFullLog() {
+      const a = document.createElement('a');
+      a.href = `/api/jobs/${currentKind}/log?download=1`;
+      a.download = `${currentKind}.log`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
 
     function pill(kind, label, cls) {
       const el = document.getElementById('pill-' + kind);
@@ -195,15 +390,14 @@
     function switchStream(kind) {
       currentKind = kind;
       const logEl = document.getElementById('log');
-      logEl.textContent = '';
+      resetLog();
       if (currentSource) { try { currentSource.close(); } catch (e) {} }
       currentSource = new EventSource(`/api/jobs/${kind}/stream`);
       currentSource.onmessage = (e) => {
-        logEl.textContent += e.data + '\n';
-        logEl.scrollTop = logEl.scrollHeight;
+        renderLine(logEl, e.data);
       };
       currentSource.addEventListener('end', () => {
-        logEl.textContent += '\n--- job finished ---\n';
+        renderLine(logEl, '--- job finished ---');
         refreshStatus();
         currentSource.close();
       });
@@ -294,10 +488,36 @@
       document.querySelectorAll('[data-start]').forEach(b => b.addEventListener('click', () => start(b.dataset.start)));
       document.querySelectorAll('[data-stop]').forEach(b => b.addEventListener('click', () => stop(b.dataset.stop)));
       document.getElementById('log-pick').addEventListener('change', e => switchStream(e.target.value));
-      document.getElementById('clear-log').addEventListener('click', () => { document.getElementById('log').textContent = ''; });
+      document.getElementById('clear-log').addEventListener('click', resetLog);
       document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
       document.getElementById('ollama-setup-btn').addEventListener('click', startOllamaSetup);
       document.getElementById('ollama-stop-btn').addEventListener('click', stopOllamaSetup);
+
+      const logEl = document.getElementById('log');
+      // Smart auto-follow: pause when the user scrolls up, resume on click of the pill
+      // or when they scroll back to within 24px of the bottom.
+      logEl.addEventListener('scroll', () => {
+        const nearBottom = (logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight) < 24;
+        if (nearBottom && !logFollow) setFollow(true);
+        else if (!nearBottom && logFollow) setFollow(false);
+      });
+      document.getElementById('log-follow-pill').addEventListener('click', () => {
+        setFollow(true);
+        logEl.scrollTop = logEl.scrollHeight;
+      });
+      document.getElementById('log-wrap').addEventListener('click', () => {
+        logWrap = !logWrap;
+        document.getElementById('log-wrap').classList.toggle('btn-primary', logWrap);
+        Array.from(logEl.children).forEach(r => r.classList.toggle('wrap', logWrap));
+      });
+      document.getElementById('log-copy').addEventListener('click', copyVisible);
+      document.getElementById('log-download').addEventListener('click', downloadFullLog);
+      const filterEl = document.getElementById('log-filter');
+      let filterTimer = null;
+      filterEl.addEventListener('input', () => {
+        clearTimeout(filterTimer);
+        filterTimer = setTimeout(() => applyFilter(filterEl.value.trim()), 120);
+      });
 
       refreshStatus();
       switchStream(currentKind);

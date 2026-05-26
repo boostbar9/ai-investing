@@ -1422,3 +1422,43 @@ def test_jinja_comments_are_stripped_from_rendered_html(client: TestClient) -> N
         assert "Brand icons + social preview" not in body, (
             f"{path} leaked the head_icons doc-comment"
         )
+
+
+def test_job_log_download_returns_full_file(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GET /api/jobs/<kind>/log?download=1`` streams the raw file so the
+    cockpit UI can offer a Download button on the Models page. The default
+    (no query string) keeps returning the JSON tail used by polling code.
+    """
+    from packages.cockpit import proc as proc_mod
+
+    log = tmp_path / "pretrain.log"
+    log.write_text("line one\nline two\nline three\n", encoding="utf-8")
+    monkeypatch.setattr(proc_mod, "LOG_DIR", tmp_path)
+
+    # JSON tail (default).
+    r = client.get("/api/jobs/pretrain/log")
+    assert r.status_code == 200
+    assert "line three" in r.json()["tail"]
+
+    # Full file download.
+    r = client.get("/api/jobs/pretrain/log?download=1")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert "line one" in r.text
+    assert "line three" in r.text
+
+
+def test_job_log_download_handles_missing_file(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If a job has never run, the download endpoint returns a friendly
+    placeholder instead of a 500. Keeps the UI button safe to click.
+    """
+    from packages.cockpit import proc as proc_mod
+
+    monkeypatch.setattr(proc_mod, "LOG_DIR", tmp_path)
+    r = client.get("/api/jobs/pretrain/log?download=1")
+    assert r.status_code == 200
+    assert "no log yet" in r.text

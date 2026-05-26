@@ -35,7 +35,14 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from pydantic import BaseModel
 
 from packages.cockpit import diagnostics, paper_autopilot, updater, watchdog
@@ -764,7 +771,22 @@ def api_job(kind: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{kind}/log")
-def api_job_log(kind: str) -> dict[str, Any]:
+def api_job_log(kind: str, download: int = 0) -> Any:
+    """Return the tail of the job log as JSON, or the full file as a download.
+
+    The cockpit UI uses JSON for the on-page snapshot but offers a Download
+    button that hits this same endpoint with ``?download=1`` to grab the
+    complete file (up to whatever the on-disk rotation has kept).
+    """
+    if download:
+        path = job_mgr.log_path(kind)
+        if not path.exists():
+            return PlainTextResponse("(no log yet)", media_type="text/plain")
+        return FileResponse(
+            path,
+            media_type="text/plain",
+            filename=f"{kind}.log",
+        )
     return {"kind": kind, "tail": job_mgr.tail_log(kind)}
 
 

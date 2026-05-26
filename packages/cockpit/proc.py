@@ -39,6 +39,13 @@ STATE_FILE: Final[Path] = REPO_ROOT / "data" / "cockpit" / "procs.json"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
+# Log rotation: when the active log exceeds ``MAX_LOG_BYTES``, the current
+# file is moved to ``<kind>.log.1`` (overwriting any previous archive) and a
+# fresh empty file is opened. We keep exactly one archive so a runaway job
+# can't fill the disk with a year of pretrain output, while still preserving
+# enough history to inspect what happened right before the rotation.
+MAX_LOG_BYTES: Final[int] = 2 * 1024 * 1024  # 2 MiB
+
 
 @dataclass
 class JobInfo:
@@ -348,6 +355,37 @@ def describe_exit(kind: str, rc: int | None) -> str:
     return f"{kind} exited with code {rc}"
 
 
+def _rotate_if_needed(log_path: Path, max_bytes: int = MAX_LOG_BYTES) -> bool:
+    """Rotate ``log_path`` to ``<path>.1`` if it has exceeded ``max_bytes``.
+
+    Returns ``True`` if a rotation occurred. The archive is overwritten on
+    every rotation, so we keep exactly one previous generation. Tail readers
+    re-open the file after rotation transparently because they re-stat the
+    path on every poll.
+    """
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return False
+    if size < max_bytes:
+        return False
+    archive = log_path.with_suffix(log_path.suffix + ".1")
+    try:
+        if archive.exists():
+            archive.unlink()
+        log_path.rename(archive)
+    except OSError:
+        return False
+    # Drop a marker so the operator knows where output continues from.
+    with contextlib.suppress(OSError):
+        log_path.write_text(
+            f"=== log rotated at {datetime.now(UTC).isoformat(timespec='seconds')} "
+            f"(previous {size:,} bytes saved to {archive.name}) ===\n",
+            encoding="utf-8",
+        )
+    return True
+
+
 def _tee_output(kind: str, proc: subprocess.Popen, log_path: Path) -> None:
     """Stream a child's stdout into ``log_path`` in 4 KiB chunks.
 
@@ -355,19 +393,31 @@ def _tee_output(kind: str, proc: subprocess.Popen, log_path: Path) -> None:
     rogue non-UTF-8 byte from a native library never crashes the tee. We
     write in append mode (the diagnostic header was already written by
     :func:`start`), and flush on every write so the cockpit UI tail sees
-    output immediately.
+    output immediately. After every chunk we check whether the file has
+    exceeded ``MAX_LOG_BYTES`` and rotate so a long-running pretrain or
+    chatty ollama_setup can't grow the log file without bound.
     """
     stream = proc.stdout
     if stream is None:
         return
     try:
-        with log_path.open("a", encoding="utf-8", buffering=1) as sink:
+        sink = log_path.open("a", encoding="utf-8", buffering=1)
+        try:
             while True:
                 chunk = stream.read(4096)
                 if not chunk:
                     break
                 sink.write(chunk.decode("utf-8", errors="replace"))
                 sink.flush()
+                if _rotate_if_needed(log_path):
+                    # The file we have open is now the archive; re-open the
+                    # active log so subsequent writes go to the fresh file.
+                    with contextlib.suppress(Exception):
+                        sink.close()
+                    sink = log_path.open("a", encoding="utf-8", buffering=1)
+        finally:
+            with contextlib.suppress(Exception):
+                sink.close()
     except Exception as exc:  # pragma: no cover - defensive
         with contextlib.suppress(OSError):
             log_path.open("a", encoding="utf-8").write(
