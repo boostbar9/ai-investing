@@ -72,6 +72,78 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# IWR + write-progress in a piped/headless host throttles downloads to a
+# crawl (sometimes <50 KB/s). Killing the progress preference here makes
+# Invoke-WebRequest run at full speed even when we DO use it as a fallback.
+$ProgressPreference = "SilentlyContinue"
+
+function Invoke-FastDownload {
+    <#
+      Headless-friendly downloader with live progress.
+
+      Streams the response to disk in 256 KB chunks and emits a single
+      progress line every ~2 s to stdout so the cockpit log shows the
+      download moving. PowerShell's IWR with -UseBasicParsing buffers
+      the entire body in memory and emits nothing to stdout, which is
+      why earlier runs of this script went silent for minutes on a 73 MB
+      download.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$OutFile
+    )
+    Add-Type -AssemblyName System.Net.Http
+    $handler = New-Object System.Net.Http.HttpClientHandler
+    $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+    $client = New-Object System.Net.Http.HttpClient($handler)
+    $client.Timeout = [TimeSpan]::FromMinutes(30)
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd("ai-investing-installer/1.0")
+    try {
+        $resp = $client.GetAsync($Uri, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        if (-not $resp.IsSuccessStatusCode) {
+            throw "HTTP $([int]$resp.StatusCode) $($resp.ReasonPhrase) for $Uri"
+        }
+        $total = $resp.Content.Headers.ContentLength
+        $totalMB = if ($total) { [math]::Round($total / 1MB, 1) } else { $null }
+        $inStream = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        $outStream = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        try {
+            $buf = New-Object byte[] 262144  # 256 KB chunks
+            $read = 0
+            [long]$bytes = 0
+            $lastReport = [DateTime]::UtcNow
+            $startedAt  = [DateTime]::UtcNow
+            while (($read = $inStream.Read($buf, 0, $buf.Length)) -gt 0) {
+                $outStream.Write($buf, 0, $read)
+                $bytes += $read
+                $now = [DateTime]::UtcNow
+                if (($now - $lastReport).TotalSeconds -ge 2) {
+                    $mb = [math]::Round($bytes / 1MB, 1)
+                    $elapsed = ($now - $startedAt).TotalSeconds
+                    $rate = if ($elapsed -gt 0) { [math]::Round(($bytes / 1MB) / $elapsed, 2) } else { 0 }
+                    if ($totalMB) {
+                        $pct = [math]::Round(($bytes / [double]$total) * 100, 1)
+                        Write-Host ("  [dl] {0,5:N1} / {1,5:N1} MB ({2,4:N1} %) @ {3,5:N2} MB/s" -f $mb, $totalMB, $pct, $rate)
+                    } else {
+                        Write-Host ("  [dl] {0,5:N1} MB @ {1,5:N2} MB/s" -f $mb, $rate)
+                    }
+                    $lastReport = $now
+                }
+            }
+            $totalElapsed = ([DateTime]::UtcNow - $startedAt).TotalSeconds
+            $finalMB = [math]::Round($bytes / 1MB, 1)
+            $finalRate = if ($totalElapsed -gt 0) { [math]::Round(($bytes / 1MB) / $totalElapsed, 2) } else { 0 }
+            Write-Host ("  [dl] done: {0:N1} MB in {1:N1}s ({2:N2} MB/s avg)" -f $finalMB, $totalElapsed, $finalRate)
+        } finally {
+            $outStream.Dispose()
+            $inStream.Dispose()
+        }
+    } finally {
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
 function Write-Step {
     param([string]$Message)
     Write-Host ""
@@ -223,7 +295,15 @@ if (-not $tempArchive) {
     Write-Host "  Asset:   $($asset.name) ($([math]::Round($asset.size / 1MB, 1)) MB)"
     Write-Host "  Saving to: $tempArchive"
 
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tempArchive -UseBasicParsing
+    try {
+        Invoke-FastDownload -Uri $asset.browser_download_url -OutFile $tempArchive
+    } catch {
+        Write-Fail "Download failed: $($_.Exception.Message)"
+        Write-Host "  Retry the cockpit Fix GPU button, or download manually from"
+        Write-Host "  https://github.com/likelovewant/ollama-for-amd/releases"
+        Write-Host "  to $tempArchive and re-run with -SkipDownload."
+        exit 1
+    }
     Write-Ok "Download complete"
 }
 
@@ -271,8 +351,7 @@ if ($tempArchiveExt -eq ".zip") {
         Write-Host "  No 7-Zip found locally -- downloading standalone 7zr.exe (~600 KB)"
         $sevenZip = Join-Path $env:TEMP "7zr.exe"
         try {
-            Invoke-WebRequest -Uri "https://www.7-zip.org/a/7zr.exe" `
-                              -OutFile $sevenZip -UseBasicParsing
+            Invoke-FastDownload -Uri "https://www.7-zip.org/a/7zr.exe" -OutFile $sevenZip
             Write-Ok "Fetched 7zr.exe"
         } catch {
             Write-Fail "Couldn't fetch 7zr.exe: $($_.Exception.Message)"

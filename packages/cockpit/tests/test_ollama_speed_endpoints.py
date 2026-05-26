@@ -161,6 +161,18 @@ def test_gpu_fix_status_returns_idle_shape() -> None:
     assert body["kind"] == srv.OLLAMA_GPU_FIX_KIND
 
 
+def test_gpu_fix_stop_returns_job_status_shape() -> None:
+    """/api/ollama/gpu_fix/stop must always return a job-status dict so
+    the cockpit JS can branch on .running without crashing, even when no
+    job has ever been started."""
+    client = TestClient(srv.app)
+    r = client.post("/api/ollama/gpu_fix/stop")
+    assert r.status_code == 200
+    body = r.json()
+    assert "running" in body
+    assert body["kind"] == srv.OLLAMA_GPU_FIX_KIND
+
+
 def test_warmup_status_and_gpu_fix_paths_are_quiet() -> None:
     """The two new poll endpoints must be in the uvicorn quiet list so the
     UI's 1\u20133s polling doesn't flood the log buffer (which we already saw

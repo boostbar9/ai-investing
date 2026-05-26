@@ -1135,6 +1135,14 @@ def api_ollama_gpu_fix_status() -> dict[str, Any]:
     return job_mgr.status(OLLAMA_GPU_FIX_KIND).to_dict()
 
 
+@app.post("/api/ollama/gpu_fix/stop")
+def api_ollama_gpu_fix_stop() -> dict[str, Any]:
+    """Cancel an in-flight GPU fix. Useful if the download stalls or the
+    user picked the button by accident — the script is mostly idempotent
+    (env vars are already set on a re-run; backup is timestamped)."""
+    return job_mgr.stop(OLLAMA_GPU_FIX_KIND).to_dict()
+
+
 @app.post("/api/ollama/warmup")
 async def api_ollama_warmup() -> dict[str, Any]:
     """Pre-load each declared model into memory so the first user-facing

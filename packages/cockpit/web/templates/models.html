@@ -97,6 +97,7 @@
           <button id="ollama-setup-btn" class="btn btn-primary" data-tt="Starts the daemon (if needed) and downloads any missing models. Streams progress to the log below.">Auto-setup</button>
           <button id="ollama-warmup-btn" class="btn btn-ghost" data-tt="Pre-load every declared model into memory now so the first Run is fast.">Warm models</button>
           <button id="ollama-gpu-fix-btn" class="btn btn-ghost" data-tt="Windows + AMD RDNA3 only: install ROCm DLLs, set env vars, restart daemon, verify GPU." style="display:none">Fix GPU</button>
+          <button id="ollama-gpu-fix-stop-btn" class="btn btn-danger" data-tt="Cancel the in-flight GPU fix. Safe to retry afterward — env vars are already set and the backup is timestamped." style="display:none">Stop GPU fix</button>
           <button id="ollama-stop-btn" class="btn btn-danger" data-tt="Stops the setup process. The daemon itself keeps running." style="display:none">Stop</button>
         </div>
       </div>
@@ -553,9 +554,40 @@
         Cockpit.toastSuccess('GPU fix started — streaming to log');
         document.getElementById('log-pick').value = 'ollama_gpu_fix';
         switchStream('ollama_gpu_fix');
+        refreshGpuFixJob();
       } catch (e) {
         Cockpit.toastError('GPU fix failed to start: ' + (e.message || 'see /api/ollama/gpu_fix'));
       }
+    }
+
+    async function stopGpuFix() {
+      if (!confirm('Cancel the in-flight GPU fix? The script is mostly idempotent — you can re-run safely.')) return;
+      try {
+        await Cockpit.api.post('/api/ollama/gpu_fix/stop', {});
+        Cockpit.toastSuccess('GPU fix cancelled');
+        refreshGpuFixJob();
+      } catch (e) {
+        Cockpit.toastError('Stop failed: ' + e.message);
+      }
+    }
+
+    // Poll the GPU-fix job status so the Stop button appears whenever the
+    // script is running and disappears when it finishes (success, error, or
+    // cancelled). Cheap GET; quiet-pathed on the server side.
+    async function refreshGpuFixJob() {
+      const fixBtn = document.getElementById('ollama-gpu-fix-btn');
+      const stopBtn = document.getElementById('ollama-gpu-fix-stop-btn');
+      try {
+        const j = await Cockpit.api.get('/api/ollama/gpu_fix');
+        if (j && j.running) {
+          fixBtn.style.display = 'none';
+          stopBtn.style.display = '';
+        } else {
+          stopBtn.style.display = 'none';
+          // Don't force-show the Fix GPU button here — the backend pill's
+          // refresh decides that based on platform + CPU detection.
+        }
+      } catch (e) { /* benign */ }
     }
 
     async function startOllamaSetup() {
@@ -592,6 +624,7 @@
       document.getElementById('ollama-stop-btn').addEventListener('click', stopOllamaSetup);
       document.getElementById('ollama-warmup-btn').addEventListener('click', startManualWarmup);
       document.getElementById('ollama-gpu-fix-btn').addEventListener('click', startGpuFix);
+      document.getElementById('ollama-gpu-fix-stop-btn').addEventListener('click', stopGpuFix);
 
       const logEl = document.getElementById('log');
       // Smart auto-follow: pause when the user scrolls up, resume on click of the pill
@@ -626,6 +659,7 @@
       Cockpit.poll(refreshTopbar, 5000, { name: 'topbar' });
       Cockpit.poll(refreshOllama, 4000, { name: 'ollama' });
       Cockpit.poll(refreshOllamaBackendAndWarmup, 4000, { name: 'ollama-accel' });
+      Cockpit.poll(refreshGpuFixJob, 3000, { name: 'gpu-fix-job' });
     });
   </script>
 </body>
