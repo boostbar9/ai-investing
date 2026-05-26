@@ -45,6 +45,9 @@ from packages.execution.broker import (
     OrderRequest,
 )
 from packages.paper.streak import compute_paper_streak
+from packages.persistence import connect as _db_connect
+from packages.persistence import insert_cycle as _db_insert_cycle
+from packages.persistence import write_snapshot as _write_snapshot
 from packages.regime.ensemble import (
     RegimeGatedEnsemble,
     RegimeWeights,
@@ -349,6 +352,14 @@ def log_run(record: dict[str, Any]) -> None:
     PAPER_LOG_DIR.mkdir(parents=True, exist_ok=True)
     with PAPER_LOG_FILE.open("a") as f:
         f.write(json.dumps(record, default=str) + "\n")
+    # Dual-write to SQLite (best-effort). JSONL remains the source of truth
+    # during this transition; the SQL mirror unlocks queryable history.
+    if os.getenv("COCKPIT_DB_DUAL_WRITE", "1") != "0":
+        try:
+            with _db_connect() as conn:
+                _db_insert_cycle(conn, record)
+        except Exception as e:  # pragma: no cover - never let SQL break the loop
+            log.warning("sqlite cycle insert failed: %s", e)
 
 
 async def run(
@@ -466,9 +477,27 @@ async def run(
 
         # Filter target weights by the symbols the risk agent approved.
         approved_syms = {s.symbol for s in agent_result.risk.approved}
+
+        # LLM-chosen target weights: if a strategy signal carries a
+        # non-null ``target_weight``, prefer it over the rule-based value
+        # (only for approved symbols). Caps below still clip the result.
+        # Sign must agree with side; mismatched signs are dropped to
+        # avoid incoherent intent (already validated by risk prompt).
+        llm_weights: dict[str, float] = {}
+        for s in agent_result.risk.approved:
+            if s.target_weight is None:
+                continue
+            tw = float(s.target_weight)
+            expected_sign = 1.0 if s.side == "buy" else -1.0
+            if tw == 0.0 or (tw > 0) != (expected_sign > 0):
+                continue  # incoherent; defer to rule-based path
+            llm_weights[s.symbol] = tw
+        if llm_weights:
+            log.info("LLM target_weights override: %s", llm_weights)
+
         if approved_syms:
             target = {
-                sym: (w if sym in approved_syms else 0.0)
+                sym: (llm_weights.get(sym, w) if sym in approved_syms else 0.0)
                 for sym, w in target.items()
             }
             log.info("agent-approved symbols: %s", sorted(approved_syms))
@@ -529,10 +558,12 @@ async def run(
         # Refresh the §16 streak snapshot AFTER appending this run so the
         # dashboard always sees the latest day. Best-effort: a failure here
         # must not poison the actual run record.
+        streak_dict: dict[str, Any] = {}
         try:
             streak = compute_paper_streak()
+            streak_dict = streak.to_dict()
             (PAPER_LOG_DIR / "streak.json").write_text(
-                json.dumps(streak.to_dict(), indent=2, default=str)
+                json.dumps(streak_dict, indent=2, default=str)
             )
             log.info(
                 "§16 streak: %d/%d clean paper days (longest %d)",
@@ -542,6 +573,22 @@ async def run(
             )
         except Exception as e:
             log.warning("could not refresh paper streak: %s", e)
+        # Per-cycle snapshot: atomic JSON the cockpit reads on boot so the
+        # dashboard isn't blank until the next cycle fires (§17, task 8).
+        try:
+            _write_snapshot(
+                equity=record.get("account_equity"),
+                buying_power=record.get("account_buying_power"),
+                target_weights=record.get("target_weights"),
+                streak=streak_dict,
+                strategy=strategy_name,
+                extras={
+                    "halted": record.get("halted", False),
+                    "decision_id": record.get("agent_decision_id"),
+                },
+            )
+        except Exception as e:  # pragma: no cover - never let snapshot break the loop
+            log.warning("could not write cycle snapshot: %s", e)
         return record
     finally:
         await broker.aclose()

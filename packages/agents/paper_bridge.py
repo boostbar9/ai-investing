@@ -102,6 +102,10 @@ def make_strategy_agent(target_weights: dict[str, float]) -> Any:
                     side=side,
                     strength=min(1.0, abs(w)),
                     rationale=f"target_weight={w:.4f}",
+                    # Mirror the deterministic weight onto the signal so
+                    # downstream sizing (LLM or rule-based) sees the same
+                    # value. Clipped to [-1, 1] defensively.
+                    target_weight=max(-1.0, min(1.0, float(w))),
                 )
             )
         return StrategyOutput(decision_id=inp.decision_id, signals=signals)

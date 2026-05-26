@@ -205,6 +205,13 @@ RATIONALE RULE: every signal's rationale MUST name at least one feature
 key from the `features` dict (e.g. "mom_12_1=0.18 + sentiment=0.42").
 Signals without grounded rationales will be rejected by Risk.
 
+SIZING (optional but recommended): you may set `target_weight` per signal
+in [-1, 1] to express your *portfolio weight conviction*. Sign must match
+side (buy => positive, sell => negative). Risk caps each name at 25% and
+each sector at 40%, so prefer |target_weight| in [0.02, 0.15] -- small,
+diversified, evidence-grounded. Skip the field if you have no opinion;
+the deterministic Kelly-based sizer will fall back automatically.
+
 INPUT:
 {payload.model_dump_json()}
 
@@ -242,8 +249,11 @@ CHECKLIST per candidate:
         c. crisis regime is in force (you should see no candidates);
         d. > 50% of candidates fail their own rationale gate.
 
-NEVER invent position sizes — sizing is computed downstream from the
-Kelly * regime_mult * vol_target / realized_vol formula.
+SIZING NOTE: signals may carry a Strategy-chosen `target_weight` in
+[-1, 1]. You DO NOT need to validate the magnitude (downstream caps it),
+but if a signal's target_weight has the wrong SIGN for its side, reject
+it (incoherent intent). If target_weight is null/missing, the Kelly *
+regime_mult * vol_target / realized_vol formula sizes it deterministically.
 
 INPUT:
 {payload.model_dump_json()}

@@ -43,6 +43,13 @@ def fake_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     ]
     log.write_text("\n".join(json.dumps(r) for r in runs) + "\n")
     monkeypatch.setattr(srv, "PAPER_LOG", log)
+    # The cockpit's latest_account_snapshot prefers data/cockpit/snapshot.json
+    # when it exists (§17 fast path). Redirect that lookup to a missing tmp
+    # path so tests continue to drive their assertions off the JSONL fixture.
+    snap_path = tmp_path / "snapshot.json"
+    import packages.persistence.snapshot as snap_mod
+    monkeypatch.setattr(snap_mod, "SNAPSHOT_PATH", snap_path)
+    monkeypatch.setattr(snap_mod.load_snapshot, "__defaults__", (snap_path,))
     return log
 
 
@@ -684,6 +691,11 @@ def test_state_endpoint_handles_empty_log(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.setattr(srv, "PAPER_LOG", empty)
     from packages.cockpit import state as st
     monkeypatch.setattr(st, "STATE_PATH", tmp_path / "state.json")
+    # Also redirect the snapshot fast-path away from the real on-disk snapshot.
+    import packages.persistence.snapshot as snap_mod
+    snap_path = tmp_path / "snapshot.json"
+    monkeypatch.setattr(snap_mod, "SNAPSHOT_PATH", snap_path)
+    monkeypatch.setattr(snap_mod.load_snapshot, "__defaults__", (snap_path,))
 
     with TestClient(srv.app) as c:
         r = c.get("/api/state")

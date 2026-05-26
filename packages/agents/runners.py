@@ -33,6 +33,7 @@ from packages.agents.prompts import (
     risk_prompt,
     strategy_prompt,
 )
+from packages.persistence.audit import log_decision
 from packages.shared.otel import span
 from packages.shared.schemas import (
     DiscoveryInput,
@@ -152,6 +153,11 @@ async def _run(
         except LLMError as e:
             log.warning("agent %s LLM chain failed (will retry once): %s", agent, e)
             s.set_attribute("agent.retry_reason", "llm_error")
+            log_decision(
+                decision_id=decision_id_str, agent=agent, attempt=1,
+                prompt=prompt, raw_response=None,
+                validation_ok=False, validation_error=f"llm_error: {e}",
+            )
             try:
                 raw = await router.generate_json(
                     agent=agent,
@@ -161,17 +167,33 @@ async def _run(
             except LLMError as e2:
                 log.warning("agent %s LLM retry also failed: %s", agent, e2)
                 s.set_attribute("agent.fallback", "llm_error")
+                log_decision(
+                    decision_id=decision_id_str, agent=agent, attempt=2,
+                    prompt=prompt, raw_response=None,
+                    validation_ok=False, validation_error=f"llm_error: {e2}",
+                    extra={"fallback": "llm_error"},
+                )
                 return safe_default(payload)
 
         # Trust server-side decision_id; never accept the model's value.
         raw["decision_id"] = decision_id_str
         try:
-            return output_model.model_validate(raw)
+            out = output_model.model_validate(raw)
+            log_decision(
+                decision_id=decision_id_str, agent=agent, attempt=1,
+                prompt=prompt, raw_response=raw, validation_ok=True,
+            )
+            return out
         except ValidationError as e:
             log.warning(
                 "agent %s invalid JSON (will retry once with repair hint): %s", agent, e
             )
             s.set_attribute("agent.retry_reason", "validation_error")
+            log_decision(
+                decision_id=decision_id_str, agent=agent, attempt=1,
+                prompt=prompt, raw_response=raw,
+                validation_ok=False, validation_error=str(e),
+            )
             # ---- Attempt 2 (validation repair) -----------------------------
             repair_prompt = prompt + "\n\n" + _validation_repair_hint(e, output_model)
             try:
@@ -183,16 +205,33 @@ async def _run(
             except LLMError as e_llm:
                 log.warning("agent %s repair retry LLM error: %s", agent, e_llm)
                 s.set_attribute("agent.fallback", "llm_error_on_repair")
+                log_decision(
+                    decision_id=decision_id_str, agent=agent, attempt=2,
+                    prompt=repair_prompt, raw_response=None,
+                    validation_ok=False, validation_error=f"llm_error: {e_llm}",
+                    extra={"fallback": "llm_error_on_repair"},
+                )
                 return safe_default(payload)
             raw2["decision_id"] = decision_id_str
             try:
                 out = output_model.model_validate(raw2)
                 s.set_attribute("agent.recovered_via_repair", True)
                 log.info("agent %s recovered via repair retry", agent)
+                log_decision(
+                    decision_id=decision_id_str, agent=agent, attempt=2,
+                    prompt=repair_prompt, raw_response=raw2, validation_ok=True,
+                    extra={"recovered_via_repair": True},
+                )
                 return out
             except ValidationError as e2:
                 log.warning("agent %s repair retry still invalid: %s", agent, e2)
                 s.set_attribute("agent.fallback", "validation_error")
+                log_decision(
+                    decision_id=decision_id_str, agent=agent, attempt=2,
+                    prompt=repair_prompt, raw_response=raw2,
+                    validation_ok=False, validation_error=str(e2),
+                    extra={"fallback": "validation_error"},
+                )
                 return safe_default(payload)
 
 

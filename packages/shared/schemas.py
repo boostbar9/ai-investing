@@ -44,6 +44,12 @@ class Signal(BaseModel):
     side: Side
     strength: float = Field(ge=0.0, le=1.0)
     rationale: str
+    # Optional LLM-chosen target portfolio weight in [-1, 1]. Sign should
+    # agree with ``side`` (buy => positive, sell => negative). When set,
+    # the downstream risk engine clips it against per-name and per-sector
+    # caps; when unset, sizing falls back to the rule-based path so this
+    # is fully backwards-compatible.
+    target_weight: float | None = Field(default=None, ge=-1.0, le=1.0)
 
 
 class StrategyOutput(BaseModel):

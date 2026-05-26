@@ -291,10 +291,28 @@ def read_runs(limit: int | None = None) -> list[dict[str, Any]]:
 def latest_account_snapshot() -> dict[str, Any]:
     """Pull the most recent equity/buying-power snapshot recorded by the paper runner.
 
-    The runner writes a record per invocation; we surface the latest one. Cash
-    and day-PnL aren't currently logged, so they come back as ``None`` until
-    the runner is extended.
+    Fast path: ``data/cockpit/snapshot.json`` is rewritten atomically after
+    every cycle, so the dashboard has equity/streak the moment the cockpit
+    boots even before any new run fires (§17, task 5/8). Falls back to the
+    JSONL run log if the snapshot file is missing or stale.
     """
+    # Fast path: the cycle snapshot.
+    try:
+        from packages.persistence import load_snapshot as _load_snapshot
+        snap = _load_snapshot()
+    except Exception:  # pragma: no cover - import guard
+        snap = None
+    if snap:
+        return {
+            "equity": snap.get("equity"),
+            "cash": snap.get("cash"),
+            "buying_power": snap.get("buying_power"),
+            "day_pnl": snap.get("day_pnl"),
+            "as_of": snap.get("ts"),
+            "strategy": snap.get("strategy"),
+            "halted": snap.get("halted"),
+        }
+    # Fallback: scan the JSONL log (slower, but works pre-snapshot).
     runs = read_runs(limit=1)
     if not runs:
         return {
@@ -999,23 +1017,71 @@ async def _warmup_models() -> dict[str, Any]:
     """
     import httpx as _httpx
 
-    from tools.check_ollama import status_snapshot
+    from tools.check_ollama import ensure_daemon, pull_model, status_snapshot
 
     _WARMUP_STATE["started_at"] = time.time()
     _WARMUP_STATE["finished_at"] = None
     _WARMUP_STATE["in_progress"] = True
     _WARMUP_STATE["results"] = []
 
+    # Auto-start the Ollama daemon if it's not already running. Honors
+    # COCKPIT_OLLAMA_AUTO_START (default on). Set to 0 to keep startup
+    # idempotent on machines where the daemon is managed by systemd.
     snap = status_snapshot()
     host = snap.get("host") or "http://127.0.0.1:11434"
+    if not snap.get("daemon_alive") and os.environ.get(
+        "COCKPIT_OLLAMA_AUTO_START", "1"
+    ) in ("1", "true", "True"):
+        log.info("Ollama daemon not running; attempting auto-start")
+        try:
+            started = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: ensure_daemon(host, verbose=False)
+            )
+            if started:
+                log.info("Ollama daemon auto-started")
+                snap = status_snapshot()
+            else:
+                log.warning("Ollama auto-start failed; warmup will be skipped")
+        except Exception as e:
+            log.warning("Ollama auto-start error: %s", e)
+
     if not snap.get("daemon_alive"):
         _WARMUP_STATE["in_progress"] = False
         _WARMUP_STATE["finished_at"] = time.time()
         return {
             "ok": False,
-            "error": "Ollama daemon not running",
+            "error": "Ollama daemon not running (auto-start failed; set COCKPIT_OLLAMA_AUTO_START=0 to suppress this attempt)",
             "results": [],
         }
+
+    # Auto-pull missing models if COCKPIT_OLLAMA_AUTO_PULL is on (default on).
+    # We pull in the background so warmup can proceed with whatever's already
+    # installed. Pull progress is visible in the server log.
+    missing = list(snap.get("missing") or [])
+    if missing and os.environ.get("COCKPIT_OLLAMA_AUTO_PULL", "1") in (
+        "1",
+        "true",
+        "True",
+    ):
+        _WARMUP_STATE["pulling"] = list(missing)
+        log.info("Ollama auto-pull: %d missing model(s): %s", len(missing), missing)
+
+        async def _bg_pull() -> None:
+            for model in missing:
+                try:
+                    ok = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda m=model: pull_model(host, m, verbose=False)
+                    )
+                    log.info(
+                        "Ollama auto-pull %s -> %s", model, "ok" if ok else "failed"
+                    )
+                except Exception as e:
+                    log.warning("Ollama auto-pull %s error: %s", model, e)
+            _WARMUP_STATE["pulling"] = []
+
+        # Fire-and-forget; the cockpit shouldn't block on a multi-GB download.
+        # Hold a reference so the task isn't GC'd mid-flight (RUF006).
+        _WARMUP_STATE["_pull_task"] = asyncio.create_task(_bg_pull())
 
     targets = list(snap.get("installed") or [])
     results: list[dict[str, Any]] = []
@@ -1373,12 +1439,26 @@ def api_trading_start(req: StartTradingRequest) -> dict[str, Any]:
     if req.dry_run:
         cmd.append("--dry-run")
     info = job_mgr.start(PAPER_LOOP_KIND, cmd)
+    # Remember intent so we auto-resume on next cockpit boot.
+    state = load_state()
+    state.paper_loop_intended = True
+    state.paper_loop_strategy = req.strategy
+    state.paper_loop_dry_run = req.dry_run
+    state = record_action(state, f"Paper loop started ({req.strategy}, dry_run={req.dry_run})")
+    save_state(state)
     return info.to_dict()
 
 
 @app.post("/api/trading/stop")
 def api_trading_stop() -> dict[str, Any]:
-    return job_mgr.stop(PAPER_LOOP_KIND).to_dict()
+    info = job_mgr.stop(PAPER_LOOP_KIND).to_dict()
+    # Clear the auto-resume intent so a future cockpit reboot doesn't
+    # re-spawn the loop the user just chose to stop.
+    state = load_state()
+    state.paper_loop_intended = False
+    state = record_action(state, "Paper loop stopped")
+    save_state(state)
+    return info
 
 
 @app.get("/api/trading/status")
@@ -2392,6 +2472,51 @@ def autopilot_page() -> HTMLResponse:
 async def _autopilot_startup() -> None:  # pragma: no cover
     if _AUTOPILOT_STATE.enabled:
         _start_autopilot_task()
+
+
+@app.on_event("startup")
+async def _paper_loop_auto_resume() -> None:  # pragma: no cover
+    """If the paper loop was intended to be running when the cockpit shut
+    down, re-spawn it now with the same strategy/dry_run combo.
+
+    Honors COCKPIT_AUTO_RESUME_LOOP (default on). Skipped when the bot is
+    paused or when a job is already alive (PID still valid).
+    """
+    if os.environ.get("COCKPIT_AUTO_RESUME_LOOP", "1") not in ("1", "true", "True"):
+        return
+    try:
+        cstate = load_state()
+    except Exception as e:
+        log.warning("auto-resume: state load failed: %s", e)
+        return
+    if not cstate.paper_loop_intended:
+        return
+    if cstate.paused:
+        log.info("auto-resume: paper loop intent set but cockpit is paused; skipping")
+        return
+    existing = job_mgr.status(PAPER_LOOP_KIND)
+    if existing.is_running():
+        log.info("auto-resume: paper loop already running (pid=%s)", existing.pid)
+        return
+    cmd = [
+        _python_exe(),
+        "tools/paper_trade.py",
+        "--strategy",
+        cstate.paper_loop_strategy,
+        "--loop",
+    ]
+    if cstate.paper_loop_dry_run:
+        cmd.append("--dry-run")
+    try:
+        info = job_mgr.start(PAPER_LOOP_KIND, cmd)
+        log.info(
+            "auto-resume: paper loop respawned pid=%s strategy=%s dry_run=%s",
+            info.pid,
+            cstate.paper_loop_strategy,
+            cstate.paper_loop_dry_run,
+        )
+    except Exception as e:
+        log.warning("auto-resume: failed to respawn loop: %s", e)
 
 
 # Background pre-warm so the first Run on /agents doesn't pay a 30-90s

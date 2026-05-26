@@ -39,6 +39,13 @@ class CockpitState:
     # Free-form note set on the last action (shown in the GUI).
     last_action: str = ""
     last_action_at: str = ""  # ISO timestamp
+    # Auto-resume: did the user have the paper loop intentionally running
+    # when the cockpit last shut down? On boot we check this and re-spawn
+    # the loop with the remembered strategy/dry_run combo so the soak
+    # streak doesn't stall just because the laptop rebooted.
+    paper_loop_intended: bool = False
+    paper_loop_strategy: str = "ensemble"
+    paper_loop_dry_run: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -61,6 +68,9 @@ def load_state(path: Path = STATE_PATH) -> CockpitState:
         paused_strategies=list(raw.get("paused_strategies", [])),
         last_action=str(raw.get("last_action", "")),
         last_action_at=str(raw.get("last_action_at", "")),
+        paper_loop_intended=bool(raw.get("paper_loop_intended", False)),
+        paper_loop_strategy=str(raw.get("paper_loop_strategy", "ensemble")),
+        paper_loop_dry_run=bool(raw.get("paper_loop_dry_run", False)),
     )
 
 
