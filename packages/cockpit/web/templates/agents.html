@@ -395,11 +395,20 @@
       btn.disabled = true;
       pill.textContent = 'running';
       pill.className = 'pill pill-blue';
-      meta.textContent = useLlm ? 'calling Ollama...' : 'running deterministic stubs...';
-      const t0 = performance.now();
+      // Visible elapsed-time counter so an LLM pass never looks frozen.
+      // 'calling Ollama' ticks once a second; on stub mode it usually finishes
+      // in under a second so the counter just briefly shows '0s' which is fine.
+      const ticker = Cockpit.elapsedTicker(meta, {
+        text: useLlm ? 'calling Ollama' : 'running deterministic stubs',
+      });
+      // Also surface 'still working' guidance once the call exceeds 20s so a
+      // first-time cold load doesn't look like a hang.
+      const guidanceTimer = useLlm ? setTimeout(() => {
+        Cockpit.toastWarn('LLM cold-start can take 30-90s on first call — weights are paging in.');
+      }, 20000) : null;
       try {
         const j = await Cockpit.api.post('/api/agents/run', {symbols, regime, use_llm: useLlm});
-        const dt = ((performance.now() - t0) / 1000).toFixed(2);
+        const dt = ticker.stop();
         paintRun(j);
         if (j.halted) {
           pill.textContent = 'halted';
@@ -408,15 +417,17 @@
         } else {
           pill.textContent = 'ok';
           pill.className = 'pill pill-green';
-          Cockpit.toastSuccess(`Pipeline complete in ${dt}s`);
+          Cockpit.toastSuccess(`Pipeline complete in ${dt.toFixed(2)}s${j.used_llm ? ' (LLM)' : ''}`);
         }
-        meta.textContent = `decision ${(j.decision_id || '').slice(0,8)} · ${dt}s`;
+        meta.textContent = `decision ${(j.decision_id || '').slice(0,8)} · ${dt.toFixed(2)}s${j.used_llm ? ' · LLM' : ' · stub'}`;
       } catch (e) {
+        ticker.stop();
         pill.textContent = 'error';
         pill.className = 'pill pill-red';
         meta.textContent = e.message;
         Cockpit.toastError('Run failed: ' + e.message);
       } finally {
+        if (guidanceTimer) clearTimeout(guidanceTimer);
         btn.disabled = false;
       }
     }
@@ -460,7 +471,7 @@
       try {
         const j = await Cockpit.api.post('/api/agents/schedule', body);
         paintSchedule(j);
-        Cockpit.toastSuccess(body.enabled ? 'Scheduler enabled' : 'Scheduler disabled');
+        Cockpit.flashSaved('sched-save-btn', body.enabled ? 'Scheduler enabled' : 'Scheduler disabled');
       } catch (e) {
         Cockpit.toastError('Save failed: ' + e.message);
       }
@@ -582,16 +593,16 @@
       document.getElementById('sched-tick-btn').addEventListener('click', tickNow);
       document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
       document.getElementById('attribute-btn').addEventListener('click', runAttribution);
-      refreshTopbar();
+      // Visibility-aware polls — these pause when the tab is hidden so a
+      // background cockpit tab doesn't keep hammering /api/agents/* every
+      // 7-30s. The first fire is immediate via runImmediately: true (default).
+      Cockpit.poll(refreshTopbar, 5000, { name: 'topbar' });
+      Cockpit.poll(loadSchedule, 7000, { name: 'schedule' });
+      Cockpit.poll(loadScorecard, 30000, { name: 'scorecard' });
+      Cockpit.poll(loadPromotionCandidates, 30000, { name: 'promo-candidates' });
+      // Last-run is one-shot at boot, refreshed only on user actions.
       loadLast();
-      loadSchedule();
       loadHistory();
-      loadScorecard();
-      loadPromotionCandidates();
-      setInterval(refreshTopbar, 5000);
-      setInterval(loadSchedule, 7000);
-      setInterval(loadScorecard, 30000);
-      setInterval(loadPromotionCandidates, 30000);
     });
   </script>
 </body>

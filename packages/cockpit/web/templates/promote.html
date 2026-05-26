@@ -326,8 +326,7 @@ TELEGRAM_CHAT_ID=your_chat_id_here</div>
       }
 
       refreshBtn.onclick = load;
-      load();
-      setInterval(load, 60000);
+      Cockpit.poll(load, 60000, { name: 'promote' });
     })();
   </script>
 </body>

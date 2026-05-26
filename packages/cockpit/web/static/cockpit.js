@@ -299,6 +299,100 @@
   document.addEventListener("keydown", _handleKey);
 
   // ----------------------------------------------------------------------
+  // Visibility-aware polling
+  // ----------------------------------------------------------------------
+  // Background tabs in Chrome throttle setInterval to >= 1s and queue
+  // pending fires that all flush when the tab regains focus, causing burst
+  // lag on every tab switch. Cockpit.poll() runs `fn` only when the tab is
+  // visible and re-fires immediately on visibility change so the user sees
+  // fresh data the moment they refocus. Returns a handle with cancel().
+  Cockpit.poll = function (fn, ms, opts = {}) {
+    const { runImmediately = true, name = "" } = opts;
+    let timer = null;
+    let cancelled = false;
+    let running = false;
+
+    async function tick() {
+      if (cancelled || document.hidden) return;
+      if (running) return; // skip overlapping calls — avoids backlog on slow endpoints
+      running = true;
+      try { await fn(); }
+      catch (e) { if (name) console.warn(`[poll:${name}]`, e); }
+      finally { running = false; }
+    }
+    function schedule() {
+      if (timer != null) clearInterval(timer);
+      timer = setInterval(tick, ms);
+    }
+    function onVisibility() {
+      if (cancelled) return;
+      if (document.hidden) {
+        if (timer != null) { clearInterval(timer); timer = null; }
+      } else {
+        tick(); // immediate refresh on refocus
+        schedule();
+      }
+    }
+    document.addEventListener("visibilitychange", onVisibility);
+    if (runImmediately) tick();
+    schedule();
+    return {
+      cancel() {
+        cancelled = true;
+        if (timer != null) { clearInterval(timer); timer = null; }
+        document.removeEventListener("visibilitychange", onVisibility);
+      },
+      now: tick,
+    };
+  };
+
+  // ----------------------------------------------------------------------
+  // Save-confirmation pulse
+  // ----------------------------------------------------------------------
+  // After saving a setting (autopilot toggle, schedule edit, etc.) the
+  // value re-paints from the next poll — so the user sees no immediate
+  // confirmation that their click did anything. Flash a brief green ring
+  // around the saved control so the action feels acknowledged.
+  Cockpit.flashSaved = function (target, label) {
+    const el = typeof target === "string" ? document.getElementById(target) : target;
+    if (!el) return;
+    el.classList.remove("cockpit-flash-saved");
+    // force reflow so the animation restarts if called twice in a row
+    void el.offsetWidth;
+    el.classList.add("cockpit-flash-saved");
+    if (label) Cockpit.toastSuccess(label);
+    setTimeout(() => el.classList.remove("cockpit-flash-saved"), 1400);
+  };
+
+  // ----------------------------------------------------------------------
+  // Elapsed-time ticker
+  // ----------------------------------------------------------------------
+  // A 60-second LLM call shouldn't look frozen. Wrap an async operation
+  // with Cockpit.elapsedTicker(el, { text }) and the element will read
+  // "<text>... 12s" with the seconds counter live until you call .stop().
+  Cockpit.elapsedTicker = function (target, opts = {}) {
+    const el = typeof target === "string" ? document.getElementById(target) : target;
+    if (!el) return { stop: () => {} };
+    const text = opts.text || "working";
+    const t0 = performance.now();
+    function paint() {
+      const s = ((performance.now() - t0) / 1000).toFixed(0);
+      el.textContent = `${text}... ${s}s`;
+    }
+    paint();
+    const id = setInterval(paint, 500);
+    return {
+      stop(finalText) {
+        clearInterval(id);
+        const total = ((performance.now() - t0) / 1000).toFixed(2);
+        if (finalText) el.textContent = `${finalText} (${total}s)`;
+        return parseFloat(total);
+      },
+      update(newText) { opts.text = newText; paint(); },
+    };
+  };
+
+  // ----------------------------------------------------------------------
   // Sparkline (tiny inline SVG)
   // ----------------------------------------------------------------------
   Cockpit.sparkline = function (values, opts = {}) {

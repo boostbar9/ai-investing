@@ -200,8 +200,7 @@
 
       loadCurrent();
       check();
-      refreshTopbar();
-      setInterval(refreshTopbar, 5000);
+      Cockpit.poll(refreshTopbar, 5000, { name: 'updates-topbar' });
     });
   </script>
 </body>

@@ -412,18 +412,18 @@
       });
       document.getElementById('auto-refresh').addEventListener('change', (e) => {
         if (e.target.checked) {
-          refreshTimer = setInterval(load, 10000);
+          refreshTimer = Cockpit.poll(load, 10000, { name: 'errors', runImmediately: false });
         } else if (refreshTimer) {
-          clearInterval(refreshTimer);
+          refreshTimer.cancel();
           refreshTimer = null;
         }
       });
       document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
 
       load();
-      refreshTopbar();
-      refreshTimer = setInterval(load, 10000);
-      setInterval(refreshTopbar, 5000);
+      // Visibility-aware polls (pause when tab hidden, resume immediately on refocus).
+      refreshTimer = Cockpit.poll(load, 10000, { name: 'errors', runImmediately: false });
+      Cockpit.poll(refreshTopbar, 5000, { name: 'topbar' });
     });
   </script>
 </body>

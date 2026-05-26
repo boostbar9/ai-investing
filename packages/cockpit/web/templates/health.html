@@ -227,9 +227,9 @@
 
       refreshBtn.onclick = loadHealth;
       runAllBtn.onclick = runAllFixes;
-      loadHealth();
-      // Auto-refresh every 30s so a yellow row doesn't go stale.
-      setInterval(loadHealth, 30000);
+      // Auto-refresh every 30s so a yellow row doesn't go stale. Pauses
+      // automatically when the tab is hidden via Cockpit.poll.
+      Cockpit.poll(loadHealth, 30000, { name: 'health' });
     })();
   </script>
 </body>

@@ -519,13 +519,12 @@
         filterTimer = setTimeout(() => applyFilter(filterEl.value.trim()), 120);
       });
 
-      refreshStatus();
       switchStream(currentKind);
-      refreshTopbar();
-      refreshOllama();
-      setInterval(refreshStatus, 3000);
-      setInterval(refreshTopbar, 5000);
-      setInterval(refreshOllama, 4000);
+      // Visibility-aware polls (pause when tab is hidden, immediate fire on refocus).
+      // The first fire is immediate via runImmediately: true (default).
+      Cockpit.poll(refreshStatus, 3000, { name: 'jobs-status' });
+      Cockpit.poll(refreshTopbar, 5000, { name: 'topbar' });
+      Cockpit.poll(refreshOllama, 4000, { name: 'ollama' });
     });
   </script>
 </body>

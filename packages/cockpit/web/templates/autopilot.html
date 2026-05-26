@@ -235,6 +235,7 @@
             strategy: strategyInput.value.trim() || null,
           });
           await load();
+          Cockpit.flashSaved(saveBtn, 'Autopilot settings saved');
         } catch (e) {
           alert("Save failed: " + (e.message || "unknown"));
         } finally {
@@ -267,7 +268,7 @@
       saveBtn.onclick = save;
       tickBtn.onclick = tick;
       load();
-      setInterval(load, 30000);
+      Cockpit.poll(load, 30000, { name: 'autopilot' });
     })();
   </script>
 </body>

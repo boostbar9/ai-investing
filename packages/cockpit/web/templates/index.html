@@ -502,8 +502,7 @@
     });
 
     // Boot
-    refresh();
-    setInterval(refresh, 5000);
+    Cockpit.poll(refresh, 5000, { name: 'index-state' });
 
     // ----- agent pipeline status lights -----
     async function refreshAgents() {
@@ -525,8 +524,7 @@
         }
       } catch (e) { /* ignore */ }
     }
-    refreshAgents();
-    setInterval(refreshAgents, 8000);
+    Cockpit.poll(refreshAgents, 8000, { name: 'index-agents' });
   </script>
 </body>
 </html>

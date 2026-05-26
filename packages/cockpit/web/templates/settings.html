@@ -189,8 +189,7 @@
     document.addEventListener('DOMContentLoaded', () => {
       document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
       load();
-      refreshTopbar();
-      setInterval(refreshTopbar, 5000);
+      Cockpit.poll(refreshTopbar, 5000, { name: 'settings-topbar' });
     });
   </script>
 </body>

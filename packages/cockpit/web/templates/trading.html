@@ -309,9 +309,9 @@
       loadMode();
       refreshTopbar();
       refreshCycles();
-      setInterval(refreshStatus, 3000);
-      setInterval(refreshTopbar, 5000);
-      setInterval(refreshCycles, 10000);
+      Cockpit.poll(refreshStatus, 3000, { name: 'trading-status' });
+      Cockpit.poll(refreshTopbar, 5000, { name: 'topbar' });
+      Cockpit.poll(refreshCycles, 10000, { name: 'cycles' });
     });
   </script>
 </body>
