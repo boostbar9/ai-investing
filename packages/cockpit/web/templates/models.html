@@ -90,9 +90,13 @@
           </div>
           <div class="text-xs text-gray-400" id="ollama-sub">checking...</div>
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-2 flex-wrap">
           <span id="pill-ollama" class="pill pill-gray">checking</span>
+          <span id="pill-ollama-backend" class="pill pill-gray" data-tt="GPU vs CPU backend detection. Click 'Fix GPU' to enable AMD GPU acceleration on Windows.">backend: ?</span>
+          <span id="pill-ollama-warmup" class="pill pill-gray" data-tt="Tracks the startup pre-warm. Models are pre-loaded into memory so the first agent Run doesn't sit through a 30-90s cold start.">warmup: ?</span>
           <button id="ollama-setup-btn" class="btn btn-primary" data-tt="Starts the daemon (if needed) and downloads any missing models. Streams progress to the log below.">Auto-setup</button>
+          <button id="ollama-warmup-btn" class="btn btn-ghost" data-tt="Pre-load every declared model into memory now so the first Run is fast.">Warm models</button>
+          <button id="ollama-gpu-fix-btn" class="btn btn-ghost" data-tt="Windows + AMD RDNA3 only: install ROCm DLLs, set env vars, restart daemon, verify GPU." style="display:none">Fix GPU</button>
           <button id="ollama-stop-btn" class="btn btn-danger" data-tt="Stops the setup process. The daemon itself keeps running." style="display:none">Stop</button>
         </div>
       </div>
@@ -109,6 +113,9 @@
           <div class="text-gray-400 mb-1">Missing</div>
           <ul id="ollama-missing" class="mono space-y-0.5"></ul>
         </div>
+      </div>
+      <div id="ollama-acceleration-hint" class="text-xs text-amber-400 mt-3" style="display:none">
+        Ollama is running on CPU. Click <strong>Fix GPU</strong> to enable AMD GPU acceleration (typically 10–50× faster inference).
       </div>
     </section>
 
@@ -163,6 +170,7 @@
             <option value="retune_nightly">retune_nightly</option>
             <option value="retune_weekly">retune_weekly</option>
             <option value="ollama_setup">ollama_setup</option>
+            <option value="ollama_gpu_fix">ollama_gpu_fix</option>
           </select>
           <input id="log-filter" type="search" placeholder="filter (regex ok)" autocomplete="off" data-tt="Hide lines that don't match. Supports plain text or /regex/ syntax." />
           <button id="log-wrap" class="btn btn-ghost btn-sm" data-tt="Toggle word-wrap for long lines.">Wrap</button>
@@ -460,6 +468,96 @@
       }
     }
 
+    // Pill text + color for the backend/warmup chips. Cheap, called on every
+    // /api/ollama/status + /api/ollama/warmup_status poll.
+    async function refreshOllamaBackendAndWarmup() {
+      const backendPill = document.getElementById('pill-ollama-backend');
+      const warmupPill = document.getElementById('pill-ollama-warmup');
+      const fixBtn = document.getElementById('ollama-gpu-fix-btn');
+      const hint = document.getElementById('ollama-acceleration-hint');
+      // Backend chip (mirrors /api/ollama/status -> snapshot.backend)
+      try {
+        const s = await Cockpit.api.get('/api/ollama/status');
+        const b = (s.backend && s.backend.backend) || 'unknown';
+        if (b === 'gpu') {
+          backendPill.textContent = 'GPU';
+          backendPill.className = 'pill pill-green';
+          hint.style.display = 'none';
+        } else if (b === 'partial-gpu') {
+          backendPill.textContent = 'partial GPU';
+          backendPill.className = 'pill pill-yellow';
+          hint.style.display = 'none';
+        } else if (b === 'cpu') {
+          backendPill.textContent = 'CPU';
+          backendPill.className = 'pill pill-red';
+          // Only show the fix on a Windows machine — server will 400 elsewhere
+          // but no point dangling a useless button in front of the user.
+          const isWin = (navigator.platform || '').toLowerCase().includes('win')
+            || (navigator.userAgent || '').toLowerCase().includes('windows');
+          fixBtn.style.display = isWin ? '' : 'none';
+          hint.style.display = isWin ? '' : 'none';
+        } else {
+          backendPill.textContent = 'backend: idle';
+          backendPill.className = 'pill pill-gray';
+          hint.style.display = 'none';
+        }
+      } catch (e) { /* status panel already shows the error */ }
+      // Warmup chip
+      try {
+        const w = await Cockpit.api.get('/api/ollama/warmup_status');
+        const results = w.results || [];
+        if (w.in_progress) {
+          warmupPill.textContent = `warming ${results.length}`;
+          warmupPill.className = 'pill pill-blue';
+        } else if (w.finished_at && results.length) {
+          const okCount = results.filter(r => r.ok).length;
+          if (okCount === results.length) {
+            warmupPill.textContent = `ready ${okCount}/${results.length}`;
+            warmupPill.className = 'pill pill-green';
+          } else {
+            warmupPill.textContent = `warm ${okCount}/${results.length}`;
+            warmupPill.className = 'pill pill-yellow';
+          }
+        } else {
+          warmupPill.textContent = 'warmup: idle';
+          warmupPill.className = 'pill pill-gray';
+        }
+      } catch (e) { /* benign */ }
+    }
+
+    async function startManualWarmup() {
+      const btn = document.getElementById('ollama-warmup-btn');
+      btn.disabled = true;
+      const oldLabel = btn.textContent;
+      btn.textContent = 'Warming...';
+      try {
+        const r = await Cockpit.api.post('/api/ollama/warmup', {});
+        if (r.ok) {
+          Cockpit.toastSuccess(`Warmed ${r.results.length} model(s) in ${r.total_elapsed_s}s`);
+        } else {
+          Cockpit.toastError('Warmup finished with errors: ' + (r.error || 'see warmup_status'));
+        }
+      } catch (e) {
+        Cockpit.toastError('Warmup failed: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = oldLabel;
+        refreshOllamaBackendAndWarmup();
+      }
+    }
+
+    async function startGpuFix() {
+      if (!confirm('Run the AMD GPU acceleration fix? This downloads ROCm DLLs and restarts the Ollama daemon. The cockpit may briefly disconnect.')) return;
+      try {
+        await Cockpit.api.post('/api/ollama/gpu_fix', {});
+        Cockpit.toastSuccess('GPU fix started — streaming to log');
+        document.getElementById('log-pick').value = 'ollama_gpu_fix';
+        switchStream('ollama_gpu_fix');
+      } catch (e) {
+        Cockpit.toastError('GPU fix failed to start: ' + (e.message || 'see /api/ollama/gpu_fix'));
+      }
+    }
+
     async function startOllamaSetup() {
       try {
         await Cockpit.api.post('/api/ollama/setup', {});
@@ -492,6 +590,8 @@
       document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
       document.getElementById('ollama-setup-btn').addEventListener('click', startOllamaSetup);
       document.getElementById('ollama-stop-btn').addEventListener('click', stopOllamaSetup);
+      document.getElementById('ollama-warmup-btn').addEventListener('click', startManualWarmup);
+      document.getElementById('ollama-gpu-fix-btn').addEventListener('click', startGpuFix);
 
       const logEl = document.getElementById('log');
       // Smart auto-follow: pause when the user scrolls up, resume on click of the pill
@@ -525,6 +625,7 @@
       Cockpit.poll(refreshStatus, 3000, { name: 'jobs-status' });
       Cockpit.poll(refreshTopbar, 5000, { name: 'topbar' });
       Cockpit.poll(refreshOllama, 4000, { name: 'ollama' });
+      Cockpit.poll(refreshOllamaBackendAndWarmup, 4000, { name: 'ollama-accel' });
     });
   </script>
 </body>

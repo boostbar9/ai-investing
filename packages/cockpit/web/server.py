@@ -98,6 +98,8 @@ _QUIET_PATH_PREFIXES: tuple[str, ...] = (
     "/api/health",
     "/api/mode",
     "/api/ollama/status",
+    "/api/ollama/warmup_status",
+    "/api/ollama/gpu_fix",  # GET status; the POST is one-shot and rare
     "/api/agents/last",
     "/api/agents/in_flight",
     "/api/agents/schedule",
@@ -956,6 +958,101 @@ def api_models_stop(kind: str) -> dict[str, Any]:
 
 OLLAMA_SETUP_KIND = "ollama_setup"
 
+# Track warmup results across the session so the UI can show "models ready"
+# vs. "warming". Updated by both the manual /api/ollama/warmup endpoint and
+# the startup background task.
+_WARMUP_STATE: dict[str, Any] = {
+    "started_at": None,
+    "finished_at": None,
+    "in_progress": False,
+    "results": [],  # list of {model, elapsed_s, ok, error?}
+}
+
+# Module-level reference for the startup pre-warm task so it isn't GC'd
+# mid-run (ruff RUF006).
+_WARMUP_BG_TASK: asyncio.Task | None = None
+
+
+async def _warmup_models() -> dict[str, Any]:
+    """Issue a one-token generate at every installed declared model.
+
+    Causes Ollama to mmap the weights and (on GPU builds) move them into
+    VRAM. After a successful warmup the first agent Run typically drops
+    from 30-90s per agent to 5-15s per agent.
+
+    Returns a result dict; also caches it in ``_WARMUP_STATE`` so the
+    Ollama panel can read it without re-running the warmup.
+    """
+    import httpx as _httpx
+
+    from tools.check_ollama import status_snapshot
+
+    _WARMUP_STATE["started_at"] = time.time()
+    _WARMUP_STATE["finished_at"] = None
+    _WARMUP_STATE["in_progress"] = True
+    _WARMUP_STATE["results"] = []
+
+    snap = status_snapshot()
+    host = snap.get("host") or "http://127.0.0.1:11434"
+    if not snap.get("daemon_alive"):
+        _WARMUP_STATE["in_progress"] = False
+        _WARMUP_STATE["finished_at"] = time.time()
+        return {
+            "ok": False,
+            "error": "Ollama daemon not running",
+            "results": [],
+        }
+
+    targets = list(snap.get("installed") or [])
+    results: list[dict[str, Any]] = []
+    async with _httpx.AsyncClient(timeout=120.0) as client:
+        for model in targets:
+            t0 = time.monotonic()
+            try:
+                r = await client.post(
+                    f"{host}/api/generate",
+                    json={
+                        "model": model,
+                        "prompt": "ok",
+                        "stream": False,
+                        "options": {"num_predict": 1, "temperature": 0.0},
+                    },
+                )
+                r.raise_for_status()
+                results.append({
+                    "model": model,
+                    "elapsed_s": round(time.monotonic() - t0, 2),
+                    "ok": True,
+                })
+            except Exception as e:
+                results.append({
+                    "model": model,
+                    "elapsed_s": round(time.monotonic() - t0, 2),
+                    "ok": False,
+                    "error": str(e)[:200],
+                })
+            # Stream partial results so the UI can show progress mid-run.
+            _WARMUP_STATE["results"] = list(results)
+
+    _WARMUP_STATE["in_progress"] = False
+    _WARMUP_STATE["finished_at"] = time.time()
+    return {
+        "ok": all(r["ok"] for r in results),
+        "results": results,
+        "total_elapsed_s": round(
+            (_WARMUP_STATE["finished_at"] - _WARMUP_STATE["started_at"]), 2
+        ),
+    }
+
+
+@app.get("/api/ollama/warmup_status")
+def api_ollama_warmup_status() -> dict[str, Any]:
+    """Poll-friendly snapshot of the current/last warmup. Used by the
+    Ollama panel to show 'models ready' once startup pre-warm finishes."""
+    state = dict(_WARMUP_STATE)
+    state["results"] = list(_WARMUP_STATE["results"])
+    return state
+
 
 @app.get("/api/ollama/status")
 def api_ollama_status() -> dict[str, Any]:
@@ -993,6 +1090,62 @@ def api_ollama_stop() -> dict[str, Any]:
     """Cancel an in-flight setup. The daemon itself is left running because
     other tools may depend on it; we only kill the pull driver."""
     return job_mgr.stop(OLLAMA_SETUP_KIND).to_dict()
+
+
+OLLAMA_GPU_FIX_KIND = "ollama_gpu_fix"
+
+
+@app.post("/api/ollama/gpu_fix")
+def api_ollama_gpu_fix() -> dict[str, Any]:
+    """One-click GPU enablement for AMD RDNA3 (RX 7900 XT) on Windows.
+
+    Wraps ``tools/fix_ollama_gpu.ps1`` which downloads the matching ROCm
+    DLL pack from likelovewant/ollama-for-amd, sets the required env
+    vars, restarts the daemon, and verifies GPU detection. Streams
+    progress through the standard /api/jobs/{kind}/stream SSE channel
+    so the live log shows up in the cockpit Logs panel.
+
+    POSIX returns 400 because the script is Windows-only — the cockpit
+    UI hides the button unless the platform is win32.
+    """
+    if sys.platform != "win32":
+        raise HTTPException(
+            status_code=400,
+            detail="GPU fix script is Windows-only (PowerShell, ROCm DLL pack).",
+        )
+    script = REPO_ROOT / "tools" / "fix_ollama_gpu.ps1"
+    if not script.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"GPU fix script not found at {script}",
+        )
+    cmd = [
+        "powershell.exe",
+        "-ExecutionPolicy", "Bypass",
+        "-NoProfile",
+        "-File", str(script),
+    ]
+    info = job_mgr.start(OLLAMA_GPU_FIX_KIND, cmd)
+    return info.to_dict()
+
+
+@app.get("/api/ollama/gpu_fix")
+def api_ollama_gpu_fix_status() -> dict[str, Any]:
+    """Status snapshot for the GPU-fix job (used by the cockpit panel)."""
+    return job_mgr.status(OLLAMA_GPU_FIX_KIND).to_dict()
+
+
+@app.post("/api/ollama/warmup")
+async def api_ollama_warmup() -> dict[str, Any]:
+    """Pre-load each declared model into memory so the first user-facing
+    Run isn't sitting through a 30-90s cold-start cascade.
+
+    Fires a one-token generate at every installed model on the active
+    profile's chain. Each call is fire-and-forget on a 5s ceiling, so a
+    missing model just logs and moves on. Returns a list of per-model
+    outcomes for the UI.
+    """
+    return await _warmup_models()
 
 
 # --------------------------------------------------------------------------
@@ -1281,6 +1434,26 @@ def api_agents_in_flight() -> dict[str, Any]:
     return snap
 
 
+async def _cleanup_early_discovery(
+    task: asyncio.Task | None,
+    router: Any,
+) -> None:
+    """Best-effort cleanup of a parallel discovery kickoff after a run fails.
+
+    If the main graph raised before the discovery block could await the
+    early task, we still need to cancel the task and close the dedicated
+    LLMRouter so the daemon connection pool doesn't leak. Any error here
+    is swallowed — the caller is already raising the real error.
+    """
+    if task is not None and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):  # pragma: no cover
+            await task
+    if router is not None:
+        with contextlib.suppress(Exception):  # pragma: no cover
+            await router.aclose()
+
+
 @app.post("/api/agents/run")
 async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
     """Run one advisory pass of the LangGraph agent graph.
@@ -1326,6 +1499,15 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
     # via /api/agents/in_flight so the user sees *which* agent is calling
     # Ollama, not just an opaque elapsed counter. Reset on every run.
     _progress_reset("llm" if req.use_llm else "stub")
+
+    # Parallel-discovery handoff vars. These are set inside the LLM branch
+    # below when discovery is kicked off concurrently with strategy/risk/
+    # execution. The discovery block further down checks them to either
+    # await the early task or fall back to the sequential path. Declared
+    # in the outer scope so the stub branch and exception paths don't
+    # NameError when the discovery block reads them.
+    _early_discovery_task: asyncio.Task | None = None
+    _discovery_router_to_close: Any = None
     try:
         if req.use_llm:
             # LLM-backed runners (Ollama). Build a fresh graph so we don't have
@@ -1378,10 +1560,67 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
                         raise
                 return _wrapped
 
+            # Discovery agent is advisory-only and only depends on research
+            # output — we can run it concurrently with strategy + risk +
+            # execution to save ~one LLM-call worth of wall time. The task
+            # is kicked off from inside the wrapped research runner as soon
+            # as research returns, and awaited later in the discovery block.
+            discovery_router = LLMRouter()
+            discovery_task: asyncio.Task | None = None
+
+            def _research_with_discovery_kickoff(research_runner):  # type: ignore[no-untyped-def]
+                instrumented = _instrument("research", research_runner)
+                async def _wrapped(inp):  # type: ignore[no-untyped-def]
+                    nonlocal discovery_task
+                    research_out = await instrumented(inp)
+                    # Fire discovery NOW — it only needs research.thesis +
+                    # research.sentiment, both of which are in research_out.
+                    try:
+                        from packages.agents.runners import build_discovery_runner
+                        from packages.shared.schemas import DiscoveryInput
+                        from packages.shared.universe import DEFAULT_UNIVERSE
+                        disc_universe_local = DEFAULT_UNIVERSE.filter(symbols) or list(symbols)
+                        disc_features_local = {
+                            "sentiment": float(research_out.sentiment),
+                            "regime_bull": 1.0 if regime == "bull" else 0.0,
+                            "regime_bear": 1.0 if regime == "bear" else 0.0,
+                            "regime_chop": 1.0 if regime == "chop" else 0.0,
+                            "regime_crisis": 1.0 if regime == "crisis" else 0.0,
+                            "n_signals": 0.0,
+                            "n_approved": 0.0,
+                        }
+                        d_in_early = DiscoveryInput(
+                            decision_id=getattr(research_out, "decision_id", ""),
+                            regime=regime,  # type: ignore[arg-type]
+                            universe=disc_universe_local,
+                            features=disc_features_local,
+                            recent_thesis=research_out.thesis,
+                        )
+                        d_runner_early = build_discovery_runner(
+                            discovery_router, scorecard_summary=scorecard_summary,
+                        )
+                        async def _disc_with_progress():
+                            _progress_begin("discovery")
+                            try:
+                                out = await d_runner_early(d_in_early)
+                                _progress_end("discovery", "ok")
+                                return out
+                            except Exception:
+                                _progress_end("discovery", "failed")
+                                raise
+                        discovery_task = asyncio.create_task(_disc_with_progress())
+                    except Exception as kick_err:
+                        log.warning("discovery kickoff failed (will fall back to sequential): %s", kick_err)
+                        discovery_task = None
+                    return research_out
+                return _wrapped
+
             router = LLMRouter()
             try:
                 graph = AgentGraph(
-                    research=_instrument("research", build_research_runner(router, scorecard_summary=scorecard_summary)),
+                    research=_research_with_discovery_kickoff(
+                        build_research_runner(router, scorecard_summary=scorecard_summary)
+                    ),
                     strategy=_instrument("strategy", build_strategy_runner(router, scorecard_summary=scorecard_summary)),
                     risk=_instrument("risk", build_risk_runner(router, scorecard_summary=scorecard_summary)),
                     execution=_instrument("execution", build_execution_runner(router, scorecard_summary=scorecard_summary)),
@@ -1393,8 +1632,16 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
                     positions=[Position(symbol=s, qty=0.0, avg_price=0.0) for s in symbols],
                     features={},
                 )
+                # Stash the early-fired discovery task on the result so the
+                # discovery block below can await it instead of starting a
+                # fresh sequential one. We use a function attribute because
+                # GraphResult is a frozen dataclass.
+                _early_discovery_task = discovery_task
             finally:
-                await router.aclose()
+                # We close the dedicated discovery router only after the
+                # discovery block has read the result, so defer it via a
+                # local var the discovery block will clean up.
+                _discovery_router_to_close = discovery_router
         else:
             # Stub backend: mark each stub agent in sequence so the UI still
             # shows progression (these usually finish in <100ms total).
@@ -1410,9 +1657,11 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
             )
     except HTTPException:
         _progress_finish(error=_AGENT_PROGRESS.get("error") or "http error")
+        await _cleanup_early_discovery(_early_discovery_task, _discovery_router_to_close)
         raise
     except Exception as run_err:
         _progress_finish(error=str(run_err))
+        await _cleanup_early_discovery(_early_discovery_task, _discovery_router_to_close)
         raise
 
     # Build per-agent status. "ok" / "warn" / "halt" maps cleanly to the
@@ -1456,29 +1705,46 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
             "n_approved": float(n_approved),
         }
         if req.use_llm:
-            from packages.agents.llm_router import LLMRouter
-            from packages.agents.runners import build_discovery_runner
-            from packages.shared.schemas import DiscoveryInput
-
-            d_router = LLMRouter()
-            try:
-                d_runner = build_discovery_runner(d_router, scorecard_summary=scorecard_summary)
-                d_in = DiscoveryInput(
-                    decision_id=result.decision_id,
-                    regime=regime,  # type: ignore[arg-type]
-                    universe=disc_universe,
-                    features=disc_features,
-                    recent_thesis=result.research.thesis,
-                )
-                _progress_begin("discovery")
+            # Fast path: discovery was kicked off in parallel with strategy/
+            # risk/execution from inside the wrapped research runner. If the
+            # kickoff succeeded, just await its result here — saves ~one LLM
+            # call of wall time per Run.
+            if _early_discovery_task is not None:
                 try:
-                    d_out = await d_runner(d_in)
-                    _progress_end("discovery", "ok")
-                except Exception:
-                    _progress_end("discovery", "failed")
-                    raise
-            finally:
-                await d_router.aclose()
+                    d_out = await _early_discovery_task
+                finally:
+                    if _discovery_router_to_close is not None:
+                        try:
+                            await _discovery_router_to_close.aclose()
+                        except Exception as close_err:  # pragma: no cover
+                            log.debug("discovery router close failed: %s", close_err)
+            else:
+                # Fallback: kickoff didn't fire (e.g. an import failed inside
+                # the wrapped research runner). Run the original sequential
+                # path so the cockpit still shows a discovery result.
+                from packages.agents.llm_router import LLMRouter
+                from packages.agents.runners import build_discovery_runner
+                from packages.shared.schemas import DiscoveryInput
+
+                d_router = LLMRouter()
+                try:
+                    d_runner = build_discovery_runner(d_router, scorecard_summary=scorecard_summary)
+                    d_in = DiscoveryInput(
+                        decision_id=result.decision_id,
+                        regime=regime,  # type: ignore[arg-type]
+                        universe=disc_universe,
+                        features=disc_features,
+                        recent_thesis=result.research.thesis,
+                    )
+                    _progress_begin("discovery")
+                    try:
+                        d_out = await d_runner(d_in)
+                        _progress_end("discovery", "ok")
+                    except Exception:
+                        _progress_end("discovery", "failed")
+                        raise
+                finally:
+                    await d_router.aclose()
         else:
             # Deterministic stub: derive at most one pattern from the existing
             # research/strategy outputs so the cockpit shows something useful
@@ -1924,6 +2190,39 @@ def autopilot_page() -> HTMLResponse:
 async def _autopilot_startup() -> None:  # pragma: no cover
     if _AUTOPILOT_STATE.enabled:
         _start_autopilot_task()
+
+
+# Background pre-warm so the first Run on /agents doesn't pay a 30-90s
+# per-agent cold-start cost. Honors COCKPIT_WARMUP_ON_STARTUP (default on);
+# set to 0 to disable for dev. Runs as a fire-and-forget task so the
+# cockpit boots immediately — the user can hit pages while warmup churns.
+@app.on_event("startup")
+async def _ollama_warmup_startup() -> None:  # pragma: no cover
+    if os.environ.get("COCKPIT_WARMUP_ON_STARTUP", "1") not in ("1", "true", "True"):
+        log.info("Ollama warmup disabled via COCKPIT_WARMUP_ON_STARTUP=0")
+        return
+
+    async def _bg_warmup() -> None:
+        # Wait a tick so the rest of startup finishes and the daemon (if
+        # auto-started elsewhere) has a chance to come up.
+        await asyncio.sleep(2.0)
+        try:
+            result = await _warmup_models()
+            if result.get("ok"):
+                log.info(
+                    "Ollama warmup complete in %.1fs (%d models)",
+                    result.get("total_elapsed_s", 0.0),
+                    len(result.get("results") or []),
+                )
+            else:
+                log.warning("Ollama warmup finished with errors: %s", result.get("error") or "see /api/ollama/warmup_status")
+        except Exception as e:  # don't crash startup over a warmup failure
+            log.warning("Ollama warmup skipped: %s", e)
+
+    # Stored on module state so the task isn't GC'd mid-warmup. Cleared
+    # automatically when the task finishes.
+    global _WARMUP_BG_TASK
+    _WARMUP_BG_TASK = asyncio.create_task(_bg_warmup())
 
 
 @app.on_event("shutdown")

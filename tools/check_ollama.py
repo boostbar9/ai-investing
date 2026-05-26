@@ -124,6 +124,57 @@ def ensure_daemon(host: str, *, verbose: bool = True) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _backend_snapshot(host: str, timeout: float = 2.0) -> dict:
+    """Detect whether Ollama is using GPU or CPU.
+
+    Calls ``/api/ps`` which reports any *currently loaded* model along
+    with a ``size_vram`` field. If size_vram > 0 the model is on the GPU.
+    If no model is loaded we can't tell from /api/ps alone, so we return
+    ``backend="unknown"`` and the caller surfaces an idle state to the UI.
+
+    Returns a dict with keys:
+      * backend:  'gpu' | 'cpu' | 'unknown'
+      * loaded:   list of currently-loaded models (with size_vram + size)
+      * vram_used_bytes: total VRAM in use
+      * gpu_fraction:  fraction of the loaded model on GPU (0.0–1.0)
+    """
+    out: dict = {
+        "backend": "unknown",
+        "loaded": [],
+        "vram_used_bytes": 0,
+        "gpu_fraction": 0.0,
+    }
+    try:
+        req = urllib.request.Request(f"{host}/api/ps")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return out
+    models = data.get("models") or []
+    total_vram = 0
+    total_size = 0
+    for m in models:
+        vram = int(m.get("size_vram") or 0)
+        size = int(m.get("size") or 0)
+        total_vram += vram
+        total_size += size
+        out["loaded"].append({
+            "name": m.get("name") or m.get("model") or "?",
+            "size_vram": vram,
+            "size": size,
+            "on_gpu": vram > 0,
+        })
+    out["vram_used_bytes"] = total_vram
+    if total_size > 0:
+        out["gpu_fraction"] = round(total_vram / total_size, 3)
+    if models:
+        if total_vram > 0:
+            out["backend"] = "gpu" if out["gpu_fraction"] >= 0.5 else "partial-gpu"
+        else:
+            out["backend"] = "cpu"
+    return out
+
+
 def _list_installed(host: str, timeout: float = 5.0) -> list[str]:
     """Hit ``GET /api/tags`` and return installed model tags."""
     req = urllib.request.Request(f"{host}/api/tags")
@@ -261,6 +312,7 @@ def status_snapshot(host: str | None = None, profile_name: str | None = None) ->
             "missing": required,  # we can't verify, so report worst case
             "ready": False,
             "cli_on_path": bool(shutil.which("ollama")),
+            "backend": {"backend": "unknown", "loaded": [], "vram_used_bytes": 0, "gpu_fraction": 0.0},
         }
 
     try:
@@ -268,6 +320,7 @@ def status_snapshot(host: str | None = None, profile_name: str | None = None) ->
     except (urllib.error.URLError, TimeoutError, OSError):
         installed = []
     missing = [r for r in required if not _matches(r, installed)]
+    backend = _backend_snapshot(h)
     return {
         "host": h,
         "daemon_alive": True,
@@ -277,6 +330,7 @@ def status_snapshot(host: str | None = None, profile_name: str | None = None) ->
         "missing": missing,
         "ready": len(missing) == 0,
         "cli_on_path": bool(shutil.which("ollama")),
+        "backend": backend,
     }
 
 
