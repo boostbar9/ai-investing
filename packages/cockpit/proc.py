@@ -47,6 +47,50 @@ STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 MAX_LOG_BYTES: Final[int] = 2 * 1024 * 1024  # 2 MiB
 
 
+# psutil is the only cross-platform way to ask "is this PID alive?" that
+# doesn't blow up on Windows. The previous implementation used
+# ``os.kill(pid, 0)``, which is the canonical POSIX liveness probe but on
+# Windows hits a CPython quirk: for an unknown/exited PID the underlying
+# OpenProcess call fails with WinError 87 and the wrapper raises
+# ``SystemError: <built-in function kill> returned a result with an exception
+# set`` instead of a plain ``OSError``. That uncaught SystemError crashed
+# ``/api/health`` with a 500, which left every dashboard stuck on
+# "Loading..." on Windows. psutil handles all the platform edge cases and
+# also distinguishes zombie/exited processes from live ones.
+try:
+    import psutil as _psutil
+except ImportError:  # pragma: no cover - psutil ships with the dev env
+    _psutil = None  # type: ignore[assignment]
+
+
+def _pid_is_running(pid: int) -> bool:
+    """Return True if ``pid`` refers to a live, non-zombie process.
+
+    Safe on both POSIX and Windows. Returns False for any error
+    (permission denied, exited, never existed, etc.) instead of raising
+    so callers don't have to guard every status check.
+    """
+    if pid is None or pid <= 0:
+        return False
+    if _psutil is not None:
+        try:
+            proc = _psutil.Process(pid)
+        except (_psutil.NoSuchProcess, _psutil.AccessDenied, ValueError, OverflowError):
+            return False
+        try:
+            return proc.is_running() and proc.status() != _psutil.STATUS_ZOMBIE
+        except (_psutil.NoSuchProcess, _psutil.AccessDenied):
+            return False
+    # Fallback for environments without psutil. POSIX-only path; on Windows
+    # this branch shouldn't trigger because psutil is in our requirements,
+    # but guard against the SystemError quirk anyway.
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, SystemError, ProcessLookupError, PermissionError):
+        return False
+
+
 @dataclass
 class JobInfo:
     """Snapshot of a managed job."""
@@ -74,12 +118,7 @@ class JobInfo:
     def is_running(self) -> bool:
         if self.pid is None:
             return False
-        try:
-            # Signal 0 just checks for existence on POSIX; Windows raises if dead.
-            os.kill(self.pid, 0)
-            return True
-        except OSError:
-            return False
+        return _pid_is_running(self.pid)
 
 
 _lock = threading.Lock()
