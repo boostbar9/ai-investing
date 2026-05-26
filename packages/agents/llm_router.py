@@ -25,7 +25,27 @@ log = logging.getLogger(__name__)
 
 # Re-exported so existing call sites that imported LLMChain from here keep
 # working.
-__all__ = ["EMERGENCY_FALLBACK_MODELS", "LLMChain", "LLMError", "LLMRouter"]
+__all__ = [
+    "EMERGENCY_FALLBACK_MODELS",
+    "LLMChain",
+    "LLMError",
+    "LLMRouter",
+    "installed_matches",
+]
+
+# Connection retry knobs. Ollama can hiccup for a fraction of a second when
+# loading a fresh model into VRAM (it briefly stops accepting new connections
+# while it mmap()s the weights). One retry with a tiny backoff is enough to
+# ride that out without papering over a daemon that's truly dead.
+_CONNECT_RETRIES = 1
+_CONNECT_RETRY_DELAY_S = 0.5
+
+# Loading a cold 32B model from disk can take 20-30s on a spinning disk before
+# Ollama even starts generating tokens. The first call to a freshly-installed
+# model gets this longer ceiling so we don't spuriously fall back when the
+# operator's box is just paging the weights in. Subsequent calls fall back to
+# the caller-supplied timeout because by then the model is warm.
+_COLD_START_TIMEOUT_S = 90
 
 # Universal fallback tier. Picked because:
 #   - qwen2.5:7b-instruct-q4_K_M appears in every profile's quantized slot,
@@ -38,6 +58,39 @@ EMERGENCY_FALLBACK_MODELS: tuple[str, ...] = (
     "qwen2.5:7b-instruct-q4_K_M",
     "llama3.2:3b-instruct-q4_K_M",
 )
+
+
+def installed_matches(required: str, installed: frozenset[str]) -> bool:
+    """Liberal name match between a declared model and Ollama's tag list.
+
+    Mirrors :func:`tools.check_ollama._matches` so the router accepts the same
+    "close enough" inventory as the cockpit health row. Cases we want to
+    accept:
+
+    * ``deepseek-r1:32b`` matches ``deepseek-r1:32b`` (exact)
+    * ``deepseek-r1:32b`` matches ``deepseek-r1:32b-q4_K_M`` (quantized variant)
+    * ``qwen2.5:7b-instruct-q4_K_M`` matches ``qwen2.5:7b-instruct-q4_K_M``
+    * ``qwen2.5:7b-instruct-q4_K_M`` matches ``qwen2.5:7b-instruct-q4_K_S``
+      (different K-quant; weights are interchangeable enough for fallback)
+    * Bare base ``qwen3`` matches ``qwen3:14b`` (profile sometimes omits tag)
+    """
+    if required in installed:
+        return True
+    base = required.split(":", 1)[0]
+    target_tag = required.split(":", 1)[1] if ":" in required else ""
+    for tag in installed:
+        if tag == base:
+            return True
+        if not tag.startswith(base + ":"):
+            continue
+        installed_tag = tag.split(":", 1)[1] if ":" in tag else ""
+        if not target_tag:
+            return True
+        # Either side is a prefix of the other — e.g. "32b" vs "32b-q4_K_M",
+        # or "7b-instruct-q4_K_M" vs "7b-instruct-q4".
+        if installed_tag.startswith(target_tag) or target_tag.startswith(installed_tag):
+            return True
+    return False
 
 
 class LLMError(RuntimeError):
@@ -83,6 +136,10 @@ class LLMRouter:
         self.temperature = temperature
         # (cached_at, frozenset_of_installed_names). None until first fetch.
         self._installed_cache: tuple[float, frozenset[str]] | None = None
+        # Models that have served at least one successful response in this
+        # process — used to grant a longer cold-start timeout on first use
+        # so we don't fall back just because the weights are paging in.
+        self._warmed: set[str] = set()
 
     async def generate_json(
         self,
@@ -120,11 +177,11 @@ class LLMRouter:
         # Tier 1: declared chain, installed-first.
         if installed is not None:
             for m in declared:
-                if m in installed:
+                if installed_matches(m, installed):
                     _push(m)
             # Tier 2: emergency fallback, installed-first.
             for m in EMERGENCY_FALLBACK_MODELS:
-                if m in installed:
+                if installed_matches(m, installed):
                     _push(m)
         # Tier 3: everything declared, even if /api/tags said it's not
         # there. Catches the case where /api/tags itself is broken.
@@ -139,6 +196,14 @@ class LLMRouter:
         last_err: Exception | None = None
         for model in walk:
             is_fallback = model not in declared
+            # First call to a cold model gets a longer ceiling so a 32B
+            # mmap doesn't trigger a spurious fall-back. Subsequent calls
+            # use the caller-supplied timeout.
+            effective_timeout = (
+                max(timeout_seconds, _COLD_START_TIMEOUT_S)
+                if model not in self._warmed
+                else timeout_seconds
+            )
             with span(
                 "llm.generate",
                 {
@@ -146,13 +211,15 @@ class LLMRouter:
                     "model": model,
                     "decision_id": decision_id,
                     "fallback": is_fallback,
+                    "cold": model not in self._warmed,
                 },
             ) as s:
                 try:
                     text = await asyncio.wait_for(
-                        self._call(model, prompt), timeout=timeout_seconds
+                        self._call(model, prompt), timeout=effective_timeout
                     )
                     s.set_attribute("llm.chars_out", len(text))
+                    self._warmed.add(model)
                     if is_fallback:
                         log.warning(
                             "agent %s served by emergency fallback model %s "
@@ -163,9 +230,43 @@ class LLMRouter:
                 except Exception as e:
                     last_err = e
                     s.set_attribute("llm.error", str(e)[:200])
+                    # If a model 404s mid-session it was uninstalled — evict
+                    # the inventory cache so the next call re-reads /api/tags
+                    # and stops trying this model.
+                    if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
+                        self._installed_cache = None
                     continue
 
         raise LLMError(f"all models failed for {agent}: {last_err}")
+
+    async def warmup(self, prompt: str = "ping") -> str | None:
+        """Pre-load the smallest installed model so the first real agent call
+        doesn't pay the cold-start latency.
+
+        Picks the first installed model from the emergency fallback tier
+        (tiniest first) since the goal is to be cheap, not capable. Returns
+        the model name that was warmed, or ``None`` if no installed model
+        could be reached. Never raises — warmup is best-effort.
+        """
+        installed = await self._installed_models()
+        if installed is None:
+            return None
+        # Iterate emergency tier in reverse so smallest (llama3.2:3b) is
+        # warmed first — fastest to load and runs on every box.
+        for candidate in reversed(EMERGENCY_FALLBACK_MODELS):
+            if not installed_matches(candidate, installed):
+                continue
+            try:
+                await asyncio.wait_for(
+                    self._call(candidate, prompt), timeout=_COLD_START_TIMEOUT_S
+                )
+                self._warmed.add(candidate)
+                log.info("router warmed %s", candidate)
+                return candidate
+            except Exception as e:
+                log.debug("warmup of %s failed: %s", candidate, e)
+                continue
+        return None
 
     async def _installed_models(self) -> frozenset[str] | None:
         """Return the set of installed model names, or ``None`` if Ollama is
@@ -204,21 +305,33 @@ class LLMRouter:
         return frozen
 
     async def _call(self, model: str, prompt: str) -> str:
-        r = await self._client.post(
-            f"{self.host}/api/generate",
-            json={
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json",
-                "options": {
-                    "num_predict": self.max_tokens,
-                    "temperature": self.temperature,
-                },
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {
+                "num_predict": self.max_tokens,
+                "temperature": self.temperature,
             },
-        )
-        r.raise_for_status()
-        return r.json().get("response", "")
+        }
+        # Retry transient connection errors once with a tiny backoff. We do
+        # NOT retry HTTP errors (404 / 500) — those are loud failures the
+        # caller should see immediately so the chain walks to the next model.
+        last_conn_err: Exception | None = None
+        for attempt in range(_CONNECT_RETRIES + 1):
+            try:
+                r = await self._client.post(f"{self.host}/api/generate", json=payload)
+                r.raise_for_status()
+                return r.json().get("response", "")
+            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+                last_conn_err = e
+                if attempt < _CONNECT_RETRIES:
+                    await asyncio.sleep(_CONNECT_RETRY_DELAY_S)
+                    continue
+                raise
+        # Unreachable, but keeps type-checkers happy.
+        raise last_conn_err  # type: ignore[misc]
 
     async def aclose(self) -> None:
         await self._client.aclose()

@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from packages.agents.llm_router import LLMError, LLMRouter
+from packages.agents.llm_router import LLMError, LLMRouter, installed_matches
 
 
 class _FakeTransport(httpx.AsyncBaseTransport):
@@ -165,4 +165,131 @@ async def test_router_recovers_when_tags_endpoint_broken():
     out = await router.generate_json("research", "x", decision_id="abc")
     # Tier 3 walks declared in order, so primary wins.
     assert out["served_by"] == "deepseek-r1:32b"
+    await router.aclose()
+
+
+def test_installed_matches_quantized_variants():
+    """The router accepts "close enough" tag variants like the cockpit does.
+
+    This is the difference between a green health row and a soak that still
+    404s because Ollama tagged the pull with a slightly different quant
+    suffix than the profile asked for.
+    """
+    inv = frozenset(
+        {
+            "deepseek-r1:32b-q4_K_M",  # quant suffix added by Ollama
+            "qwen3",                    # bare base name (no tag)
+            "qwen2.5:7b-instruct-q4",  # operator pulled a shorter tag
+        }
+    )
+    # Quant suffix added by Ollama is accepted.
+    assert installed_matches("deepseek-r1:32b", inv)
+    # Bare base name in inventory satisfies a tagged requirement.
+    assert installed_matches("qwen3:14b", inv)
+    # Installed-tag-is-prefix-of-required is accepted (their q4 satisfies our
+    # q4_K_M ask — same family, close enough for fallback).
+    assert installed_matches("qwen2.5:7b-instruct-q4_K_M", inv)
+    # Truly different model is still rejected.
+    assert not installed_matches("llama3.2:3b-instruct-q4_K_M", inv)
+
+
+@pytest.mark.asyncio
+async def test_router_retries_transient_connect_error():
+    """A single ConnectError (Ollama briefly hiccuping while it mmap()s a
+    fresh model into VRAM) must not knock the model out of the walk — the
+    router retries the call once before falling back."""
+
+    class FlapOnceTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.attempts: list[str] = []  # tracks every POST attempt
+            self.flapped = False
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path.endswith("/api/tags"):
+                return httpx.Response(
+                    200, json={"models": [{"name": "deepseek-r1:32b"}]}
+                )
+            body = json.loads(request.content)
+            self.attempts.append(body["model"])
+            if not self.flapped:
+                self.flapped = True
+                raise httpx.ConnectError("connection refused")
+            return httpx.Response(
+                200, json={"response": json.dumps({"ok": True, "served_by": body["model"]})}
+            )
+
+    transport = FlapOnceTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://x")
+    import os
+    os.environ["HARDWARE_PROFILE"] = "rx_7900_xt"
+    router = LLMRouter(host="http://x", client=client)
+    out = await router.generate_json("research", "x", decision_id="abc")
+    assert out["served_by"] == "deepseek-r1:32b"
+    # Two POSTs to the SAME model: the retry caught the flap. If the retry
+    # were absent, the second attempt would be against the next model in the
+    # walk (deepseek-r1:14b), which is not installed here.
+    assert transport.attempts == ["deepseek-r1:32b", "deepseek-r1:32b"]
+    await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_router_warmup_loads_smallest_installed_model():
+    """`warmup()` should pre-load the smallest installed emergency model so
+    the first real agent call doesn't pay cold-start latency."""
+
+    class WarmupTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.posts: list[str] = []
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path.endswith("/api/tags"):
+                # Both emergency models present; warmup must pick the smaller.
+                return httpx.Response(
+                    200,
+                    json={
+                        "models": [
+                            {"name": "qwen2.5:7b-instruct-q4_K_M"},
+                            {"name": "llama3.2:3b-instruct-q4_K_M"},
+                        ]
+                    },
+                )
+            body = json.loads(request.content)
+            self.posts.append(body["model"])
+            return httpx.Response(200, json={"response": "{}"})
+
+    transport = WarmupTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://x")
+    router = LLMRouter(host="http://x", client=client)
+    warmed = await router.warmup()
+    assert warmed == "llama3.2:3b-instruct-q4_K_M"
+    assert transport.posts == ["llama3.2:3b-instruct-q4_K_M"]
+    await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_router_evicts_cache_on_404():
+    """A model that 404s mid-session has been uninstalled — the router
+    should drop the cached inventory so the next call re-reads /api/tags
+    and stops trying that model.
+
+    Pre-load the cache directly so we can observe eviction in isolation
+    from the walk logic.
+    """
+
+    class A404Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"error": "not found"})
+
+    client = httpx.AsyncClient(transport=A404Transport(), base_url="http://x")
+    import os
+    import time
+    os.environ["HARDWARE_PROFILE"] = "rx_7900_xt"
+    router = LLMRouter(host="http://x", client=client)
+    # Seed the cache so the router thinks deepseek-r1:32b is installed; the
+    # walk will hit /api/generate, get a 404, and must drop the cache.
+    router._installed_cache = (time.monotonic(), frozenset({"deepseek-r1:32b"}))
+    assert router._installed_cache is not None
+    with pytest.raises(LLMError):
+        await router.generate_json("research", "x", decision_id="abc")
+    assert router._installed_cache is None
     await router.aclose()
