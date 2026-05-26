@@ -40,8 +40,18 @@
     to 'latest'. Pin this if a future release breaks compatibility.
 
 .PARAMETER SkipDownload
-    Skip the download step (use a previously downloaded zip in $env:TEMP).
+    Skip the download step (use a previously downloaded archive in
+    $env:TEMP -- either ollama-rocm-rdna3.7z or ollama-rocm-rdna3.zip).
     Mostly useful for testing.
+
+.NOTES
+    Asset format compatibility:
+      * Older releases (<=v0.16.1) shipped a separate *-windows-amd64-rocm.zip.
+      * Newer releases (v0.18.2+) ship a single ollama-windows-amd64.7z
+        that contains the same lib\ollama\rocm\ tree.
+    This script prefers the rocm.zip if present, falls back to the .7z,
+    and downloads the standalone 7zr.exe extractor on demand if 7-Zip
+    isn't installed locally.
 
 .EXAMPLE
     cd C:\Users\devfa\ai-investing
@@ -141,12 +151,26 @@ foreach ($k in $envVars.Keys) {
 }
 
 # ----- 4. Download the RDNA3 ROCm pack ----------------------------------------
-$tempZip = Join-Path $env:TEMP "ollama-rocm-rdna3.zip"
+# Newer likelovewant/ollama-for-amd releases (v0.18.2+) ship a single
+# `ollama-windows-amd64.7z` instead of the old split `*-rocm.zip`. We
+# accept either, and pick the extractor accordingly further down.
 $tempExtract = Join-Path $env:TEMP "ollama-rocm-rdna3"
+$tempArchive = $null
+$tempArchiveExt = $null
 
-if ($SkipDownload -and (Test-Path $tempZip)) {
-    Write-Step "Skipping download -- using cached $tempZip"
-} else {
+# Detect a cached archive from a previous run so -SkipDownload works for
+# either format.
+foreach ($ext in ".7z", ".zip") {
+    $candidate = Join-Path $env:TEMP "ollama-rocm-rdna3$ext"
+    if ($SkipDownload -and (Test-Path $candidate)) {
+        $tempArchive = $candidate
+        $tempArchiveExt = $ext
+        Write-Step "Skipping download -- using cached $candidate"
+        break
+    }
+}
+
+if (-not $tempArchive) {
     Write-Step "Downloading RDNA3 ROCm pack from likelovewant/ollama-for-amd"
 
     # Use the GitHub API to find the release asset URL for the latest tag.
@@ -161,12 +185,14 @@ if ($SkipDownload -and (Test-Path $tempZip)) {
     } catch {
         Write-Fail "GitHub API request failed: $($_.Exception.Message)"
         Write-Host "  Download manually from https://github.com/likelovewant/ollama-for-amd/releases"
-        Write-Host "  Save the *windows-amd64-rocm.zip asset to $tempZip, then re-run with -SkipDownload."
+        Write-Host "  Save the ollama-windows-amd64.7z (or *-rocm.zip) asset to"
+        Write-Host "  $env:TEMP\ollama-rocm-rdna3.7z, then re-run with -SkipDownload."
         exit 1
     }
 
-    # Pick the windows-amd64 rocm asset. Filenames vary across releases;
-    # match liberally on 'windows', 'amd64', 'rocm', '.zip'.
+    # Prefer a separate rocm zip (older layout). If absent, fall back to
+    # the consolidated windows-amd64 7z which contains lib\ollama\rocm\.
+    # Match liberally because filenames have drifted across releases.
     $asset = $release.assets | Where-Object {
         $_.name -match "windows" -and
         $_.name -match "amd64"   -and
@@ -175,17 +201,29 @@ if ($SkipDownload -and (Test-Path $tempZip)) {
     } | Select-Object -First 1
 
     if (-not $asset) {
-        Write-Fail "Could not find a windows-amd64 rocm zip in release $($release.tag_name)"
+        $asset = $release.assets | Where-Object {
+            $_.name -match "windows" -and
+            $_.name -match "amd64"   -and
+            $_.name -match "\.7z$"
+        } | Select-Object -First 1
+    }
+
+    if (-not $asset) {
+        Write-Fail "Could not find a windows-amd64 ROCm archive in release $($release.tag_name)"
+        Write-Host "  Looked for *windows*amd64*rocm*.zip or *windows*amd64*.7z"
         Write-Host "  Assets available:"
         $release.assets | ForEach-Object { Write-Host "    - $($_.name)" }
         exit 1
     }
 
+    $tempArchiveExt = if ($asset.name -match "\.7z$") { ".7z" } else { ".zip" }
+    $tempArchive = Join-Path $env:TEMP "ollama-rocm-rdna3$tempArchiveExt"
+
     Write-Host "  Release: $($release.tag_name)"
     Write-Host "  Asset:   $($asset.name) ($([math]::Round($asset.size / 1MB, 1)) MB)"
-    Write-Host "  Saving to: $tempZip"
+    Write-Host "  Saving to: $tempArchive"
 
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tempZip -UseBasicParsing
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tempArchive -UseBasicParsing
     Write-Ok "Download complete"
 }
 
@@ -201,7 +239,58 @@ Write-Ok "Backed up to $backupDir"
 Write-Step "Extracting RDNA3 ROCm DLLs into Ollama install"
 
 if (Test-Path $tempExtract) { Remove-Item -Recurse -Force $tempExtract }
-Expand-Archive -Path $tempZip -DestinationPath $tempExtract -Force
+New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
+
+if ($tempArchiveExt -eq ".zip") {
+    Expand-Archive -Path $tempArchive -DestinationPath $tempExtract -Force
+} else {
+    # 7z extraction. PowerShell has no native 7z support, so we try a
+    # short chain of options: installed 7z.exe (most dev boxes have one),
+    # then a cached 7zr.exe in $env:TEMP, then we download the official
+    # standalone 7zr.exe (~600 KB) from 7-zip.org. 7zr handles 7z files
+    # without needing the full installer.
+    function Resolve-SevenZip {
+        $candidates = @(
+            "$env:ProgramFiles\7-Zip\7z.exe",
+            "$env:ProgramFiles(x86)\7-Zip\7z.exe",
+            "$env:TEMP\7zr.exe"
+        )
+        foreach ($p in $candidates) {
+            if ($p -and (Test-Path $p)) { return $p }
+        }
+        # System PATH (covers chocolatey/scoop installs).
+        $cmd = Get-Command 7z.exe -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+        $cmd = Get-Command 7zr.exe -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+        return $null
+    }
+
+    $sevenZip = Resolve-SevenZip
+    if (-not $sevenZip) {
+        Write-Host "  No 7-Zip found locally -- downloading standalone 7zr.exe (~600 KB)"
+        $sevenZip = Join-Path $env:TEMP "7zr.exe"
+        try {
+            Invoke-WebRequest -Uri "https://www.7-zip.org/a/7zr.exe" `
+                              -OutFile $sevenZip -UseBasicParsing
+            Write-Ok "Fetched 7zr.exe"
+        } catch {
+            Write-Fail "Couldn't fetch 7zr.exe: $($_.Exception.Message)"
+            Write-Host "  Install 7-Zip from https://www.7-zip.org/ and re-run with -SkipDownload,"
+            Write-Host "  or extract $tempArchive manually into $tempExtract and re-run with -SkipDownload."
+            exit 1
+        }
+    }
+
+    Write-Host "  Using 7-Zip at: $sevenZip"
+    Write-Host "  Extracting $tempArchive -> $tempExtract"
+    # -y: assume Yes on prompts; -o (no space) sets the output dir.
+    & $sevenZip x $tempArchive "-o$tempExtract" -y | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "7-Zip extraction failed with exit code $LASTEXITCODE"
+        exit 1
+    }
+}
 
 # The zip layout from ollama-for-amd is the full Ollama install tree.
 # We only want lib\ollama\rocm\* (and specifically rocblas.dll + rocblas/library/).
