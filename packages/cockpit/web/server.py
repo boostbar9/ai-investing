@@ -69,6 +69,91 @@ secrets.hydrate_environment()
 log = logging.getLogger("cockpit")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+
+# --------------------------------------------------------------------------
+# Quiet the uvicorn access log
+# --------------------------------------------------------------------------
+# The cockpit UI polls a handful of status endpoints every 3-5 seconds
+# (``/api/state``, ``/api/jobs``, ``/api/errors``, ``/api/health``,
+# ``/api/ollama/status``, ``/api/agents/...``). Without this filter, each
+# poll fires an INFO access-log line on the terminal, which buries real
+# events like POSTs, exit codes, and the once-per-startup OTel warning
+# under a wall of identical 200 OKs.
+#
+# This filter drops the access record only when *all* of the following are
+# true: GET method, 200/304 status, and the URL is one of the high-frequency
+# polling paths or any SSE ``/stream`` endpoint. Everything else (POSTs,
+# page loads, non-2xx, downloads, one-off API hits) still logs normally.
+#
+# Note: uvicorn emits access logs by writing a single argument tuple
+# ``(client_addr, method, path, http_version, status)`` to the
+# ``uvicorn.access`` logger. We sniff that tuple shape and pattern-match
+# the path; if uvicorn ever changes its access format the filter falls
+# through to ``True`` so we never accidentally silence real errors.
+_QUIET_PATH_PREFIXES: tuple[str, ...] = (
+    "/api/state",
+    "/api/jobs",  # also covers /api/jobs/<kind>/stream
+    "/api/errors",
+    "/api/health",
+    "/api/mode",
+    "/api/ollama/status",
+    "/api/agents/last",
+    "/api/agents/schedule",
+    "/api/agents/history",
+    "/api/agents/scorecard",
+    "/api/agents/promotion_candidates",
+    "/api/autopilot",
+    "/api/trading/status",
+    "/api/watchdog",
+    "/api/equity-summary",
+    "/api/promote",
+    "/static/",
+    "/favicon.ico",
+)
+
+
+class _UvicornAccessQuietFilter(logging.Filter):
+    """Suppress 2xx/304 GET access log lines for high-frequency poll paths."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 5:
+            return True
+        method = args[1]
+        path = args[2]
+        status = args[4]
+        if not isinstance(method, str) or not isinstance(path, str):
+            return True
+        try:
+            status_int = int(status)
+        except (TypeError, ValueError):
+            return True
+        if method != "GET":
+            return True
+        if status_int not in (200, 304):
+            return True
+        # Strip the query string before prefix-matching.
+        bare = path.split("?", 1)[0]
+        return not bare.startswith(_QUIET_PATH_PREFIXES)
+
+
+def _install_uvicorn_access_filter() -> None:
+    """Attach the quiet filter to ``uvicorn.access``. Idempotent.
+
+    Safe to call multiple times: we tag the filter instance with a marker
+    attribute and skip if an instance with that marker is already attached.
+    """
+    access_log = logging.getLogger("uvicorn.access")
+    for existing in access_log.filters:
+        if getattr(existing, "_cockpit_quiet", False):
+            return
+    flt = _UvicornAccessQuietFilter()
+    flt._cockpit_quiet = True  # type: ignore[attr-defined]
+    access_log.addFilter(flt)
+
+
+_install_uvicorn_access_filter()
+
 PAPER_LOG = Path("data/paper_log/runs.jsonl")
 # Append-only log of every LangGraph agent advisory run. Capped at AGENT_LOG_MAX
 # lines via simple tail-trim so it never grows unbounded.
