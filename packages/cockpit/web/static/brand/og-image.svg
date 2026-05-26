@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Open Graph / social preview card. 1200x630 is the canonical size. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <linearGradient id="ogbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#020617"/>
+    </linearGradient>
+    <linearGradient id="ogup" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#059669"/>
+      <stop offset="1" stop-color="#34d399"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.85" cy="0.18" r="0.55">
+      <stop offset="0" stop-color="#10b981" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#10b981" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#ogbg)"/>
+  <rect width="1200" height="630" fill="url(#glow)"/>
+
+  <!-- decorative chart line in background -->
+  <path d="M 0 480 L 120 460 L 220 470 L 340 420 L 460 430 L 580 380 L 700 340 L 820 290 L 940 260 L 1060 200 L 1200 160"
+        stroke="#1f2937" stroke-width="2" fill="none"/>
+  <path d="M 0 480 L 120 460 L 220 470 L 340 420 L 460 430 L 580 380 L 700 340 L 820 290 L 940 260 L 1060 200 L 1200 160 L 1200 630 L 0 630 Z"
+        fill="#10b981" opacity="0.05"/>
+
+  <!-- brand mark, large -->
+  <g transform="translate(80,100)">
+    <rect width="180" height="180" rx="38" ry="38" fill="#111827"/>
+    <rect x="1" y="1" width="178" height="178" rx="37" ry="37" fill="none" stroke="#1f2937" stroke-width="2"/>
+    <line x1="45" y1="118" x2="45" y2="146" stroke="url(#ogup)" stroke-width="5" stroke-linecap="round"/>
+    <rect x="36.5" y="124" width="17" height="22" rx="4" fill="url(#ogup)"/>
+    <line x1="90" y1="78" x2="90" y2="134" stroke="url(#ogup)" stroke-width="5" stroke-linecap="round"/>
+    <rect x="81.5" y="90" width="17" height="39" rx="4" fill="url(#ogup)"/>
+    <line x1="135" y1="38" x2="135" y2="118" stroke="url(#ogup)" stroke-width="5" stroke-linecap="round"/>
+    <rect x="126.5" y="50" width="17" height="62" rx="4" fill="url(#ogup)"/>
+    <circle cx="135" cy="34" r="10" fill="#f59e0b"/>
+    <circle cx="135" cy="34" r="17" fill="none" stroke="#f59e0b" stroke-width="2" opacity="0.4"/>
+  </g>
+
+  <!-- wordmark + tagline -->
+  <text x="80" y="380" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,sans-serif" font-size="84" font-weight="700" letter-spacing="-2" fill="#f9fafb">ai-investing</text>
+  <text x="80" y="430" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,sans-serif" font-size="30" font-weight="400" fill="#9ca3af">Autonomous paper-trading cockpit</text>
+
+  <!-- status pills -->
+  <g transform="translate(80,490)" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,sans-serif" font-size="20" font-weight="500">
+    <rect width="180" height="44" rx="22" fill="#064e3b"/>
+    <text x="90" y="29" text-anchor="middle" fill="#6ee7b7">Local-first</text>
+    <g transform="translate(200,0)">
+      <rect width="220" height="44" rx="22" fill="#0c4a6e"/>
+      <text x="110" y="29" text-anchor="middle" fill="#7dd3fc">Multi-agent LLM</text>
+    </g>
+    <g transform="translate(440,0)">
+      <rect width="200" height="44" rx="22" fill="#3f1d1d"/>
+      <text x="100" y="29" text-anchor="middle" fill="#fca5a5">60-day soak</text>
+    </g>
+  </g>
+</svg>

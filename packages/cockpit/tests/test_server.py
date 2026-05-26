@@ -1114,10 +1114,13 @@ def test_errors_page_includes_share_snapshot_card(snapshot_client: TestClient) -
     assert "/api/health-snapshot" in html
 
 
-def test_favicon_returns_no_content_when_file_missing(client: TestClient) -> None:
-    """Without a favicon.ico on disk we return 204 — not 404 — so the
+def test_favicon_falls_back_to_204_when_files_missing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If both candidate ICO paths are missing we return 204 — not 404 — so the
     browser stops logging warnings on every page load. The exact status
     matters because some browsers will keep retrying on 404."""
+    monkeypatch.setattr(srv, "_STATIC_DIR", tmp_path / "empty-static")
     r = client.get("/favicon.ico")
     assert r.status_code == 204
     assert r.content == b""
@@ -1354,3 +1357,52 @@ def test_autopilot_page_renders_html(client: TestClient) -> None:
     assert r.status_code == 200
     assert "text/html" in r.headers.get("content-type", "")
     assert "autopilot" in r.text.lower()
+
+
+# --------------------------------------------------------------------------
+# Branding / favicon (icons, OG card, manifest)
+# --------------------------------------------------------------------------
+
+
+def test_favicon_serves_real_ico(client: TestClient) -> None:
+    """``GET /favicon.ico`` returns the multi-size ICO from static/brand/."""
+    r = client.get("/favicon.ico")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/x-icon"
+    # ICO files begin with the bytes 00 00 01 00
+    assert r.content[:4] == b"\x00\x00\x01\x00"
+
+
+def test_brand_assets_are_mounted(client: TestClient) -> None:
+    """Each declared icon variant is reachable through /static/brand/."""
+    for path in (
+        "/static/brand/logo.svg",
+        "/static/brand/favicon-16.png",
+        "/static/brand/favicon-32.png",
+        "/static/brand/favicon.ico",
+        "/static/brand/apple-touch-icon.png",
+        "/static/brand/icon-192.png",
+        "/static/brand/icon-512.png",
+        "/static/brand/og-image.png",
+        "/static/brand/site.webmanifest",
+    ):
+        r = client.get(path)
+        assert r.status_code == 200, f"missing brand asset: {path}"
+
+
+def test_every_page_links_favicon_and_og(client: TestClient) -> None:
+    """All HTML routes must include the icon partial so browser tabs and
+    social previews look right no matter which page the user opens first."""
+    pages = [
+        "/", "/agents", "/autopilot", "/errors", "/health",
+        "/models", "/promote", "/settings", "/trading", "/updates",
+    ]
+    for path in pages:
+        r = client.get(path)
+        assert r.status_code == 200, path
+        body = r.text
+        assert "/static/brand/logo.svg" in body, f"{path} missing svg icon link"
+        assert "/static/brand/favicon-32.png" in body, f"{path} missing 32px icon"
+        assert "/static/brand/apple-touch-icon.png" in body, f"{path} missing apple icon"
+        assert "/static/brand/og-image.png" in body, f"{path} missing OG card"
+        assert 'property="og:title"' in body, f"{path} missing og:title"

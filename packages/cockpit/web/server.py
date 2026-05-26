@@ -27,6 +27,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -305,18 +306,21 @@ if _STATIC_DIR.exists():
 
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon() -> Response:
-    """Return 204 so browsers stop logging 404s for the missing favicon.
+    """Serve the legacy /favicon.ico path.
 
-    If a real ``favicon.ico`` ever ships under ``static/``, FastAPI's static
-    mount serves it directly and this route is a no-op fallback. Today we
-    just want a clean log on startup.
+    Modern browsers pick up the icons declared in the template <head> and
+    never hit this route; older browsers (and Windows pinned tabs) still
+    request /favicon.ico directly. The real multi-size ICO lives under
+    ``static/brand/favicon.ico`` -- this route just bridges the well-known
+    path to it. Falls back to a legacy top-level file or a 204 so the
+    server log stays clean either way.
     """
-    favicon_path = _STATIC_DIR / "favicon.ico"
-    if favicon_path.exists():
-        return Response(
-            content=favicon_path.read_bytes(),
-            media_type="image/x-icon",
-        )
+    for candidate in (_STATIC_DIR / "brand" / "favicon.ico", _STATIC_DIR / "favicon.ico"):
+        if candidate.exists():
+            return Response(
+                content=candidate.read_bytes(),
+                media_type="image/x-icon",
+            )
     return Response(status_code=204)
 
 
@@ -361,11 +365,36 @@ def health_page() -> HTMLResponse:
     return _render("health.html")
 
 
+_TEMPLATES_DIR = Path(__file__).parent / "templates"
+_INCLUDE_PATTERN = re.compile(r"\{%\s*include\s+['\"]([^'\"]+)['\"]\s*%\}")
+
+
 def _render(name: str) -> HTMLResponse:
-    path = Path(__file__).parent / "templates" / name
+    """Read a template file and expand any ``{% include 'foo.html' %}`` tags.
+
+    A full Jinja2 dependency would be overkill for the handful of partials
+    the cockpit needs (currently just ``_head_icons.html``), so we do a
+    one-pass include expansion ourselves. Includes resolve relative to the
+    templates directory; missing partials degrade gracefully with an HTML
+    comment so a typo doesn't break the whole page.
+    """
+    path = _TEMPLATES_DIR / name
     if not path.exists():
         return HTMLResponse(f"<h1>template missing: {name}</h1>", status_code=500)
-    return HTMLResponse(path.read_text(encoding="utf-8"))
+    return HTMLResponse(_expand_includes(path.read_text(encoding="utf-8")))
+
+
+def _expand_includes(body: str, _depth: int = 0) -> str:
+    if _depth > 4:  # paranoid recursion guard
+        return body
+
+    def repl(m: re.Match[str]) -> str:
+        included = _TEMPLATES_DIR / m.group(1)
+        if not included.exists():
+            return f"<!-- include not found: {m.group(1)} -->"
+        return _expand_includes(included.read_text(encoding="utf-8"), _depth + 1)
+
+    return _INCLUDE_PATTERN.sub(repl, body)
 
 
 @app.get("/api/health")
