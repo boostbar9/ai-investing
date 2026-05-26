@@ -40,7 +40,7 @@ def test_no_template_loads_cockpit_js_with_defer():
     )
 
 
-def test_every_template_that_uses_Cockpit_loads_the_bundle():
+def test_every_template_that_uses_cockpit_loads_the_bundle():
     """Sanity check: any template using Cockpit.* must load cockpit.js."""
     missing = []
     for path in _templates():

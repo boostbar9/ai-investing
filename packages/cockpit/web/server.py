@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,7 @@ _QUIET_PATH_PREFIXES: tuple[str, ...] = (
     "/api/mode",
     "/api/ollama/status",
     "/api/agents/last",
+    "/api/agents/in_flight",
     "/api/agents/schedule",
     "/api/agents/history",
     "/api/agents/scorecard",
@@ -1198,6 +1200,87 @@ def api_agents_last() -> dict[str, Any]:
     return _last_run_payload()
 
 
+# Live progress for an in-flight /api/agents/run call. The Run button on
+# /agents polls this every second while it awaits the POST so the user
+# sees *which* agent is currently calling Ollama, not just an opaque
+# "calling Ollama... 69s" ticker. Updated by the run handler before/after
+# each agent step; reset between runs.
+_AGENT_PROGRESS: dict[str, Any] = {
+    "active": False,
+    "started_at": None,
+    "current_agent": None,  # 'research' | 'strategy' | 'risk' | 'execution' | 'discovery' | None
+    "agent_started_at": None,
+    "completed": [],  # list of {agent, elapsed_s, status}
+    "backend": None,  # 'llm' | 'stub'
+    "error": None,
+}
+_PROGRESS_AGENTS = ("preflight", "research", "strategy", "risk", "execution", "discovery")
+
+
+def _progress_reset(backend: str) -> None:
+    _AGENT_PROGRESS.clear()
+    _AGENT_PROGRESS.update({
+        "active": True,
+        "started_at": time.monotonic(),
+        "current_agent": None,
+        "agent_started_at": None,
+        "completed": [],
+        "backend": backend,
+        "error": None,
+    })
+
+
+def _progress_begin(agent: str) -> None:
+    _AGENT_PROGRESS["current_agent"] = agent
+    _AGENT_PROGRESS["agent_started_at"] = time.monotonic()
+
+
+def _progress_end(agent: str, status: str = "ok") -> None:
+    started = _AGENT_PROGRESS.get("agent_started_at") or time.monotonic()
+    elapsed = max(0.0, time.monotonic() - float(started))
+    _AGENT_PROGRESS["completed"].append({
+        "agent": agent,
+        "elapsed_s": round(elapsed, 2),
+        "status": status,
+    })
+    _AGENT_PROGRESS["current_agent"] = None
+    _AGENT_PROGRESS["agent_started_at"] = None
+
+
+def _progress_finish(error: str | None = None) -> None:
+    _AGENT_PROGRESS["active"] = False
+    _AGENT_PROGRESS["current_agent"] = None
+    _AGENT_PROGRESS["agent_started_at"] = None
+    if error:
+        _AGENT_PROGRESS["error"] = error
+
+
+@app.get("/api/agents/in_flight")
+def api_agents_in_flight() -> dict[str, Any]:
+    """Live progress for the currently-running pipeline (if any).
+
+    Polled by the /agents Run button every 1s during a run so the user
+    sees per-agent progress (e.g. ``strategy ... 12s``) instead of a
+    single opaque counter that just keeps ticking up.
+    """
+    now = time.monotonic()
+    snap: dict[str, Any] = {
+        "active": bool(_AGENT_PROGRESS.get("active")),
+        "current_agent": _AGENT_PROGRESS.get("current_agent"),
+        "backend": _AGENT_PROGRESS.get("backend"),
+        "completed": list(_AGENT_PROGRESS.get("completed") or []),
+        "error": _AGENT_PROGRESS.get("error"),
+        "all_agents": list(_PROGRESS_AGENTS),
+    }
+    started = _AGENT_PROGRESS.get("started_at")
+    snap["elapsed_s"] = round(now - float(started), 2) if started else 0.0
+    agent_started = _AGENT_PROGRESS.get("agent_started_at")
+    snap["current_agent_elapsed_s"] = (
+        round(now - float(agent_started), 2) if agent_started else 0.0
+    )
+    return snap
+
+
 @app.post("/api/agents/run")
 async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
     """Run one advisory pass of the LangGraph agent graph.
@@ -1239,46 +1322,98 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
             log.warning("scorecard summary skipped: %s", e)
             scorecard_summary = None
 
-    if req.use_llm:
-        # LLM-backed runners (Ollama). Build a fresh graph so we don't have
-        # to import inside the bridge module.
-        from packages.agents.graph import AgentGraph
-        from packages.agents.llm_router import LLMRouter
-        from packages.agents.runners import (
-            build_execution_runner,
-            build_research_runner,
-            build_risk_runner,
-            build_strategy_runner,
-        )
-
-        async def _auto_approve(sigs, _did):  # type: ignore[no-untyped-def]
-            return sigs
-
-        router = LLMRouter()
-        try:
-            graph = AgentGraph(
-                research=build_research_runner(router, scorecard_summary=scorecard_summary),
-                strategy=build_strategy_runner(router, scorecard_summary=scorecard_summary),
-                risk=build_risk_runner(router, scorecard_summary=scorecard_summary),
-                execution=build_execution_runner(router, scorecard_summary=scorecard_summary),
-                approval=_auto_approve,
+    # Live progress tracking — polled by the /agents Run button every 1s
+    # via /api/agents/in_flight so the user sees *which* agent is calling
+    # Ollama, not just an opaque elapsed counter. Reset on every run.
+    _progress_reset("llm" if req.use_llm else "stub")
+    try:
+        if req.use_llm:
+            # LLM-backed runners (Ollama). Build a fresh graph so we don't have
+            # to import inside the bridge module.
+            from packages.agents.graph import AgentGraph
+            from packages.agents.llm_router import LLMRouter
+            from packages.agents.runners import (
+                build_execution_runner,
+                build_research_runner,
+                build_risk_runner,
+                build_strategy_runner,
             )
-            result = await graph.run(
+
+            async def _auto_approve(sigs, _did):  # type: ignore[no-untyped-def]
+                return sigs
+
+            # Preflight: fail fast if Ollama isn't reachable at all rather than
+            # letting the user sit through a 90s cold-start timeout per agent.
+            _progress_begin("preflight")
+            try:
+                import httpx as _httpx
+                _ollama_host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+                async with _httpx.AsyncClient(timeout=3.0) as _hc:
+                    _r = await _hc.get(f"{_ollama_host}/api/tags")
+                    _r.raise_for_status()
+                _progress_end("preflight", "ok")
+            except Exception as preflight_err:
+                _progress_end("preflight", "failed")
+                _progress_finish(error=f"Ollama unreachable: {preflight_err}")
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Ollama is not reachable at {_ollama_host}. "
+                        f"Start Ollama (or visit /models to install it), "
+                        f"then try again. Original error: {preflight_err}"
+                    ),
+                ) from preflight_err
+
+            # Wrap each runner so we can mark begin/end on the live progress
+            # dict without modifying the underlying runner factories.
+            def _instrument(agent_name: str, runner):  # type: ignore[no-untyped-def]
+                async def _wrapped(inp):  # type: ignore[no-untyped-def]
+                    _progress_begin(agent_name)
+                    try:
+                        out = await runner(inp)
+                        _progress_end(agent_name, "ok")
+                        return out
+                    except Exception:
+                        _progress_end(agent_name, "failed")
+                        raise
+                return _wrapped
+
+            router = LLMRouter()
+            try:
+                graph = AgentGraph(
+                    research=_instrument("research", build_research_runner(router, scorecard_summary=scorecard_summary)),
+                    strategy=_instrument("strategy", build_strategy_runner(router, scorecard_summary=scorecard_summary)),
+                    risk=_instrument("risk", build_risk_runner(router, scorecard_summary=scorecard_summary)),
+                    execution=_instrument("execution", build_execution_runner(router, scorecard_summary=scorecard_summary)),
+                    approval=_auto_approve,
+                )
+                result = await graph.run(
+                    symbols=symbols,
+                    regime=regime,
+                    positions=[Position(symbol=s, qty=0.0, avg_price=0.0) for s in symbols],
+                    features={},
+                )
+            finally:
+                await router.aclose()
+        else:
+            # Stub backend: mark each stub agent in sequence so the UI still
+            # shows progression (these usually finish in <100ms total).
+            for _stub_agent in ("research", "strategy", "risk", "execution"):
+                _progress_begin(_stub_agent)
+                _progress_end(_stub_agent, "ok")
+            result = await paper_bridge.advise(
                 symbols=symbols,
                 regime=regime,
                 positions=[Position(symbol=s, qty=0.0, avg_price=0.0) for s in symbols],
-                features={},
+                target_weights=target_weights,
+                sentiment_scores=None,
             )
-        finally:
-            await router.aclose()
-    else:
-        result = await paper_bridge.advise(
-            symbols=symbols,
-            regime=regime,
-            positions=[Position(symbol=s, qty=0.0, avg_price=0.0) for s in symbols],
-            target_weights=target_weights,
-            sentiment_scores=None,
-        )
+    except HTTPException:
+        _progress_finish(error=_AGENT_PROGRESS.get("error") or "http error")
+        raise
+    except Exception as run_err:
+        _progress_finish(error=str(run_err))
+        raise
 
     # Build per-agent status. "ok" / "warn" / "halt" maps cleanly to the
     # cockpit pill classes (green / yellow / red).
@@ -1335,7 +1470,13 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
                     features=disc_features,
                     recent_thesis=result.research.thesis,
                 )
-                d_out = await d_runner(d_in)
+                _progress_begin("discovery")
+                try:
+                    d_out = await d_runner(d_in)
+                    _progress_end("discovery", "ok")
+                except Exception:
+                    _progress_end("discovery", "failed")
+                    raise
             finally:
                 await d_router.aclose()
         else:
@@ -1453,6 +1594,7 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
     _LAST_AGENT_RUN.clear()
     _LAST_AGENT_RUN.update(payload)
     _append_agent_log(payload)
+    _progress_finish()
     return payload
 
 

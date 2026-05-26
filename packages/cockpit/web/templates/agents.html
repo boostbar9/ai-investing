@@ -401,10 +401,43 @@
       const ticker = Cockpit.elapsedTicker(meta, {
         text: useLlm ? 'calling Ollama' : 'running deterministic stubs',
       });
+      // Poll the live progress endpoint so the user sees *which* agent is
+      // running, not just an opaque "calling Ollama... 69s" counter. The
+      // poll fires every 1s and rewrites the ticker text in place. We also
+      // visually mark each agent dot as it transitions running → ok/failed.
+      const progressTimer = setInterval(async () => {
+        try {
+          const p = await Cockpit.api.get('/api/agents/in_flight');
+          if (!p || !p.active) return;
+          // Update per-agent dots based on completed list.
+          const completedSet = new Set((p.completed || []).map(c => c.agent));
+          (p.completed || []).forEach(c => {
+            const dot = document.querySelector(`[data-agent="${c.agent}"] .agent-dot`);
+            const det = document.querySelector(`[data-agent="${c.agent}"] .agent-detail`);
+            if (dot) dot.className = 'agent-dot ' + (c.status === 'ok' ? 'ok' : 'halt');
+            if (det) det.textContent = `${c.status} · ${c.elapsed_s.toFixed(1)}s`;
+          });
+          // Mark the currently-running agent’s dot as 'running' (blue/pulse).
+          if (p.current_agent && !completedSet.has(p.current_agent)) {
+            const dot = document.querySelector(`[data-agent="${p.current_agent}"] .agent-dot`);
+            const det = document.querySelector(`[data-agent="${p.current_agent}"] .agent-detail`);
+            if (dot) dot.className = 'agent-dot warn';
+            if (det) det.textContent = `running · ${p.current_agent_elapsed_s.toFixed(1)}s`;
+          }
+          // Rewrite the ticker label to show which agent is active.
+          if (p.current_agent === 'preflight') {
+            ticker.update('pinging Ollama');
+          } else if (p.current_agent) {
+            ticker.update(`${p.current_agent} agent`);
+          } else if (p.completed && p.completed.length) {
+            ticker.update('finalizing');
+          }
+        } catch (e) { /* ignore — next poll will catch up */ }
+      }, 1000);
       // Also surface 'still working' guidance once the call exceeds 20s so a
       // first-time cold load doesn't look like a hang.
       const guidanceTimer = useLlm ? setTimeout(() => {
-        Cockpit.toastWarn('LLM cold-start can take 30-90s on first call — weights are paging in.');
+        Cockpit.toastWarn('LLM cold-start can take 30-90s per agent on the first call — weights are paging in.');
       }, 20000) : null;
       try {
         const j = await Cockpit.api.post('/api/agents/run', {symbols, regime, use_llm: useLlm});
@@ -428,6 +461,7 @@
         Cockpit.toastError('Run failed: ' + e.message);
       } finally {
         if (guidanceTimer) clearTimeout(guidanceTimer);
+        clearInterval(progressTimer);
         btn.disabled = false;
       }
     }
