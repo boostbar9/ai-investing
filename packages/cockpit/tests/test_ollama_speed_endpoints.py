@@ -179,3 +179,97 @@ def test_warmup_status_and_gpu_fix_paths_are_quiet() -> None:
     paint the screen with garbage in an earlier session)."""
     assert "/api/ollama/warmup_status" in srv._QUIET_PATH_PREFIXES
     assert "/api/ollama/gpu_fix" in srv._QUIET_PATH_PREFIXES
+
+
+# ---------------------------------------------------------------------------
+# /api/ollama/pin
+# ---------------------------------------------------------------------------
+#
+# The pin endpoint is the cheap fix for AMD machines that have both the
+# standard ollama.com installer AND the Adrenalin AI_Bundle install present.
+# It's a much lighter alternative to the full Fix GPU script because it
+# doesn't download or modify any DLLs -- it just hardlocks the cockpit's
+# binary resolver to the AMD-blessed binary and kills any stale daemon.
+
+
+def test_pin_adrenalin_succeeds_when_path_present(monkeypatch, tmp_path) -> None:
+    """Happy path: Adrenalin binary on disk -> pin sets env var and reports adrenalin."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    adren = tmp_path / "AMD" / "AI_Bundle" / "Ollama"
+    adren.mkdir(parents=True)
+    (adren / "ollama.exe").write_text("")
+    monkeypatch.delenv("COCKPIT_OLLAMA_BIN", raising=False)
+    # Stub out the kill so we don't taskkill on the CI host.
+    monkeypatch.setattr(srv, "_kill_ollama_processes", lambda: 0)
+    # Stub out setx so we don't pollute the test host's User env.
+    monkeypatch.setattr(srv.os, "name", "posix")
+
+    client = TestClient(srv.app)
+    r = client.post("/api/ollama/pin", json={"flavor": "adrenalin"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    # After a pin the resolver returns "override" because COCKPIT_OLLAMA_BIN
+    # now takes precedence -- that's the user-explicit-pin signal in the UI.
+    # The path itself still points at the Adrenalin AI_Bundle binary.
+    assert body["ollama_flavor"] == "override"
+    assert "AI_Bundle" in body["ollama_binary"]
+    assert "AI_Bundle" in body["pinned_to"]
+    # Once pinned, COCKPIT_OLLAMA_BIN is set in the running process so the
+    # next status_snapshot picks it up without a cockpit restart.
+    import os as _os
+    assert "AI_Bundle" in _os.environ["COCKPIT_OLLAMA_BIN"]
+
+
+def test_pin_adrenalin_fails_cleanly_when_not_installed(monkeypatch, tmp_path) -> None:
+    """If the user clicks the button on a machine without Adrenalin AI installed,
+    we must return a helpful error -- not raise or pin something wrong."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    # Only the standard binary exists.
+    std = tmp_path / "Programs" / "Ollama"
+    std.mkdir(parents=True)
+    (std / "ollama.exe").write_text("")
+    monkeypatch.delenv("COCKPIT_OLLAMA_BIN", raising=False)
+    monkeypatch.setattr(srv, "_kill_ollama_processes", lambda: 0)
+
+    client = TestClient(srv.app)
+    r = client.post("/api/ollama/pin", json={"flavor": "adrenalin"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "Adrenalin" in body["error"]
+
+
+def test_pin_explicit_path_requires_file_exists(monkeypatch, tmp_path) -> None:
+    """Don't pin to a typo -- 404 the path first."""
+    monkeypatch.delenv("COCKPIT_OLLAMA_BIN", raising=False)
+    monkeypatch.setattr(srv, "_kill_ollama_processes", lambda: 0)
+
+    client = TestClient(srv.app)
+    r = client.post("/api/ollama/pin", json={"path": str(tmp_path / "nope.exe")})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "not found" in body["error"]
+
+
+def test_pin_clear_unsets_the_env_var(monkeypatch, tmp_path) -> None:
+    """Clearing the pin reverts to auto-resolution -- the user should be
+    able to undo a wrong pick without poking at env vars."""
+    monkeypatch.setenv("COCKPIT_OLLAMA_BIN", "/some/old/path")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(srv, "_kill_ollama_processes", lambda: 0)
+    monkeypatch.setattr(srv.os, "name", "posix")
+
+    client = TestClient(srv.app)
+    r = client.post("/api/ollama/pin", json={"flavor": "clear"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    import os as _os
+    assert "COCKPIT_OLLAMA_BIN" not in _os.environ
+
+
+def test_pin_endpoint_in_quiet_path_list() -> None:
+    """SSE log polling should not flood when the user pings the pin endpoint."""
+    assert "/api/ollama/pin" in srv._QUIET_PATH_PREFIXES

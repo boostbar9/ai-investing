@@ -93,10 +93,12 @@
         <div class="flex items-center gap-2 flex-wrap">
           <span id="pill-ollama" class="pill pill-gray">checking</span>
           <span id="pill-ollama-backend" class="pill pill-gray" data-tt="GPU vs CPU backend detection. Click 'Fix GPU' to enable AMD GPU acceleration on Windows.">backend: ?</span>
+          <span id="pill-ollama-binary" class="pill pill-gray" data-tt="Which ollama.exe the cockpit is using. AMD Adrenalin = the AI_Bundle install (preferred on RX 7700+). Standard = the ollama.com installer." style="display:none">binary: ?</span>
           <span id="pill-ollama-warmup" class="pill pill-gray" data-tt="Tracks the startup pre-warm. Models are pre-loaded into memory so the first agent Run doesn't sit through a 30-90s cold start.">warmup: ?</span>
           <button id="ollama-setup-btn" class="btn btn-primary" data-tt="Starts the daemon (if needed) and downloads any missing models. Streams progress to the log below.">Auto-setup</button>
           <button id="ollama-warmup-btn" class="btn btn-ghost" data-tt="Pre-load every declared model into memory now so the first Run is fast.">Warm models</button>
-          <button id="ollama-gpu-fix-btn" class="btn btn-ghost" data-tt="Windows + AMD RDNA3 only: install ROCm DLLs, set env vars, restart daemon, verify GPU." style="display:none">Fix GPU</button>
+          <button id="ollama-pin-adrenalin-btn" class="btn btn-primary" data-tt="One-click: point the cockpit at AMD's bundled Ollama (from Adrenalin AI tab), kill any standard ollama.exe that's hogging the port, and use the GPU-correct binary. No downloads required." style="display:none">Use AMD Adrenalin Ollama</button>
+          <button id="ollama-gpu-fix-btn" class="btn btn-ghost" data-tt="Windows + AMD RDNA3 only: install ROCm DLLs, set env vars, restart daemon, verify GPU. Use this only if you do NOT have AMD Adrenalin AI installed." style="display:none">Fix GPU (advanced)</button>
           <button id="ollama-gpu-fix-stop-btn" class="btn btn-danger" data-tt="Cancel the in-flight GPU fix. Safe to retry afterward — env vars are already set and the backup is timestamped." style="display:none">Stop GPU fix</button>
           <button id="ollama-stop-btn" class="btn btn-danger" data-tt="Stops the setup process. The daemon itself keeps running." style="display:none">Stop</button>
         </div>
@@ -473,12 +475,48 @@
     // /api/ollama/status + /api/ollama/warmup_status poll.
     async function refreshOllamaBackendAndWarmup() {
       const backendPill = document.getElementById('pill-ollama-backend');
+      const binaryPill = document.getElementById('pill-ollama-binary');
       const warmupPill = document.getElementById('pill-ollama-warmup');
       const fixBtn = document.getElementById('ollama-gpu-fix-btn');
+      const pinBtn = document.getElementById('ollama-pin-adrenalin-btn');
       const hint = document.getElementById('ollama-acceleration-hint');
       // Backend chip (mirrors /api/ollama/status -> snapshot.backend)
       try {
         const s = await Cockpit.api.get('/api/ollama/status');
+        // Binary-flavor chip: shows which ollama.exe is in play. On RX 7700+
+        // boxes with the Jan 2026 Adrenalin update the Adrenalin AI_Bundle
+        // binary is the only one that reliably uses the GPU; we want the
+        // user to see at a glance which one the cockpit picked.
+        const flavor = s.ollama_flavor || 'missing';
+        const binPath = s.ollama_binary || '';
+        if (flavor === 'adrenalin') {
+          binaryPill.textContent = 'AMD Adrenalin';
+          binaryPill.className = 'pill pill-green';
+          binaryPill.style.display = '';
+          binaryPill.title = 'Using ' + binPath;
+        } else if (flavor === 'standard') {
+          binaryPill.textContent = 'Standard Ollama';
+          // Yellow not red — the standard binary works fine on NVIDIA / CPU,
+          // it's only on AMD where it silently falls back.
+          binaryPill.className = 'pill pill-yellow';
+          binaryPill.style.display = '';
+          binaryPill.title = 'Using ' + binPath + ' — if you also have AMD Adrenalin AI installed, set COCKPIT_OLLAMA_BIN to the AI_Bundle ollama.exe.';
+        } else if (flavor === 'override') {
+          binaryPill.textContent = 'Pinned (env)';
+          binaryPill.className = 'pill pill-blue';
+          binaryPill.style.display = '';
+          binaryPill.title = 'COCKPIT_OLLAMA_BIN = ' + binPath;
+        } else if (flavor === 'path') {
+          binaryPill.textContent = 'PATH';
+          binaryPill.className = 'pill pill-gray';
+          binaryPill.style.display = '';
+          binaryPill.title = 'Using ' + binPath;
+        } else {
+          binaryPill.textContent = 'no ollama.exe';
+          binaryPill.className = 'pill pill-red';
+          binaryPill.style.display = '';
+          binaryPill.title = 'No ollama binary found on this machine.';
+        }
         const b = (s.backend && s.backend.backend) || 'unknown';
         if (b === 'gpu') {
           backendPill.textContent = 'GPU';
@@ -491,16 +529,28 @@
         } else if (b === 'cpu') {
           backendPill.textContent = 'CPU';
           backendPill.className = 'pill pill-red';
-          // Only show the fix on a Windows machine — server will 400 elsewhere
-          // but no point dangling a useless button in front of the user.
+          // Only show fixes on Windows. We have two paths:
+          //   1. "Use AMD Adrenalin" -- one click, no download, only if
+          //      the Adrenalin AI_Bundle install is detected AND we're not
+          //      already pinned to it.
+          //   2. "Fix GPU" -- full ROCm overlay, takes minutes, only
+          //      shown when option 1 is unavailable.
           const isWin = (navigator.platform || '').toLowerCase().includes('win')
             || (navigator.userAgent || '').toLowerCase().includes('windows');
-          fixBtn.style.display = isWin ? '' : 'none';
+          // The flavor pill JS above already set this. If the user has
+          // Adrenalin installed but isn't using it, the one-click fix
+          // is almost certainly what they want.
+          const adrenalinAvailable = isWin && (flavor === 'standard' || flavor === 'path');
+          if (adrenalinAvailable && pinBtn) pinBtn.style.display = '';
+          fixBtn.style.display = isWin && !adrenalinAvailable ? '' : 'none';
           hint.style.display = isWin ? '' : 'none';
         } else {
           backendPill.textContent = 'backend: idle';
           backendPill.className = 'pill pill-gray';
           hint.style.display = 'none';
+          // Hide the pin button when backend is idle/unknown -- pinning
+          // mid-load is fine but we don't want to push it without cause.
+          if (pinBtn) pinBtn.style.display = 'none';
         }
       } catch (e) { /* status panel already shows the error */ }
       // Warmup chip
@@ -544,6 +594,37 @@
         btn.disabled = false;
         btn.textContent = oldLabel;
         refreshOllamaBackendAndWarmup();
+      }
+    }
+
+    // One-click fix for AMD users: pin the cockpit to the Adrenalin AI_Bundle
+    // ollama.exe (already-installed via AMD Adrenalin AI tab), kill any
+    // standard ollama.exe holding the port, and persist the pin via setx so
+    // it survives cockpit restarts. Much cheaper than the full Fix GPU path
+    // since no downloads or DLL surgery are needed.
+    async function pinAdrenalin() {
+      const btn = document.getElementById('ollama-pin-adrenalin-btn');
+      const oldLabel = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Switching...';
+      try {
+        const r = await Cockpit.api.post('/api/ollama/pin', {flavor: 'adrenalin'});
+        if (r.ok) {
+          let msg = 'Pinned to AMD Adrenalin Ollama';
+          if (r.killed_processes > 0) msg += ` (killed ${r.killed_processes} stale process)`;
+          if (!r.persisted) msg += ' (in-memory only — setx failed)';
+          Cockpit.toastSuccess(msg);
+        } else {
+          Cockpit.toastError('Pin failed: ' + (r.error || 'unknown'));
+        }
+      } catch (e) {
+        Cockpit.toastError('Pin failed: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = oldLabel;
+        // Give the daemon a beat to come back up before re-polling, otherwise
+        // the backend pill flashes red on the first refresh after taskkill.
+        setTimeout(refreshOllamaBackendAndWarmup, 2000);
       }
     }
 
@@ -623,6 +704,7 @@
       document.getElementById('ollama-setup-btn').addEventListener('click', startOllamaSetup);
       document.getElementById('ollama-stop-btn').addEventListener('click', stopOllamaSetup);
       document.getElementById('ollama-warmup-btn').addEventListener('click', startManualWarmup);
+      document.getElementById('ollama-pin-adrenalin-btn').addEventListener('click', pinAdrenalin);
       document.getElementById('ollama-gpu-fix-btn').addEventListener('click', startGpuFix);
       document.getElementById('ollama-gpu-fix-stop-btn').addEventListener('click', stopGpuFix);
 

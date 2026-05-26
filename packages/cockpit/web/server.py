@@ -100,6 +100,7 @@ _QUIET_PATH_PREFIXES: tuple[str, ...] = (
     "/api/ollama/status",
     "/api/ollama/warmup_status",
     "/api/ollama/gpu_fix",  # GET status; the POST is one-shot and rare
+    "/api/ollama/pin",  # POST is rare; included so SSE log polling stays quiet
     "/api/agents/last",
     "/api/agents/in_flight",
     "/api/agents/schedule",
@@ -1141,6 +1142,137 @@ def api_ollama_gpu_fix_stop() -> dict[str, Any]:
     user picked the button by accident — the script is mostly idempotent
     (env vars are already set on a re-run; backup is timestamped)."""
     return job_mgr.stop(OLLAMA_GPU_FIX_KIND).to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Binary pinning -- pick which ollama.exe the cockpit launches
+# ---------------------------------------------------------------------------
+#
+# On AMD machines we sometimes end up with TWO ollama.exe installs on PATH:
+#   * Standard installer:   %LOCALAPPDATA%\Programs\Ollama\ollama.exe
+#   * Adrenalin AI_Bundle:  %LOCALAPPDATA%\AMD\AI_Bundle\Ollama\ollama.exe
+#
+# The Adrenalin one ships AMD-blessed ROCm libs that just work on RX 7700+;
+# the standard one silently picks CPU on RDNA3. The pin endpoint lets the
+# cockpit hardlock the resolver onto the Adrenalin path AND kills any
+# already-running ollama.exe so the next daemon-start picks the right binary.
+#
+# This is a much cheaper fix than the full GPU-fix script: no downloads, no
+# DLL surgery, no reboots. Just pin + restart. The script remains the
+# fallback for machines that don't have Adrenalin AI_Bundle installed.
+
+
+def _kill_ollama_processes() -> int:
+    """Kill any running ollama.exe on Windows. Returns count killed.
+
+    Uses ``taskkill`` because we don't know which binary spawned the running
+    daemon and shutil.which can return either one. On non-Windows this is
+    a no-op that returns 0.
+    """
+    if os.name != "nt":
+        return 0
+    try:
+        result = subprocess.run(
+            ["taskkill", "/F", "/IM", "ollama.exe"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        # taskkill returns 128 when no process matches -- that's success for us.
+        out = (result.stdout or "") + (result.stderr or "")
+        # SUCCESS lines look like: 'SUCCESS: The process "ollama.exe" with PID 1234'
+        return out.count("SUCCESS")
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return 0
+
+
+@app.post("/api/ollama/pin")
+def api_ollama_pin(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Pin the cockpit to a specific ollama.exe via COCKPIT_OLLAMA_BIN.
+
+    Payload (all optional):
+      * ``flavor``: ``"adrenalin"`` to auto-pick the AI_Bundle path (default),
+        ``"standard"`` to pick the ollama.com installer path,
+        ``"clear"`` to unset the pin and revert to auto-resolution.
+      * ``path``: explicit absolute path -- overrides ``flavor``.
+
+    Side effects (Windows only):
+      1. Writes/clears the User-scope ``COCKPIT_OLLAMA_BIN`` env var so the
+         pin survives cockpit restarts.
+      2. Updates os.environ for the running process so the resolver picks
+         up the new pin without needing a cockpit restart.
+      3. Kills any running ollama.exe so the next daemon-start uses the
+         newly pinned binary.
+
+    Returns the new resolver result so the UI can update the badge.
+    """
+    from tools.check_ollama import (
+        _adrenalin_candidate,
+        _standard_candidate,
+        resolve_ollama_binary,
+    )
+
+    payload = payload or {}
+    explicit_path = (payload.get("path") or "").strip()
+    flavor_req = (payload.get("flavor") or "adrenalin").strip().lower()
+
+    target: str | None = None
+    if explicit_path:
+        if not os.path.isfile(explicit_path):
+            return {"ok": False, "error": f"path not found: {explicit_path}"}
+        target = explicit_path
+    elif flavor_req == "clear":
+        target = None
+    elif flavor_req == "adrenalin":
+        target = _adrenalin_candidate()
+        if not target:
+            return {
+                "ok": False,
+                "error": "AMD Adrenalin Ollama not found at %LOCALAPPDATA%\\AMD\\AI_Bundle\\Ollama. Install it from the AMD Adrenalin Software AI tab.",
+            }
+    elif flavor_req == "standard":
+        target = _standard_candidate()
+        if not target:
+            return {"ok": False, "error": "Standard Ollama not found at %LOCALAPPDATA%\\Programs\\Ollama."}
+    else:
+        return {"ok": False, "error": f"unknown flavor: {flavor_req}"}
+
+    # Update the running process so the next status_snapshot resolves correctly.
+    if target:
+        os.environ["COCKPIT_OLLAMA_BIN"] = target
+    else:
+        os.environ.pop("COCKPIT_OLLAMA_BIN", None)
+
+    # Persist to the User-scope env so the pin survives a cockpit restart.
+    # setx is Windows-only; on other platforms we just rely on the in-process
+    # update + whatever shell rc file the user maintains themselves.
+    persisted = False
+    if os.name == "nt":
+        try:
+            value = target or ""
+            # setx truncates to 1024 chars and emits a warning to stderr -- not
+            # a real path will ever be that long, so we ignore the warning.
+            subprocess.run(
+                ["setx", "COCKPIT_OLLAMA_BIN", value],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            persisted = True
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            persisted = False
+
+    killed = _kill_ollama_processes()
+
+    path, flavor = resolve_ollama_binary()
+    return {
+        "ok": True,
+        "pinned_to": target,
+        "persisted": persisted,
+        "killed_processes": killed,
+        "ollama_binary": path,
+        "ollama_flavor": flavor,
+    }
 
 
 @app.post("/api/ollama/warmup")

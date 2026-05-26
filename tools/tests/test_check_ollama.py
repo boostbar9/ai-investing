@@ -261,3 +261,118 @@ def test_status_snapshot_handles_list_errors_gracefully() -> None:
     assert snap["installed"] == []
     assert snap["missing"] == ["deepseek-r1:32b"]
     assert snap["ready"] is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_ollama_binary — picks the right ollama.exe on Windows
+# ---------------------------------------------------------------------------
+#
+# On RX 7700+ machines with the January 2026+ Adrenalin driver, the user
+# typically ends up with TWO ollama.exe binaries on PATH:
+#
+#   1. C:\Users\<user>\AppData\Local\Programs\Ollama\ollama.exe   (standard)
+#   2. C:\Users\<user>\AppData\Local\AMD\AI_Bundle\Ollama\ollama.exe (Adrenalin)
+#
+# We MUST pick the Adrenalin one because its ROCm libs are pre-patched for
+# gfx1100/gfx1103/gfx1201 by AMD. PATH-order resolution silently picks the
+# wrong one and the cockpit falls back to CPU.
+
+
+def _fake_localappdata(monkeypatch, root: str) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", root)
+
+
+def test_resolve_prefers_adrenalin_when_both_present(monkeypatch, tmp_path) -> None:
+    """The killer scenario: both binaries on disk, Adrenalin must win."""
+    _fake_localappdata(monkeypatch, str(tmp_path))
+    adren = tmp_path / "AMD" / "AI_Bundle" / "Ollama"
+    adren.mkdir(parents=True)
+    (adren / "ollama.exe").write_text("")
+    std = tmp_path / "Programs" / "Ollama"
+    std.mkdir(parents=True)
+    (std / "ollama.exe").write_text("")
+    monkeypatch.delenv("COCKPIT_OLLAMA_BIN", raising=False)
+
+    path, flavor = check_ollama.resolve_ollama_binary()
+    assert flavor == "adrenalin"
+    assert path is not None and "AI_Bundle" in path
+
+
+def test_resolve_falls_back_to_standard_when_only_one(monkeypatch, tmp_path) -> None:
+    """Adrenalin not installed - use the standard ollama.com install."""
+    _fake_localappdata(monkeypatch, str(tmp_path))
+    std = tmp_path / "Programs" / "Ollama"
+    std.mkdir(parents=True)
+    (std / "ollama.exe").write_text("")
+    monkeypatch.delenv("COCKPIT_OLLAMA_BIN", raising=False)
+
+    path, flavor = check_ollama.resolve_ollama_binary()
+    assert flavor == "standard"
+    assert path is not None and "Programs" in path
+
+
+def test_resolve_env_override_wins_over_disk(monkeypatch, tmp_path) -> None:
+    """COCKPIT_OLLAMA_BIN must beat everything else - it's the user's escape hatch."""
+    _fake_localappdata(monkeypatch, str(tmp_path))
+    adren = tmp_path / "AMD" / "AI_Bundle" / "Ollama"
+    adren.mkdir(parents=True)
+    (adren / "ollama.exe").write_text("")
+
+    pinned = tmp_path / "my-custom" / "ollama.exe"
+    pinned.parent.mkdir(parents=True)
+    pinned.write_text("")
+    monkeypatch.setenv("COCKPIT_OLLAMA_BIN", str(pinned))
+
+    path, flavor = check_ollama.resolve_ollama_binary()
+    assert flavor == "override"
+    assert path == str(pinned)
+
+
+def test_resolve_env_override_ignored_if_file_missing(monkeypatch, tmp_path) -> None:
+    """A stale COCKPIT_OLLAMA_BIN pointing at a deleted file must NOT short-circuit;
+    we should fall through to the next resolver tier instead of returning None."""
+    _fake_localappdata(monkeypatch, str(tmp_path))
+    adren = tmp_path / "AMD" / "AI_Bundle" / "Ollama"
+    adren.mkdir(parents=True)
+    (adren / "ollama.exe").write_text("")
+    monkeypatch.setenv("COCKPIT_OLLAMA_BIN", str(tmp_path / "does-not-exist.exe"))
+
+    path, flavor = check_ollama.resolve_ollama_binary()
+    assert flavor == "adrenalin"
+    assert path is not None
+
+
+def test_resolve_falls_back_to_path_on_linux(monkeypatch, tmp_path) -> None:
+    """No LOCALAPPDATA and no override - trust whatever's on PATH (Linux/Mac)."""
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.delenv("COCKPIT_OLLAMA_BIN", raising=False)
+    with patch.object(check_ollama.shutil, "which", return_value="/usr/local/bin/ollama"):
+        path, flavor = check_ollama.resolve_ollama_binary()
+    assert flavor == "path"
+    assert path == "/usr/local/bin/ollama"
+
+
+def test_resolve_returns_missing_when_nothing_found(monkeypatch) -> None:
+    """No binary anywhere - report missing, don't crash."""
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.delenv("COCKPIT_OLLAMA_BIN", raising=False)
+    with patch.object(check_ollama.shutil, "which", return_value=None):
+        path, flavor = check_ollama.resolve_ollama_binary()
+    assert flavor == "missing"
+    assert path is None
+
+
+def test_status_snapshot_includes_binary_metadata(monkeypatch, tmp_path) -> None:
+    """The cockpit UI needs to know which binary is in play to surface the
+    'AMD Adrenalin' badge - the snapshot must include ollama_binary + flavor."""
+    _fake_localappdata(monkeypatch, str(tmp_path))
+    adren = tmp_path / "AMD" / "AI_Bundle" / "Ollama"
+    adren.mkdir(parents=True)
+    (adren / "ollama.exe").write_text("")
+    monkeypatch.delenv("COCKPIT_OLLAMA_BIN", raising=False)
+
+    with patch.object(check_ollama, "_daemon_alive", return_value=False), \
+         patch.object(check_ollama, "all_models", return_value=["x:1"]):
+        snap = check_ollama.status_snapshot(host="http://x")
+    assert snap["ollama_flavor"] == "adrenalin"
+    assert "AI_Bundle" in (snap["ollama_binary"] or "")

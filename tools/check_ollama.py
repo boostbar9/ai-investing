@@ -53,6 +53,91 @@ PROGRESS_REPORT_EVERY_MB = 50
 
 
 # ---------------------------------------------------------------------------
+# Binary resolution
+# ---------------------------------------------------------------------------
+#
+# Windows installers can leave multiple ollama.exe on PATH. The two we see in
+# the wild on AMD machines are:
+#
+#   1. C:\Users\<user>\AppData\Local\Programs\Ollama\ollama.exe
+#      Standard ollama.com installer. Ships generic ROCm libs that
+#      *sometimes* fail on RDNA3 (no gfx1100 tensor files in the
+#      consolidated v0.30.0 7z).
+#
+#   2. C:\Users\<user>\AppData\Local\AMD\AI_Bundle\Ollama\ollama.exe
+#      Bundled by the January 2026+ Adrenalin driver "AI tab" install.
+#      Ships AMD-blessed ROCm libs that are known-good for the
+#      RX 7700+ (gfx1100/gfx1103/gfx1201). On these machines we want to
+#      *prefer* this binary because the standard one will pick CPU.
+#
+# Resolution order (first match wins):
+#   1. ``$COCKPIT_OLLAMA_BIN`` env var if set (explicit user override)
+#   2. The Adrenalin AI_Bundle path if it exists on disk
+#   3. Whatever ``shutil.which("ollama")`` returns (legacy behavior)
+#
+# The flavor ("adrenalin" / "standard" / "unknown") is surfaced to the UI so
+# the user can see which binary is actually running.
+
+
+def _adrenalin_candidate() -> str | None:
+    """Return the Adrenalin-installed ollama.exe path, or None.
+
+    Lives under %LOCALAPPDATA%\\AMD\\AI_Bundle\\Ollama on Windows. Returns
+    None on non-Windows systems or when the file isn't present.
+    """
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return None
+    candidate = os.path.join(local, "AMD", "AI_Bundle", "Ollama", "ollama.exe")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _standard_candidate() -> str | None:
+    """Return the ollama.com installer path under %LOCALAPPDATA%, or None."""
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return None
+    candidate = os.path.join(local, "Programs", "Ollama", "ollama.exe")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def resolve_ollama_binary() -> tuple[str | None, str]:
+    """Pick which ollama executable the cockpit should invoke.
+
+    Returns a ``(path, flavor)`` pair where ``flavor`` is one of:
+
+      * ``"override"``   - the user pinned the path via env var
+      * ``"adrenalin"``  - AMD AI_Bundle binary detected on disk
+      * ``"standard"``   - ollama.com installer binary detected on disk
+      * ``"path"``       - whatever appears first on PATH (Linux/Mac/unknown)
+      * ``"missing"``    - nothing found anywhere (path is None)
+
+    The cockpit prefers the Adrenalin binary because it ships AMD's blessed
+    ROCm libs for the RX 7700+. When both are present the standard binary
+    is ignored unless the user overrides via ``COCKPIT_OLLAMA_BIN``.
+    """
+    override = os.environ.get("COCKPIT_OLLAMA_BIN")
+    if override and os.path.isfile(override):
+        return override, "override"
+
+    adrenalin = _adrenalin_candidate()
+    if adrenalin:
+        return adrenalin, "adrenalin"
+
+    standard = _standard_candidate()
+    if standard:
+        return standard, "standard"
+
+    on_path = shutil.which("ollama")
+    if on_path:
+        # Some users have a non-Windows install or a custom location that
+        # doesn't match our LOCALAPPDATA probes. Trust PATH as a fallback.
+        return on_path, "path"
+
+    return None, "missing"
+
+
+# ---------------------------------------------------------------------------
 # Daemon reachability + autostart
 # ---------------------------------------------------------------------------
 
@@ -73,12 +158,13 @@ def _start_daemon_background() -> subprocess.Popen | None:
     ``ollama`` CLI isn't on PATH. The daemon will keep running after this
     script exits because we don't tie its lifetime to ours.
     """
-    if not shutil.which("ollama"):
+    binary, _flavor = resolve_ollama_binary()
+    if binary is None:
         return None
     try:
         # stdout/stderr to DEVNULL so a slow daemon doesn't block us.
         proc = subprocess.Popen(
-            ["ollama", "serve"],
+            [binary, "serve"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
@@ -266,11 +352,12 @@ def _pull_via_http(host: str, model: str, *, verbose: bool = True) -> bool:
 def _pull_via_cli(model: str, *, verbose: bool = True) -> bool:
     """Fallback: shell out to ``ollama pull``. Inherits the user's terminal
     so they see the native progress bar. Used when HTTP pull fails."""
-    if not shutil.which("ollama"):
+    binary, _flavor = resolve_ollama_binary()
+    if binary is None:
         return False
     if verbose:
         print(f"    falling back to: ollama pull {model}")
-    rc = subprocess.run(["ollama", "pull", model]).returncode
+    rc = subprocess.run([binary, "pull", model]).returncode
     return rc == 0
 
 
@@ -301,6 +388,7 @@ def status_snapshot(host: str | None = None, profile_name: str | None = None) ->
     profile = active_profile(env_value=profile_name)
     required = all_models(profile)
 
+    binary, flavor = resolve_ollama_binary()
     alive = _daemon_alive(h)
     if not alive:
         return {
@@ -312,6 +400,8 @@ def status_snapshot(host: str | None = None, profile_name: str | None = None) ->
             "missing": required,  # we can't verify, so report worst case
             "ready": False,
             "cli_on_path": bool(shutil.which("ollama")),
+            "ollama_binary": binary,
+            "ollama_flavor": flavor,
             "backend": {"backend": "unknown", "loaded": [], "vram_used_bytes": 0, "gpu_fraction": 0.0},
         }
 
@@ -330,6 +420,8 @@ def status_snapshot(host: str | None = None, profile_name: str | None = None) ->
         "missing": missing,
         "ready": len(missing) == 0,
         "cli_on_path": bool(shutil.which("ollama")),
+        "ollama_binary": binary,
+        "ollama_flavor": flavor,
         "backend": backend,
     }
 
