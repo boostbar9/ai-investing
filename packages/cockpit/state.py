@@ -46,6 +46,12 @@ class CockpitState:
     paper_loop_intended: bool = False
     paper_loop_strategy: str = "ensemble"
     paper_loop_dry_run: bool = False
+    # Autopilot trigger scheduler: same auto-resume contract as the paper
+    # loop -- if it was enabled when the cockpit shut down, re-arm on
+    # boot so the 60-day soak doesn't stall on a restart.
+    autopilot_enabled: bool = False
+    autopilot_strategy: str = "ensemble"
+    autopilot_dry_run: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -71,6 +77,9 @@ def load_state(path: Path = STATE_PATH) -> CockpitState:
         paper_loop_intended=bool(raw.get("paper_loop_intended", False)),
         paper_loop_strategy=str(raw.get("paper_loop_strategy", "ensemble")),
         paper_loop_dry_run=bool(raw.get("paper_loop_dry_run", False)),
+        autopilot_enabled=bool(raw.get("autopilot_enabled", False)),
+        autopilot_strategy=str(raw.get("autopilot_strategy", "ensemble")),
+        autopilot_dry_run=bool(raw.get("autopilot_dry_run", False)),
     )
 
 

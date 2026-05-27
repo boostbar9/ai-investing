@@ -47,7 +47,7 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel
 
-from packages.cockpit import diagnostics, paper_autopilot, updater, watchdog
+from packages.cockpit import automation, diagnostics, paper_autopilot, updater, watchdog
 from packages.cockpit import errors as err_log
 from packages.cockpit import proc as job_mgr
 from packages.cockpit.state import (
@@ -2443,6 +2443,16 @@ async def api_autopilot_set(cfg: AutopilotConfig) -> dict[str, Any]:
             _start_autopilot_task()
         else:
             _stop_autopilot_task()
+    # Persist autopilot intent so the cockpit can re-arm on reboot
+    # without the user re-toggling the GUI (§17 follow-up).
+    try:
+        cstate = load_state()
+        cstate.autopilot_enabled = _AUTOPILOT_STATE.enabled
+        cstate.autopilot_strategy = _AUTOPILOT_STATE.paper_strategy
+        cstate.autopilot_dry_run = _AUTOPILOT_STATE.dry_run
+        save_state(cstate)
+    except Exception as e:  # pragma: no cover - never block API on disk hiccup
+        log.warning("could not persist autopilot intent: %s", e)
     return api_autopilot_get()
 
 
@@ -2470,6 +2480,23 @@ def autopilot_page() -> HTMLResponse:
 
 @app.on_event("startup")
 async def _autopilot_startup() -> None:  # pragma: no cover
+    # Auto-resume autopilot if the user had it enabled before shutdown.
+    # Mirrors the paper-loop auto-resume contract: intent persisted in
+    # CockpitState wins over the in-process default.
+    if os.environ.get("COCKPIT_AUTO_RESUME_AUTOPILOT", "1") in ("1", "true", "True"):
+        try:
+            cstate = load_state()
+            if cstate.autopilot_enabled:
+                _AUTOPILOT_STATE.enabled = True
+                _AUTOPILOT_STATE.paper_strategy = cstate.autopilot_strategy
+                _AUTOPILOT_STATE.dry_run = cstate.autopilot_dry_run
+                log.info(
+                    "auto-resume: autopilot re-armed strategy=%s dry_run=%s",
+                    cstate.autopilot_strategy,
+                    cstate.autopilot_dry_run,
+                )
+        except Exception as e:
+            log.warning("auto-resume autopilot: state load failed: %s", e)
     if _AUTOPILOT_STATE.enabled:
         _start_autopilot_task()
 
@@ -2550,6 +2577,85 @@ async def _ollama_warmup_startup() -> None:  # pragma: no cover
     # automatically when the task finishes.
     global _WARMUP_BG_TASK
     _WARMUP_BG_TASK = asyncio.create_task(_bg_warmup())
+
+
+# ---------------------------------------------------------------------------
+# Background automation: watchdog ticker + daily backups + audit rotation
+# + boot doctor. Each loop is opt-out via env var and lives in
+# packages/cockpit/automation.py so the logic is testable in isolation.
+# ---------------------------------------------------------------------------
+
+_AUTOMATION_TASKS: dict[str, asyncio.Task[Any]] = {}
+_BACKUP_STATE: dict[str, Any] = {}
+
+
+@app.on_event("startup")
+async def _automation_startup() -> None:  # pragma: no cover - long-lived tasks
+    # Boot doctor: log a one-line readiness summary so the user sees
+    # missing keys / empty parquet cache at a glance, not via cryptic
+    # downstream agent errors.
+    if os.environ.get("COCKPIT_BOOT_DOCTOR", "1") in ("1", "true", "True"):
+        try:
+            report = automation.boot_doctor_report()
+            log.info("boot doctor: %s", automation.summarize_boot_doctor(report))
+        except Exception as e:
+            log.warning("boot doctor failed: %s", e)
+
+    loop = asyncio.get_running_loop()
+
+    # Watchdog ticker: re-evaluate drawdown every 60s so an overnight
+    # breach halts the loop even if no one hits the API.
+    if os.environ.get("COCKPIT_WATCHDOG_LOOP", "1") in ("1", "true", "True"):
+        def _eval() -> object:
+            return watchdog.evaluate_and_persist(equity_curve_points())
+        _AUTOMATION_TASKS["watchdog"] = loop.create_task(
+            automation.watchdog_loop(evaluator=_eval, poll_seconds=60.0)
+        )
+
+    # Daily backup scheduler: zip data/ + logs/ once per UTC day.
+    if os.environ.get("COCKPIT_AUTO_BACKUP", "1") in ("1", "true", "True"):
+        from tools.backup_daily import build_backup, prune_old
+
+        def _runner() -> Path:
+            out = build_backup()
+            try:
+                prune_old(keep=30)
+            except Exception as e:
+                log.warning("backup retention prune failed: %s", e)
+            return out
+
+        _AUTOMATION_TASKS["backup"] = loop.create_task(
+            automation.backup_loop(runner=_runner, state=_BACKUP_STATE)
+        )
+
+    # Audit log rotation: once an hour check decisions.jsonl size,
+    # gzip-rotate if it exceeds AUDIT_MAX_BYTES (default 50 MB).
+    if os.environ.get("COCKPIT_AUDIT_ROTATE", "1") in ("1", "true", "True"):
+        from packages.persistence.audit import AUDIT_LOG_PATH
+
+        _AUTOMATION_TASKS["audit_rotate"] = loop.create_task(
+            automation.audit_rotate_loop(path=AUDIT_LOG_PATH)
+        )
+
+
+@app.on_event("shutdown")
+async def _automation_shutdown() -> None:  # pragma: no cover - shutdown
+    for name, task in list(_AUTOMATION_TASKS.items()):
+        if task is not None and not task.done():
+            task.cancel()
+        _AUTOMATION_TASKS.pop(name, None)
+
+
+@app.get("/api/automation")
+def api_automation_status() -> dict[str, Any]:
+    """Surface background-loop state so the GUI can prove these are running."""
+    out: dict[str, Any] = {"loops": {}, "backup": dict(_BACKUP_STATE)}
+    for name, task in _AUTOMATION_TASKS.items():
+        out["loops"][name] = {
+            "running": bool(task is not None and not task.done()),
+            "done": bool(task is not None and task.done()),
+        }
+    return out
 
 
 @app.on_event("shutdown")
