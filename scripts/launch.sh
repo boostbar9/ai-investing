@@ -121,10 +121,38 @@ fi
 
 # 6. Boot orchestrator (warm up Ollama, pull models, create data dirs, doctor).
 # Same code path the Windows launch.ps1 hits — keeps both platforms in lockstep.
+# We deliberately omit --quiet so the per-step [ok]/[!!]/[XX] summary always
+# lands on the user's screen above any error banner.
 section "Warming up the stack"
 export PYTHONPATH=.
-if ! .venv/bin/python -m tools.boot --quiet; then
-  fail "boot orchestrator failed. Fix the [XX] step above, then re-run."
+set +e
+.venv/bin/python -m tools.boot
+boot_exit=$?
+set -e
+if [[ $boot_exit -ne 0 ]]; then
+  case "$boot_exit" in
+    2) hint="One or more boot steps failed (look for [XX] above)." ;;
+    3) hint="The boot orchestrator itself crashed (Python traceback above)." ;;
+    *) hint="Unexpected exit code from tools.boot." ;;
+  esac
+  # Best-effort: surface the failed step name from data/cockpit/boot.json.
+  failed_step=""
+  if [[ -f data/cockpit/boot.json ]] && command -v python3 >/dev/null; then
+    failed_step=$(python3 -c "import json,sys
+try:
+    d=json.load(open('data/cockpit/boot.json'))
+    rows=[r for r in d.get('results', []) if r.get('status')=='failed']
+    print('; '.join(f\"{r['name']}: {r['message']}\" for r in rows))
+except Exception:
+    pass" 2>/dev/null || true)
+  fi
+  if [[ -n "$failed_step" ]]; then
+    fail "boot orchestrator failed (exit $boot_exit). $hint
+  Failed step(s): $failed_step
+  Fix the issue above, then re-run."
+  else
+    fail "boot orchestrator failed (exit $boot_exit). $hint Fix the issue above, then re-run."
+  fi
 fi
 
 # 7. Cockpit

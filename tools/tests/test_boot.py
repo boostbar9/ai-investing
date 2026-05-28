@@ -357,6 +357,57 @@ def test_main_cli_json_mode(ctx: BootContext, capsys) -> None:
     assert any(s["name"] == "data_dirs" for s in payload["steps"])
 
 
+def test_main_cli_quiet_still_prints_human_summary(ctx: BootContext, capsys) -> None:
+    """Regression: --quiet only silences INFO logs. The human summary with
+    [ok]/[!!]/[XX] markers must ALWAYS land on stdout so the launcher's
+    "Fix the [XX] step above" message has something to point at."""
+    rc = boot.main(["--only", "data_dirs", "--quiet"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "=== ai-investing boot ===" in out
+    assert "[ok]" in out
+    assert "data_dirs" in out
+    assert "overall:" in out
+
+
+def test_main_cli_returns_two_when_step_failed(ctx: BootContext, capsys, monkeypatch) -> None:
+    """Exit code 2 is the launcher contract for 'one or more steps failed'."""
+    def _boom(_ctx):
+        from tools.boot import StepResult
+        return StepResult("data_dirs", "failed", "simulated")
+
+    monkeypatch.setattr(
+        boot,
+        "STEPS",
+        [("data_dirs", _boom)],
+    )
+    rc = boot.main(["--only", "data_dirs"])
+    assert rc == 2
+    out = capsys.readouterr().out
+    # The [XX] marker for the failed step must be visible.
+    assert "[XX]" in out
+    assert "data_dirs" in out
+
+
+def test_main_cli_returns_three_on_orchestrator_crash(
+    ctx: BootContext, capsys, monkeypatch
+) -> None:
+    """If run_boot itself raises (not a step), main() must catch it, print
+    a traceback, and exit 3 so the launcher can give a distinct hint."""
+    def _explode(**_kwargs):
+        raise RuntimeError("simulated orchestrator crash")
+
+    monkeypatch.setattr(boot, "run_boot", _explode)
+    rc = boot.main([])
+    assert rc == 3
+    out = capsys.readouterr().out
+    assert "CRASHED" in out
+    assert "simulated orchestrator crash" in out
+    # Traceback delimiters must be present so users can paste a complete block.
+    assert "--- traceback ---" in out
+    assert "--- end traceback ---" in out
+
+
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------

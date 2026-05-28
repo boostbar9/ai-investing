@@ -258,10 +258,36 @@ if ($WithDocker) {
 Write-Section "Warming up the stack"
 
 $env:PYTHONPATH = "."
-& $venvPython -m tools.boot --quiet
+# Run the orchestrator WITHOUT --quiet so the per-step [ok]/[!!]/[XX]
+# summary always lands on the user's screen above any error banner.
+& $venvPython -m tools.boot
 $bootExit = $LASTEXITCODE
 if ($bootExit -ne 0) {
-  Fail "boot orchestrator failed (exit $bootExit). Fix the [XX] step above, then re-run."
+  $hint = switch ($bootExit) {
+    2 { "One or more boot steps failed (look for [XX] above)." }
+    3 { "The boot orchestrator itself crashed (Python traceback above)." }
+    default { "Unexpected exit code from tools.boot." }
+  }
+  # Best-effort: surface the failed step name from data/cockpit/boot.json so
+  # the user has somewhere concrete to look even if scrollback is gone.
+  $bootJson = Join-Path $repoRoot "data\cockpit\boot.json"
+  $failedStep = ""
+  if (Test-Path $bootJson) {
+    try {
+      $bootData = Get-Content $bootJson -Raw | ConvertFrom-Json
+      $failed = @($bootData.results | Where-Object { $_.status -eq "failed" })
+      if ($failed.Count -gt 0) {
+        $failedStep = ($failed | ForEach-Object { "$($_.name): $($_.message)" }) -join "; "
+      }
+    } catch {
+      # Best-effort only.
+    }
+  }
+  if ($failedStep) {
+    Fail "boot orchestrator failed (exit $bootExit). $hint`n  Failed step(s): $failedStep`n  Fix the issue above, then re-run."
+  } else {
+    Fail "boot orchestrator failed (exit $bootExit). $hint Fix the issue above, then re-run."
+  }
 }
 
 # ----------------------------------------------------------------------

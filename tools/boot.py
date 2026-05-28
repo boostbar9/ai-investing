@@ -541,7 +541,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="emit JSON summary")
     ap.add_argument("--skip", action="append", default=[], help="skip a step (repeatable)")
     ap.add_argument("--only", action="append", default=[], help="run only these (repeatable)")
-    ap.add_argument("--quiet", action="store_true", help="suppress per-step log lines")
+    ap.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "suppress per-step INFO log lines (the human summary is always "
+            "printed so launchers can show which step failed)"
+        ),
+    )
     args = ap.parse_args(argv)
 
     logging.basicConfig(
@@ -549,17 +556,47 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    summary = run_boot(
-        skip=args.skip,
-        only=args.only or None,
-    )
-    if args.json:
-        print(json.dumps(summary.to_dict(), indent=2))
-    else:
-        print(_format_human(summary))
+    # Run with a defensive outer try/except so an unhandled error inside a
+    # step (or in run_boot itself) NEVER leaves the launcher staring at an
+    # empty terminal with a meaningless exit code. We print a self-contained
+    # error block + traceback so the user can paste it into a bug report
+    # and we can debug from a single screenshot.
+    try:
+        summary = run_boot(
+            skip=args.skip,
+            only=args.only or None,
+        )
+    except BaseException as exc:  # last-line safety net for the launcher
+        import traceback
 
-    # Exit code: 0 if overall is ok or degraded (cockpit can still come up),
-    # 2 if failed (caller should not proceed to start the cockpit).
+        sys.stdout.flush()
+        print("", flush=True)
+        print("=== ai-investing boot CRASHED ===", flush=True)
+        print(f"  {type(exc).__name__}: {exc}", flush=True)
+        print("", flush=True)
+        print("--- traceback ---", flush=True)
+        traceback.print_exc()
+        print("--- end traceback ---", flush=True)
+        print("", flush=True)
+        print(
+            "This is a bug in tools/boot.py. Please open an issue with the "
+            "traceback above.",
+            flush=True,
+        )
+        return 3
+
+    if args.json:
+        print(json.dumps(summary.to_dict(), indent=2), flush=True)
+    else:
+        # ALWAYS print the human summary, even with --quiet, so failed steps
+        # show their [XX] marker before the launcher's red "Fix the [XX] step
+        # above" message.
+        print(_format_human(summary), flush=True)
+
+    # Exit code contract for launchers:
+    #   0 -- ok or degraded; cockpit may still come up
+    #   2 -- one or more required steps failed; do not start the cockpit
+    #   3 -- orchestrator itself crashed (see traceback above)
     return 0 if summary.overall in ("ok", "degraded") else 2
 
 
