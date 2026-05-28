@@ -122,12 +122,18 @@ fi
 # 6. Boot orchestrator (warm up Ollama, pull models, create data dirs, doctor).
 # Same code path the Windows launch.ps1 hits — keeps both platforms in lockstep.
 # We deliberately omit --quiet so the per-step [ok]/[!!]/[XX] summary always
-# lands on the user's screen above any error banner.
+# lands on the user's screen above any error banner. Tee combined stdout+stderr
+# to a permanent log file so the user can paste it into a bug report even if
+# the terminal scrollback is gone.
 section "Warming up the stack"
 export PYTHONPATH=.
+export PYTHONUNBUFFERED=1
+export PYTHONIOENCODING=utf-8
+mkdir -p data/cockpit
+boot_log="data/cockpit/boot_launcher.log"
 set +e
-.venv/bin/python -m tools.boot
-boot_exit=$?
+.venv/bin/python -u -m tools.boot 2>&1 | tee "$boot_log"
+boot_exit=${PIPESTATUS[0]}
 set -e
 if [[ $boot_exit -ne 0 ]]; then
   case "$boot_exit" in
@@ -146,12 +152,21 @@ try:
 except Exception:
     pass" 2>/dev/null || true)
   fi
+  # If the orchestrator died before writing boot.json (typical for exit 1),
+  # echo the tail of the captured log so the user sees the actual error.
+  if [[ -z "$failed_step" && -f "$boot_log" ]]; then
+    echo ""
+    echo "  --- last 25 lines of $boot_log ---"
+    tail -n 25 "$boot_log" || true
+    echo "  --- end log ---"
+  fi
   if [[ -n "$failed_step" ]]; then
     fail "boot orchestrator failed (exit $boot_exit). $hint
   Failed step(s): $failed_step
-  Fix the issue above, then re-run."
+  Full log: $boot_log"
   else
-    fail "boot orchestrator failed (exit $boot_exit). $hint Fix the issue above, then re-run."
+    fail "boot orchestrator failed (exit $boot_exit). $hint
+  Full log: $boot_log"
   fi
 fi
 

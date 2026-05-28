@@ -389,6 +389,30 @@ def test_main_cli_returns_two_when_step_failed(ctx: BootContext, capsys, monkeyp
     assert "data_dirs" in out
 
 
+def test_main_cli_prints_starting_banner(ctx: BootContext, capsys) -> None:
+    """Even before any step runs we must emit a 'tools.boot starting' marker
+    plus python/cwd/PYTHONPATH diagnostics. That way a hard crash mid-step
+    still leaves the user with proof the orchestrator was reached at all,
+    and the launcher's tail-the-log fallback has something to show."""
+    boot.main(["--only", "data_dirs"])
+    out = capsys.readouterr().out
+    assert "=== tools.boot starting ===" in out
+    assert "python" in out
+    assert "cwd" in out
+    assert "PYTHONPATH" in out
+
+
+def test_main_cli_json_mode_suppresses_banner(ctx: BootContext, capsys) -> None:
+    """--json mode is consumed by scripts; the diagnostic banner would
+    corrupt the JSON payload, so it must be suppressed."""
+    rc = boot.main(["--only", "data_dirs", "--json"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "=== tools.boot starting ===" not in out
+    # Output must be parseable JSON (no banner garbage prefix).
+    json.loads(out)
+
+
 def test_main_cli_returns_three_on_orchestrator_crash(
     ctx: BootContext, capsys, monkeypatch
 ) -> None:

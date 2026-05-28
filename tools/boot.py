@@ -556,6 +556,22 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
+    # Print a banner BEFORE running anything so even a hard segfault inside
+    # a step leaves the user with a visible marker ("got at least this far").
+    # The launcher tees stdout to data/cockpit/boot_launcher.log so this is
+    # the bottom of the truth chain.
+    if not args.json:
+        print("", flush=True)
+        print("=== tools.boot starting ===", flush=True)
+        print(f"  python  : {sys.version.split()[0]} ({sys.executable})", flush=True)
+        print(f"  cwd     : {os.getcwd()}", flush=True)
+        print(f"  PYTHONPATH={os.environ.get('PYTHONPATH', '<unset>')}", flush=True)
+        if args.skip:
+            print(f"  skip    : {','.join(args.skip)}", flush=True)
+        if args.only:
+            print(f"  only    : {','.join(args.only)}", flush=True)
+        print("", flush=True)
+
     # Run with a defensive outer try/except so an unhandled error inside a
     # step (or in run_boot itself) NEVER leaves the launcher staring at an
     # empty terminal with a meaningless exit code. We print a self-contained

@@ -258,15 +258,37 @@ if ($WithDocker) {
 Write-Section "Warming up the stack"
 
 $env:PYTHONPATH = "."
-# Run the orchestrator WITHOUT --quiet so the per-step [ok]/[!!]/[XX]
-# summary always lands on the user's screen above any error banner.
-& $venvPython -m tools.boot
-$bootExit = $LASTEXITCODE
+# Force unbuffered, UTF-8 stdout so nothing the orchestrator prints can be
+# swallowed by PowerShell's stderr-as-error trap when $ErrorActionPreference
+# is 'Stop'. Capturing combined stdout+stderr into a tee file gives us a
+# permanent record the user can paste even after the window scrolls or
+# closes.
+$env:PYTHONUNBUFFERED = "1"
+$env:PYTHONIOENCODING = "utf-8"
+$bootLogDir = Join-Path $repoRoot "data\cockpit"
+if (-not (Test-Path $bootLogDir)) { New-Item -ItemType Directory -Path $bootLogDir -Force | Out-Null }
+$bootLog = Join-Path $bootLogDir "boot_launcher.log"
+
+# Temporarily relax ErrorActionPreference so a native command's stderr
+# emission cannot terminate the script before we read $LASTEXITCODE.
+$oldEAP = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+  # 2>&1 merges stderr into the success stream so PowerShell shows the
+  # Python traceback / step output instead of dropping it. Tee-Object
+  # mirrors everything to disk for post-mortem inspection.
+  & $venvPython -u -m tools.boot 2>&1 | Tee-Object -FilePath $bootLog
+  $bootExit = $LASTEXITCODE
+} finally {
+  $ErrorActionPreference = $oldEAP
+}
+
 if ($bootExit -ne 0) {
   $hint = switch ($bootExit) {
+    1 { "Python interpreter exited 1 — typically a ModuleNotFoundError or import-time crash. See $bootLog." }
     2 { "One or more boot steps failed (look for [XX] above)." }
     3 { "The boot orchestrator itself crashed (Python traceback above)." }
-    default { "Unexpected exit code from tools.boot." }
+    default { "Unexpected exit code $bootExit from tools.boot. See $bootLog." }
   }
   # Best-effort: surface the failed step name from data/cockpit/boot.json so
   # the user has somewhere concrete to look even if scrollback is gone.
@@ -283,10 +305,32 @@ if ($bootExit -ne 0) {
       # Best-effort only.
     }
   }
-  if ($failedStep) {
-    Fail "boot orchestrator failed (exit $bootExit). $hint`n  Failed step(s): $failedStep`n  Fix the issue above, then re-run."
+
+  # If the orchestrator died before writing boot.json (typical for exit 1),
+  # tail the captured log so the user sees the actual Python error inline.
+  $logTail = ""
+  if ((Test-Path $bootLog) -and (-not $failedStep)) {
+    try {
+      $tail = Get-Content $bootLog -Tail 25 -ErrorAction SilentlyContinue
+      if ($tail) { $logTail = ($tail -join "`n") }
+    } catch {
+      # Best-effort only.
+    }
+  }
+
+  Write-Host ""
+  Write-Host "  --- last 25 lines of $bootLog ---" -ForegroundColor DarkGray
+  if ($logTail) {
+    Write-Host $logTail -ForegroundColor DarkGray
   } else {
-    Fail "boot orchestrator failed (exit $bootExit). $hint Fix the issue above, then re-run."
+    Write-Host "  (log file empty — Python exited before producing any output)" -ForegroundColor DarkGray
+  }
+  Write-Host "  --- end log ---" -ForegroundColor DarkGray
+
+  if ($failedStep) {
+    Fail "boot orchestrator failed (exit $bootExit). $hint`n  Failed step(s): $failedStep`n  Full log: $bootLog"
+  } else {
+    Fail "boot orchestrator failed (exit $bootExit). $hint`n  Full log: $bootLog"
   }
 }
 
