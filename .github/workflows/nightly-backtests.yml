@@ -20,16 +20,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install uv
-        run: curl -LsSf https://astral.sh/uv/install.sh | sh
-      - name: Sync deps
+      - name: Install deps
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          uv sync --all-extras || true
+          pip install --upgrade pip
+          pip install numpy pandas pyarrow pydantic pydantic-settings httpx pytest pytest-asyncio pyjwt fastapi pillow
       - name: Run backtest
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          uv run python -m packages.backtests.run \
+          mkdir -p artifacts
+          python -m packages.backtests.run \
             --strategy ${{ matrix.strategy }} \
             --regime ${{ matrix.regime }} \
             --output artifacts/${{ matrix.strategy }}-${{ matrix.regime }}.json || true
@@ -70,8 +68,15 @@ jobs:
       - name: Persist baseline (main only)
         if: github.ref == 'refs/heads/main' && success()
         run: |
+          set +e
+          shopt -s nullglob globstar
+          json_files=(artifacts/**/*.json)
+          if [ ${#json_files[@]} -eq 0 ]; then
+            echo "nightly_gate: no artifacts to persist; skipping."
+            exit 0
+          fi
           rm -rf baselines/main && mkdir -p baselines/main
-          find artifacts -name "*.json" -exec cp {} baselines/main/ \;
+          cp "${json_files[@]}" baselines/main/
           if [ -n "$(git status --porcelain baselines/)" ]; then
             git config user.name  "nightly-gate"
             git config user.email "nightly-gate@users.noreply.github.com"
@@ -79,3 +84,4 @@ jobs:
             git commit -m "chore(nightly): refresh Sharpe baselines [skip ci]"
             git push
           fi
+        shell: bash
