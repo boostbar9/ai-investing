@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
@@ -387,6 +388,103 @@ def test_main_cli_returns_two_when_step_failed(ctx: BootContext, capsys, monkeyp
     # The [XX] marker for the failed step must be visible.
     assert "[XX]" in out
     assert "data_dirs" in out
+
+
+def test_run_boot_traces_each_step_to_stderr(ctx: BootContext, capsys, monkeypatch) -> None:
+    """>>> step X starting / <<< step X ok markers go to stderr so even a
+    hard exit during a step leaves a 'got this far' marker in the launcher
+    log."""
+    monkeypatch.setenv("COCKPIT_BOOT_TRACE", "1")
+    run_boot(only={"data_dirs"}, ctx=ctx, persist=False)
+    err = capsys.readouterr().err
+    assert ">>> step data_dirs starting" in err
+    assert "<<< step data_dirs ok" in err
+
+
+def test_run_boot_trace_disabled_when_env_zero(ctx: BootContext, capsys, monkeypatch) -> None:
+    monkeypatch.setenv("COCKPIT_BOOT_TRACE", "0")
+    run_boot(only={"data_dirs"}, ctx=ctx, persist=False)
+    err = capsys.readouterr().err
+    assert ">>> step" not in err
+
+
+def test_run_boot_catches_systemexit_in_step(ctx: BootContext, monkeypatch) -> None:
+    """A step that calls sys.exit() must NOT take down the orchestrator.
+    Instead the step is recorded as failed and run_boot returns normally."""
+    def _suicide(_ctx):
+        raise SystemExit(7)
+
+    monkeypatch.setattr(boot, "STEPS", [("data_dirs", _suicide)])
+    summary = run_boot(only={"data_dirs"}, ctx=ctx, persist=False)
+    assert summary.overall == "failed"
+    assert summary.results[0].status == "failed"
+    assert "sys.exit(7)" in summary.results[0].message
+
+
+def test_run_boot_catches_base_exception_in_step(ctx: BootContext, monkeypatch) -> None:
+    """Even an unusual BaseException subclass (e.g. GeneratorExit) must be
+    contained so a misbehaving step can't silently kill boot."""
+    def _weird(_ctx):
+        raise GeneratorExit("unexpected")
+
+    monkeypatch.setattr(boot, "STEPS", [("data_dirs", _weird)])
+    summary = run_boot(only={"data_dirs"}, ctx=ctx, persist=False)
+    assert summary.overall == "failed"
+    assert "GeneratorExit" in summary.results[0].message
+
+
+def test_run_boot_propagates_keyboard_interrupt(ctx: BootContext, monkeypatch) -> None:
+    """Ctrl+C must still quit. Catching it would leave users unable to
+    abort a hung step."""
+    def _hang(_ctx):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(boot, "STEPS", [("data_dirs", _hang)])
+    with pytest.raises(KeyboardInterrupt):
+        run_boot(only={"data_dirs"}, ctx=ctx, persist=False)
+
+
+class _FakeVersionInfo(tuple):
+    """Quack like ``sys.version_info`` — indexable AND has named attrs.
+
+    ``sys.version_info`` itself can't be instantiated directly
+    (TypeError: cannot create 'sys.version_info' instances), so we ship a
+    duck-typed stand-in that supports both ``v[:2]`` slicing and
+    ``v.major / v.minor / v.micro`` attribute access — which is the full
+    surface boot.py uses.
+    """
+
+    def __new__(cls, major: int, minor: int, micro: int,
+                releaselevel: str = "final", serial: int = 0):
+        return super().__new__(cls, (major, minor, micro, releaselevel, serial))
+
+    @property
+    def major(self) -> int: return self[0]
+    @property
+    def minor(self) -> int: return self[1]
+    @property
+    def micro(self) -> int: return self[2]
+    @property
+    def releaselevel(self) -> str: return self[3]
+    @property
+    def serial(self) -> int: return self[4]
+
+
+def test_main_cli_warns_on_old_python_3_12(capsys, monkeypatch) -> None:
+    """Python 3.12.0..3.12.5 had Windows stability bugs; the banner nudges
+    users to upgrade without blocking the launch."""
+    monkeypatch.setattr(sys, "version_info", _FakeVersionInfo(3, 12, 0))
+    boot.main(["--only", "data_dirs"])
+    out = capsys.readouterr().out
+    assert "3.12.0 has known Windows stability bugs" in out
+    assert "3.12.6+" in out
+
+
+def test_main_cli_no_python_warning_on_current(capsys, monkeypatch) -> None:
+    monkeypatch.setattr(sys, "version_info", _FakeVersionInfo(3, 12, 8))
+    boot.main(["--only", "data_dirs"])
+    out = capsys.readouterr().out
+    assert "known Windows stability bugs" not in out
 
 
 def test_main_cli_prints_starting_banner(ctx: BootContext, capsys) -> None:

@@ -486,6 +486,17 @@ def run_boot(
     if only is not None:
         ctx.only = set(only)
 
+    # Per-step trace markers go to stderr, always flushed, so even if a
+    # step calls os._exit() or gets killed by the OS we can see exactly
+    # which step was running. Quiet mode suppresses them to keep CI logs
+    # clean. The launcher tees stderr->stdout->disk so these are visible
+    # in data/cockpit/boot_launcher.log even when the terminal eats them.
+    trace = os.environ.get("COCKPIT_BOOT_TRACE", "1") in ("1", "true", "yes")
+
+    def _trace(msg: str) -> None:
+        if trace:
+            print(msg, file=sys.stderr, flush=True)
+
     started = time.time()
     results: list[StepResult] = []
     for name, fn in STEPS:
@@ -495,12 +506,28 @@ def run_boot(
             if on_step:
                 on_step(r)
             continue
+        _trace(f">>> step {name} starting")
         t0 = time.time()
         try:
             r = fn(ctx)
-        except Exception as exc:  # pragma: no cover — last-line safety net
-            r = StepResult(name, "failed", f"unexpected error: {exc}")
+        except SystemExit as exc:
+            # A step called sys.exit() -- treat as a failure but DO NOT let
+            # it propagate up and kill the orchestrator silently.
+            r = StepResult(
+                name,
+                "failed",
+                f"step called sys.exit({exc.code!r}) -- this is a bug in the step",
+            )
+        except KeyboardInterrupt:
+            # User pressed Ctrl+C; propagate so they can actually quit.
+            _trace(f"<<< step {name} interrupted by user")
+            raise
+        except BaseException as exc:
+            # Catches Exception + GeneratorExit + any future BaseException
+            # subclass a misbehaving step might raise. SystemExit handled above.
+            r = StepResult(name, "failed", f"unexpected error: {type(exc).__name__}: {exc}")
         r.duration_s = round(time.time() - t0, 3)
+        _trace(f"<<< step {name} {r.status} ({r.duration_s}s)")
         results.append(r)
         if on_step:
             on_step(r)
@@ -570,6 +597,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  skip    : {','.join(args.skip)}", flush=True)
         if args.only:
             print(f"  only    : {','.join(args.only)}", flush=True)
+        # Patch-level advisory: 3.12.0/3.12.1/3.12.2 shipped several
+        # multiprocessing / asyncio bugs that can manifest as silent
+        # exits on Windows. Nudge users to a current patch without
+        # blocking the launch.
+        v = sys.version_info
+        if v[:2] == (3, 12) and v.micro < 6:
+            print(
+                f"  [warn] Python 3.12.{v.micro} has known Windows stability bugs; "
+                "upgrade to 3.12.6+ from https://python.org/downloads/",
+                flush=True,
+            )
         print("", flush=True)
 
     # Run with a defensive outer try/except so an unhandled error inside a
