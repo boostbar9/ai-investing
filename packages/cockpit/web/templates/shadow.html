@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shadow Trading - ai-investing</title>
+  {% include "_head_icons.html" %}
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/cockpit.css" />
+  <script src="/static/cockpit.js"></script>
+  <style>
+    .panel { background: #0b1220; border: 1px solid #1f2937; border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+    .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+    .pill-shadow { background: #1e293b; color: #cbd5e1; border: 1px solid #334155; }
+    .pill-ready { background: #064e3b; color: #6ee7b7; border: 1px solid #10b981; }
+    .stat { display: flex; flex-direction: column; gap: 4px; }
+    .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #94a3b8; }
+    .stat-value { font-size: 24px; font-weight: 600; color: #f1f5f9; font-variant-numeric: tabular-nums; }
+    .stat-value.positive { color: #34d399; }
+    .stat-value.negative { color: #f87171; }
+    .progress-bar { width: 100%; height: 8px; background: #1f2937; border-radius: 4px; overflow: hidden; margin-top: 6px; }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, #2563eb, #10b981); transition: width .4s ease; }
+    table.dense { width: 100%; border-collapse: collapse; font-size: 12px; }
+    table.dense th, table.dense td { padding: 6px 10px; border-bottom: 1px solid #1f2937; text-align: right; font-variant-numeric: tabular-nums; }
+    table.dense th { color: #94a3b8; font-weight: 500; text-transform: uppercase; font-size: 10px; letter-spacing: .05em; }
+    table.dense td:first-child, table.dense th:first-child { text-align: left; }
+    .pnl-pos { color: #34d399; }
+    .pnl-neg { color: #f87171; }
+    .pnl-flat { color: #94a3b8; }
+    .empty { padding: 32px; text-align: center; color: #64748b; font-style: italic; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="topbar"><div class="topbar-inner">
+    <a href="/" class="topbar-brand">
+      <span id="cockpit-conn-dot" class="topbar-brand-dot idle"></span>
+      <span>ai-investing</span>
+    </a>
+    <div id="cockpit-topbar"></div>
+  </div></div>
+
+  <div class="max-w-5xl mx-auto p-6">
+    <nav class="nav flex items-center gap-1 mb-4 text-sm">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/trading" class="nav-link">Trading</a>
+      <a href="/shadow" class="nav-link nav-active">Shadow</a>
+      <a href="/autopilot" class="nav-link">Autopilot</a>
+      <a href="/agents" class="nav-link">Agents</a>
+      <a href="/models" class="nav-link">Models</a>
+      <a href="/health" class="nav-link">Health</a>
+      <a href="/settings" class="nav-link">Settings</a>
+    </nav>
+
+    <h1 class="text-2xl font-semibold mb-2">Shadow Trading</h1>
+    <p class="text-gray-400 text-sm mb-6">
+      Predicted-vs-actual reconciliation for shadow-mode orders.
+      The system auto-greenlights for live capital after
+      <span class="font-mono" id="days-required">14</span>
+      consecutive non-negative days.
+    </p>
+
+    <div class="panel">
+      <div class="flex items-start justify-between gap-6 flex-wrap">
+        <div>
+          <div class="stat-label">Status</div>
+          <div class="mt-2" id="status-pill-container">
+            <span class="pill pill-shadow" id="status-pill">SHADOW</span>
+          </div>
+          <div class="mt-3 text-sm text-gray-400" id="status-reason">Loading...</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Streak</div>
+          <div class="stat-value">
+            <span id="streak-days">0</span><span class="text-gray-500 text-base ml-1">/ <span id="streak-required">14</span></span>
+          </div>
+          <div class="progress-bar"><div class="progress-fill" id="streak-bar" style="width:0%"></div></div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Total PnL</div>
+          <div class="stat-value" id="total-pnl">$0.00</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Round trips</div>
+          <div class="stat-value" id="round-trips">0</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2 class="text-lg font-semibold mb-3">Daily PnL</h2>
+      <div id="daily-container">
+        <div class="empty">Loading...</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2 class="text-lg font-semibold mb-3">Predicted vs Actual</h2>
+      <div id="pva-container">
+        <div class="empty">Loading...</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function fmtMoney(v) {
+      const sign = v < 0 ? "-" : "";
+      const abs = Math.abs(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      return sign + "$" + abs;
+    }
+    function pnlClass(v) {
+      if (v > 0) return "pnl-pos";
+      if (v < 0) return "pnl-neg";
+      return "pnl-flat";
+    }
+    async function loadShadow() {
+      try {
+        const data = await Cockpit.api.get("/api/shadow/snapshot");
+        const gl = data.greenlight || {};
+        const status = gl.status || "shadow";
+        const pill = document.getElementById("status-pill");
+        pill.textContent = status.toUpperCase();
+        pill.className = "pill " + (status === "ready" ? "pill-ready" : "pill-shadow");
+
+        document.getElementById("status-reason").textContent = (gl.reasons || []).join(" · ") || "—";
+        document.getElementById("streak-days").textContent = gl.streak_days || 0;
+        document.getElementById("streak-required").textContent = data.days_required || 14;
+        document.getElementById("days-required").textContent = data.days_required || 14;
+        const pct = Math.min(100, ((gl.streak_days || 0) / (data.days_required || 14)) * 100);
+        document.getElementById("streak-bar").style.width = pct + "%";
+
+        const total = data.total_pnl || 0;
+        const totalEl = document.getElementById("total-pnl");
+        totalEl.textContent = fmtMoney(total);
+        totalEl.className = "stat-value " + (total > 0 ? "positive" : total < 0 ? "negative" : "");
+        document.getElementById("round-trips").textContent = data.n_round_trips || 0;
+
+        renderDaily(data.daily || []);
+        renderPva(data.predicted_vs_actual || []);
+      } catch (e) {
+        document.getElementById("status-reason").textContent = "Error loading: " + e.message;
+      }
+    }
+
+    function renderDaily(rows) {
+      const wrap = document.getElementById("daily-container");
+      if (!rows.length) {
+        wrap.innerHTML = '<div class="empty">No closed round-trips yet.</div>';
+        return;
+      }
+      let html = '<table class="dense"><thead><tr><th>Day</th><th>PnL</th><th>Trades</th></tr></thead><tbody>';
+      for (const r of rows.slice().reverse()) {
+        html += `<tr><td>${r.day}</td><td class="${pnlClass(r.pnl)}">${fmtMoney(r.pnl)}</td><td>${r.n_trades}</td></tr>`;
+      }
+      html += "</tbody></table>";
+      wrap.innerHTML = html;
+    }
+
+    function renderPva(rows) {
+      const wrap = document.getElementById("pva-container");
+      if (!rows.length) {
+        wrap.innerHTML = '<div class="empty">No predictions logged yet.</div>';
+        return;
+      }
+      let html = '<table class="dense"><thead><tr><th>Symbol</th><th>Predicted</th><th>Actual</th><th>Delta</th><th>Matched</th></tr></thead><tbody>';
+      for (const r of rows) {
+        const delta = r.actual_pnl - r.predicted_pnl;
+        html += `<tr><td>${r.symbol}</td><td>${fmtMoney(r.predicted_pnl)}</td><td class="${pnlClass(r.actual_pnl)}">${fmtMoney(r.actual_pnl)}</td><td class="${pnlClass(delta)}">${fmtMoney(delta)}</td><td>${r.matched ? "yes" : "—"}</td></tr>`;
+      }
+      html += "</tbody></table>";
+      wrap.innerHTML = html;
+    }
+
+    loadShadow();
+    setInterval(loadShadow, 30000);
+  </script>
+</body>
+</html>

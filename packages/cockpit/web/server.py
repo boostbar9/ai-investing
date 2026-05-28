@@ -488,6 +488,25 @@ def agents_page() -> HTMLResponse:
     return _render("agents.html")
 
 
+@app.get("/shadow", response_class=HTMLResponse)
+def shadow_page() -> HTMLResponse:
+    """Shadow-trading dashboard (Phase 6).
+
+    Renders the static template; the page client-side polls
+    ``/api/shadow/snapshot`` every 30s for fresh state.
+    """
+    return _render("shadow.html")
+
+
+@app.get("/api/shadow/snapshot")
+def api_shadow_snapshot() -> dict[str, Any]:
+    """JSON snapshot of pairs + daily PnL + greenlight verdict."""
+    from packages.shadow.snapshot import build_snapshot
+
+    snap = build_snapshot()
+    return snap.to_payload()
+
+
 @app.get("/health", response_class=HTMLResponse)
 def health_page() -> HTMLResponse:
     return _render("health.html")
