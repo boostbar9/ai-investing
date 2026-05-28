@@ -1559,3 +1559,229 @@ def test_job_log_download_handles_missing_file(
     r = client.get("/api/jobs/pretrain/log?download=1")
     assert r.status_code == 200
     assert "no log yet" in r.text
+
+
+# ===========================================================================
+# Onboarding endpoints (/welcome page + /api/onboarding/*)
+# ===========================================================================
+#
+# These tests mirror the boot endpoint pattern: monkeypatch the persistence
+# path to tmp_path so the suite never writes into data/cockpit/. The probe
+# itself is patched out to keep the test offline.
+
+
+@pytest.fixture
+def fake_onboarding_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Redirect onboarding persistence to a tmp file."""
+    target = tmp_path / "onboarding.json"
+    from packages.cockpit import onboarding as ob_mod
+
+    monkeypatch.setattr(ob_mod, "ONBOARDING_PATH", target)
+    return target
+
+
+def test_welcome_page_serves_html(client: TestClient) -> None:
+    """The /welcome route must serve the wizard shell. We just check for
+    a stable string in the template so any future rename gets a clear
+    failure."""
+    r = client.get("/welcome")
+    assert r.status_code == 200
+    assert "first-boot setup" in r.text.lower() or "welcome" in r.text.lower()
+
+
+def test_onboarding_get_returns_defaults_when_no_file(
+    client: TestClient, fake_onboarding_path: Path
+) -> None:
+    r = client.get("/api/onboarding")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["completed"] is False
+    assert body["robinhood_status"] == "unknown"
+    assert body["live_float_cap_usd"] == 300.0
+    assert body["rh_mode"] == "shadow"
+
+
+def test_onboarding_complete_writes_state_and_sets_flags(
+    client: TestClient, fake_onboarding_path: Path
+) -> None:
+    payload = {
+        "display_name": "Devin",
+        "robinhood_status": "waitlist",
+        "live_float_cap_usd": 250.0,
+        "accept_disclaimer": True,
+    }
+    r = client.post("/api/onboarding/complete", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["completed"] is True
+    assert body["display_name"] == "Devin"
+    assert body["robinhood_status"] == "waitlist"
+    assert body["live_float_cap_usd"] == 250.0
+    assert body["accepted_disclaimer_at"] != ""
+    assert body["wizard_started_at"] != ""
+    assert body["wizard_completed_at"] != ""
+    # Persisted to disk.
+    assert fake_onboarding_path.exists()
+
+
+def test_onboarding_complete_rejects_unaccepted_disclaimer(
+    client: TestClient, fake_onboarding_path: Path
+) -> None:
+    """Disclaimer is the hard gate. Without it we MUST refuse to mark
+    completion, even if every other field is valid."""
+    payload = {
+        "display_name": "Devin",
+        "robinhood_status": "waitlist",
+        "live_float_cap_usd": 300.0,
+        "accept_disclaimer": False,
+    }
+    r = client.post("/api/onboarding/complete", json=payload)
+    assert r.status_code == 400
+    assert "disclaimer" in r.text.lower()
+    # And nothing was persisted.
+    assert not fake_onboarding_path.exists()
+
+
+def test_onboarding_complete_rejects_invalid_rh_status(
+    client: TestClient, fake_onboarding_path: Path
+) -> None:
+    payload = {
+        "robinhood_status": "not_a_real_status",
+        "live_float_cap_usd": 300.0,
+        "accept_disclaimer": True,
+    }
+    r = client.post("/api/onboarding/complete", json=payload)
+    assert r.status_code == 400
+    assert "robinhood_status" in r.text.lower()
+
+
+def test_onboarding_complete_rejects_negative_float_cap(
+    client: TestClient, fake_onboarding_path: Path
+) -> None:
+    payload = {
+        "robinhood_status": "waitlist",
+        "live_float_cap_usd": -1.0,
+        "accept_disclaimer": True,
+    }
+    r = client.post("/api/onboarding/complete", json=payload)
+    assert r.status_code == 400
+
+
+def test_onboarding_reset_wipes_file(
+    client: TestClient, fake_onboarding_path: Path
+) -> None:
+    # Seed with a completed state.
+    client.post(
+        "/api/onboarding/complete",
+        json={
+            "display_name": "Devin",
+            "robinhood_status": "waitlist",
+            "live_float_cap_usd": 300.0,
+            "accept_disclaimer": True,
+        },
+    )
+    assert fake_onboarding_path.exists()
+    r = client.post("/api/onboarding/reset")
+    assert r.status_code == 200
+    assert not fake_onboarding_path.exists()
+    assert r.json()["state"]["completed"] is False
+
+
+def test_onboarding_check_robinhood_persists_waitlist_outcome(
+    client: TestClient,
+    fake_onboarding_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe returns 'waitlist' -> state should be persisted."""
+    from packages.cockpit import robinhood_access as rh_mod
+    from packages.cockpit.robinhood_access import ProbeResult
+
+    monkeypatch.setattr(
+        rh_mod,
+        "detect_access",
+        lambda **_kw: ProbeResult(
+            outcome="waitlist",
+            detail="reachable",
+            http_status=200,
+        ),
+    )
+    # Also monkeypatch the import inside the endpoint module path.
+    monkeypatch.setattr(
+        srv,
+        "_OnboardingCompleteBody",
+        srv._OnboardingCompleteBody,
+        raising=False,
+    )
+
+    r = client.post("/api/onboarding/check-robinhood")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["outcome"] == "waitlist"
+    assert body["persisted"] is True
+    # State file should now reflect the new status.
+    from packages.cockpit.onboarding import load_onboarding
+
+    assert load_onboarding().robinhood_status == "waitlist"
+
+
+def test_onboarding_check_robinhood_offline_does_not_persist(
+    client: TestClient,
+    fake_onboarding_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An offline probe must NOT overwrite a previously-stored status.
+    This is what protects a 'granted' record from a flaky wifi blip."""
+    from packages.cockpit import robinhood_access as rh_mod
+    from packages.cockpit.onboarding import (
+        OnboardingState,
+        load_onboarding,
+        save_onboarding,
+    )
+    from packages.cockpit.robinhood_access import ProbeResult
+
+    # Seed: user previously had 'granted'.
+    save_onboarding(OnboardingState(robinhood_status="granted"))
+    monkeypatch.setattr(
+        rh_mod,
+        "detect_access",
+        lambda **_kw: ProbeResult(outcome="offline", detail="no internet"),
+    )
+
+    r = client.post("/api/onboarding/check-robinhood")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["outcome"] == "offline"
+    assert body["persisted"] is False
+    # Original 'granted' must survive an offline blip.
+    assert load_onboarding().robinhood_status == "granted"
+
+
+def test_onboarding_check_robinhood_respects_declined_choice(
+    client: TestClient,
+    fake_onboarding_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the user previously declined, the detector should short-circuit
+    to 'declined' without touching the network."""
+    from packages.cockpit.onboarding import (
+        OnboardingState,
+        save_onboarding,
+    )
+
+    save_onboarding(OnboardingState(robinhood_status="declined"))
+
+    # Force any network probe to blow up so we know it wasn't called.
+    from packages.cockpit import robinhood_access as rh_mod
+
+    def explode(**_kw):  # pragma: no cover - reached only on regression
+        raise RuntimeError("network must not be touched when declined")
+
+    monkeypatch.setattr(rh_mod, "_probe_discovery", explode)
+    monkeypatch.setattr(rh_mod, "_check_granted_via_token", lambda: None)
+
+    r = client.post("/api/onboarding/check-robinhood")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["outcome"] == "declined"

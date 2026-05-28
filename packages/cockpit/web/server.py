@@ -493,6 +493,15 @@ def health_page() -> HTMLResponse:
     return _render("health.html")
 
 
+@app.get("/welcome", response_class=HTMLResponse)
+def welcome_page() -> HTMLResponse:
+    """First-boot wizard. Served on demand -- the dashboard banner deep-
+    links here when onboarding is incomplete. The actual state lives in
+    ``data/cockpit/onboarding.json`` and is read/written by the
+    ``/api/onboarding/*`` endpoints below."""
+    return _render("welcome.html")
+
+
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 _INCLUDE_PATTERN = re.compile(r"\{%\s*include\s+['\"]([^'\"]+)['\"]\s*%\}")
 # Strip Jinja-style comments {# ... #}. DOTALL so multi-line blocks vanish too.
@@ -1173,6 +1182,135 @@ def api_boot_summary(refresh: bool = False) -> dict[str, Any]:
         # First call before the launcher ran: synthesize a minimal snapshot.
         summary = run_boot(only={"env", "venv", "data_dirs", "cockpit_port"})
         return summary.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# /api/onboarding/* -- first-boot wizard (Phase 1C)
+#
+# Backed by ``packages/cockpit/onboarding.py`` (state) and
+# ``packages/cockpit/robinhood_access.py`` (RH waitlist probe). The
+# wizard HTML lives at ``/welcome``; these endpoints are how it reads
+# and persists user choices.
+#
+# Design notes:
+#   * GET /api/onboarding returns the full state every time. Cheap, and
+#     the wizard doesn't render the dashboard so we can afford it.
+#   * POST /api/onboarding/check-robinhood is a deliberately tiny probe
+#     (4s timeout, fail-open). It updates the persisted status as a side
+#     effect so a polling dashboard banner can pick it up.
+#   * POST /api/onboarding/complete is the single 'done' commit -- it
+#     stamps timestamps, flips ``completed=True``, and is idempotent.
+#   * POST /api/onboarding/reset wipes the state file so the wizard re-
+#     runs. Exposed for the settings page "Re-run welcome" button.
+# ---------------------------------------------------------------------------
+
+
+class _OnboardingCompleteBody(BaseModel):
+    """Payload accepted by ``/api/onboarding/complete``. All fields are
+    optional except ``accept_disclaimer`` -- if False, the endpoint 400s
+    so we never persist a 'completed' record without acknowledgment."""
+
+    display_name: str = ""
+    robinhood_status: str = "unknown"
+    live_float_cap_usd: float = 300.0
+    accept_disclaimer: bool = False
+
+
+@app.get("/api/onboarding")
+def api_onboarding_get() -> dict[str, Any]:
+    """Read the persisted onboarding state. Returns sane defaults when
+    the file is missing or corrupt (the wizard treats both the same)."""
+    from packages.cockpit.onboarding import load_onboarding
+
+    return load_onboarding().to_dict()
+
+
+@app.post("/api/onboarding/check-robinhood")
+def api_onboarding_check_robinhood() -> dict[str, Any]:
+    """Run the Robinhood reachability probe and persist the outcome.
+
+    Never raises -- if the probe blows up we record ``unknown`` so the
+    UI can show a neutral state instead of a stack trace. The probe is
+    bounded by ``RH_PROBE_TIMEOUT_S`` (4s) so this endpoint can't hang
+    the wizard.
+    """
+    from packages.cockpit.onboarding import (
+        load_onboarding,
+        save_onboarding,
+    )
+    from packages.cockpit.robinhood_access import detect_access
+
+    current = load_onboarding()
+    result = detect_access(declined_already=current.robinhood_status == "declined")
+
+    # 'offline' is not a persisted status (the onboarding schema doesn't
+    # know about it). Leave the stored status untouched in that case --
+    # we don't want a flaky wifi blip to overwrite a previously-confirmed
+    # 'granted' value.
+    if result.outcome in {"granted", "waitlist", "declined"}:
+        current.robinhood_status = result.outcome  # type: ignore[assignment]
+        save_onboarding(current)
+
+    return {
+        "outcome": result.outcome,
+        "detail": result.detail,
+        "http_status": result.http_status,
+        "persisted": result.outcome in {"granted", "waitlist", "declined"},
+    }
+
+
+@app.post("/api/onboarding/complete")
+def api_onboarding_complete(body: _OnboardingCompleteBody) -> dict[str, Any]:
+    """Stamp completion and persist the final wizard state.
+
+    The disclaimer is the gate: if ``accept_disclaimer`` is False we
+    refuse to mark completion. This makes it impossible to bypass the
+    acknowledgement by hand-crafting a POST.
+    """
+    from packages.cockpit.onboarding import (
+        VALID_RH_STATUS,
+        accept_disclaimer,
+        load_onboarding,
+        mark_completed,
+        mark_started,
+        save_onboarding,
+    )
+
+    if not body.accept_disclaimer:
+        raise HTTPException(
+            status_code=400, detail="disclaimer must be accepted"
+        )
+    if body.robinhood_status not in VALID_RH_STATUS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid robinhood_status: {body.robinhood_status}",
+        )
+    if body.live_float_cap_usd < 0:
+        raise HTTPException(
+            status_code=400, detail="live_float_cap_usd must be >= 0"
+        )
+
+    state = load_onboarding()
+    mark_started(state)  # idempotent
+    state.display_name = body.display_name.strip()
+    state.robinhood_status = body.robinhood_status  # type: ignore[assignment]
+    state.live_float_cap_usd = float(body.live_float_cap_usd)
+    accept_disclaimer(state)
+    mark_completed(state)
+    save_onboarding(state)
+    return state.to_dict()
+
+
+@app.post("/api/onboarding/reset")
+def api_onboarding_reset() -> dict[str, Any]:
+    """Wipe onboarding state so the wizard re-runs on next visit.
+
+    Used by the settings page 'Re-run welcome' affordance.
+    """
+    from packages.cockpit.onboarding import load_onboarding, reset
+
+    reset()
+    return {"ok": True, "state": load_onboarding().to_dict()}
 
 
 @app.get("/api/ollama/status")

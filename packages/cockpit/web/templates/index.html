@@ -26,6 +26,33 @@
 
   <div class="max-w-7xl mx-auto p-4 md:p-6">
 
+    <!-- {# First-boot welcome banner. Hidden by default; the JS below
+         polls /api/onboarding once on load and reveals it only when the
+         wizard hasn't been completed. Idempotent: revisiting the
+         dashboard after completion never shows the banner. #} -->
+    <div id="welcome-banner" class="hidden mb-4 rounded-lg border border-blue-700 bg-blue-900/30 p-4 flex items-center justify-between gap-4">
+      <div>
+        <div class="font-semibold text-blue-200">Finish setting up ai-investing</div>
+        <div class="text-xs text-gray-400 mt-1">Four quick steps: name, Robinhood status, live-trading cap, disclaimer.</div>
+      </div>
+      <a href="/welcome" class="px-4 py-2 rounded-md bg-blue-600 hover:bg-blue-500 text-sm font-medium whitespace-nowrap">Open setup →</a>
+    </div>
+    <script>
+      // {# Single shot probe of /api/onboarding. Errors silently -- the
+      //    banner just stays hidden if the API isn't reachable yet,
+      //    which avoids a scary flash during boot. #}
+      (async () => {
+        try {
+          const r = await fetch("/api/onboarding");
+          if (!r.ok) return;
+          const s = await r.json();
+          if (!s.completed) {
+            document.getElementById("welcome-banner").classList.remove("hidden");
+          }
+        } catch (_) { /* swallow */ }
+      })();
+    </script>
+
     <!-- Nav -->
     <nav class="nav">
       <a href="/" class="nav-link nav-active">Dashboard</a>

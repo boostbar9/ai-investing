@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Welcome — ai-investing</title>
+  {% include "_head_icons.html" %}
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/cockpit.css" />
+  <style>
+    /* {# Wizard-specific layout. Kept tiny -- four panels, one progress
+        bar, and a couple of buttons. No JS framework needed. #} */
+    .wizard-shell { max-width: 720px; margin: 0 auto; }
+    .step { display: none; }
+    .step.active { display: block; }
+    .input {
+      background: #0b1220; border: 1px solid #1f2937; border-radius: 6px;
+      padding: 10px 12px; color: #f9fafb; font-size: 14px; width: 100%;
+    }
+    .input:focus { outline: none; border-color: #2563eb; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+      border-radius: 999px; font-size: 12px; font-weight: 500;
+    }
+    .pill-unknown { background: #1f2937; color: #d1d5db; }
+    .pill-waitlist { background: #78350f; color: #fde68a; }
+    .pill-granted { background: #064e3b; color: #6ee7b7; }
+    .pill-declined { background: #1f2937; color: #9ca3af; }
+    .pill-offline { background: #1e293b; color: #93c5fd; }
+    .progress-dot { width: 28px; height: 28px; border-radius: 999px;
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 600; }
+    .progress-dot.done { background: #059669; color: white; }
+    .progress-dot.active { background: #2563eb; color: white; }
+    .progress-dot.pending { background: #1f2937; color: #6b7280; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="wizard-shell p-6 md:p-10">
+
+    <!-- Brand -->
+    <header class="mb-8 flex items-center gap-3">
+      <span class="inline-block w-3 h-3 rounded-full bg-blue-500"></span>
+      <span class="text-lg font-semibold">ai-investing</span>
+      <span class="text-xs text-gray-500 ml-2">First-boot setup</span>
+    </header>
+
+    <!-- Progress dots -->
+    <div class="flex items-center gap-3 mb-8 text-xs text-gray-400">
+      <span id="dot-1" class="progress-dot active">1</span>
+      <span class="flex-1 h-px bg-gray-800"></span>
+      <span id="dot-2" class="progress-dot pending">2</span>
+      <span class="flex-1 h-px bg-gray-800"></span>
+      <span id="dot-3" class="progress-dot pending">3</span>
+      <span class="flex-1 h-px bg-gray-800"></span>
+      <span id="dot-4" class="progress-dot pending">4</span>
+    </div>
+
+    <!-- Step 1: Welcome -->
+    <section id="step-1" class="step active">
+      <h1 class="text-3xl font-semibold mb-3">Welcome to ai-investing.</h1>
+      <p class="text-gray-400 mb-6 text-base leading-relaxed">
+        This is a quick four-step setup. After this, every launch will be
+        one click — Ollama warms up, your agents start, and the cockpit
+        opens automatically.
+      </p>
+
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-5 mb-6">
+        <h2 class="font-semibold mb-2">What you're about to set up</h2>
+        <ul class="text-sm text-gray-400 space-y-2">
+          <li>• Your display name (optional)</li>
+          <li>• Robinhood agentic-trading status (waitlist signup or skip)</li>
+          <li>• A starter live-trading cap ($300 default)</li>
+          <li>• Acknowledgment that this is software that can lose money</li>
+        </ul>
+      </div>
+
+      <label class="block text-sm text-gray-400 mb-2">Display name (optional)</label>
+      <input id="display_name" class="input mb-6" placeholder="Devin" autocomplete="off" />
+
+      <div class="flex justify-end">
+        <button id="btn-next-1" class="px-5 py-2 rounded-md bg-blue-600 hover:bg-blue-500 font-medium">
+          Get started →
+        </button>
+      </div>
+    </section>
+
+    <!-- Step 2: Robinhood status -->
+    <section id="step-2" class="step">
+      <h1 class="text-2xl font-semibold mb-3">Robinhood agentic trading</h1>
+      <p class="text-gray-400 mb-6 text-sm leading-relaxed">
+        Robinhood opened their platform to AI agents on May 27, 2026. Access
+        is rolling out gradually — you sign up, they email you when your
+        agentic sub-account is live.
+      </p>
+
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-5 mb-6">
+        <div class="flex items-center justify-between mb-3">
+          <span class="text-sm text-gray-400">Current status</span>
+          <span id="rh-status-pill" class="pill pill-unknown">checking…</span>
+        </div>
+        <div id="rh-status-detail" class="text-xs text-gray-500"></div>
+      </div>
+
+      <div class="grid gap-3 mb-6">
+        <a href="https://robinhood.com/us/en/support/articles/agentic-trading-overview/"
+           target="_blank" rel="noopener"
+           class="block bg-emerald-900/30 border border-emerald-700 rounded-lg p-4 hover:bg-emerald-900/50">
+          <div class="font-semibold text-emerald-300 mb-1">Reserve your spot</div>
+          <div class="text-xs text-gray-400">
+            Opens Robinhood's agentic-trading page in a new tab. Sign up there,
+            then come back and click "Check again".
+          </div>
+        </a>
+
+        <button id="btn-recheck-rh"
+                class="text-left bg-gray-900 border border-gray-800 rounded-lg p-4 hover:border-blue-600">
+          <div class="font-semibold text-blue-300 mb-1">Check again</div>
+          <div class="text-xs text-gray-400">
+            Re-probe Robinhood's discovery endpoint. Doesn't submit any trades —
+            this is read-only.
+          </div>
+        </button>
+
+        <button id="btn-decline-rh"
+                class="text-left bg-gray-900 border border-gray-800 rounded-lg p-4 hover:border-gray-600">
+          <div class="font-semibold text-gray-300 mb-1">Skip for now</div>
+          <div class="text-xs text-gray-400">
+            Stay paper-only. You can re-enable Robinhood later from Settings.
+          </div>
+        </button>
+      </div>
+
+      <div class="flex justify-between">
+        <button id="btn-prev-2" class="px-4 py-2 rounded-md bg-gray-800 hover:bg-gray-700 text-sm">← Back</button>
+        <button id="btn-next-2" class="px-5 py-2 rounded-md bg-blue-600 hover:bg-blue-500 font-medium">Continue →</button>
+      </div>
+    </section>
+
+    <!-- Step 3: Float cap -->
+    <section id="step-3" class="step">
+      <h1 class="text-2xl font-semibold mb-3">Starter live-trading cap</h1>
+      <p class="text-gray-400 mb-6 text-sm leading-relaxed">
+        This is the maximum the broker can deploy in <em>live</em> mode —
+        not paper. Default is $300 because that's what you told us you're
+        comfortable risking first. You can raise this later after 14 days
+        of positive shadow-trading PnL.
+      </p>
+
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-5 mb-6">
+        <label class="block text-sm text-gray-400 mb-2">Live float cap (USD)</label>
+        <input id="float_cap" class="input mb-2" type="number" min="0" step="50" value="300" />
+        <div class="text-xs text-gray-500">
+          Robinhood shadow-mode stays on by default — no real orders until you
+          flip it from the dashboard.
+        </div>
+      </div>
+
+      <div class="bg-amber-900/20 border border-amber-700/50 rounded-lg p-4 mb-6">
+        <div class="text-sm text-amber-300 font-semibold mb-1">Heads up</div>
+        <div class="text-xs text-gray-400">
+          AI-driven trading can lose money. Robinhood disclaims liability
+          for agent decisions. Markets aren't predictable — we look for
+          positive expected value over many trades, not certainty on any
+          single one.
+        </div>
+      </div>
+
+      <label class="flex items-start gap-3 mb-6 cursor-pointer">
+        <input id="accept_disclaimer" type="checkbox" class="mt-1" />
+        <span class="text-sm text-gray-300">
+          I understand this can lose money and I accept the risk.
+        </span>
+      </label>
+
+      <div class="flex justify-between">
+        <button id="btn-prev-3" class="px-4 py-2 rounded-md bg-gray-800 hover:bg-gray-700 text-sm">← Back</button>
+        <button id="btn-next-3" class="px-5 py-2 rounded-md bg-blue-600 hover:bg-blue-500 font-medium disabled:opacity-40 disabled:cursor-not-allowed" disabled>
+          Continue →
+        </button>
+      </div>
+    </section>
+
+    <!-- Step 4: Confirm + launch -->
+    <section id="step-4" class="step">
+      <h1 class="text-2xl font-semibold mb-3">All set.</h1>
+      <p class="text-gray-400 mb-6 text-sm leading-relaxed">
+        Here's what we're saving. You can change any of this from Settings later.
+      </p>
+
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-5 mb-6 space-y-2 text-sm">
+        <div class="flex justify-between"><span class="text-gray-400">Display name</span><span id="summary-name" class="font-medium">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Robinhood</span><span id="summary-rh" class="font-medium">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Robinhood mode</span><span class="font-medium text-blue-300">Shadow (logs trades, doesn't submit)</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Live float cap</span><span id="summary-cap" class="font-medium">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Disclaimer accepted</span><span class="font-medium text-emerald-300">Yes</span></div>
+      </div>
+
+      <div class="flex justify-between">
+        <button id="btn-prev-4" class="px-4 py-2 rounded-md bg-gray-800 hover:bg-gray-700 text-sm">← Back</button>
+        <button id="btn-launch" class="px-5 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500 font-semibold">
+          Launch cockpit →
+        </button>
+      </div>
+    </section>
+
+  </div>
+
+  <script>
+    // {# Tiny vanilla-JS wizard controller. No build step, no framework.
+    //    State lives in the form fields + an in-memory object; the server
+    //    is the source of truth on every step transition. #}
+    const state = {
+      step: 1,
+      display_name: "",
+      rh_status: "unknown",
+      rh_detail: "",
+      live_float_cap_usd: 300,
+      disclaimer: false,
+    };
+
+    function setStep(n) {
+      state.step = n;
+      document.querySelectorAll(".step").forEach(el => el.classList.remove("active"));
+      document.getElementById("step-" + n).classList.add("active");
+      for (let i = 1; i <= 4; i++) {
+        const d = document.getElementById("dot-" + i);
+        d.classList.remove("done", "active", "pending");
+        if (i < n) d.classList.add("done");
+        else if (i === n) d.classList.add("active");
+        else d.classList.add("pending");
+      }
+    }
+
+    function setRhPill(status, detail) {
+      state.rh_status = status;
+      state.rh_detail = detail || "";
+      const pill = document.getElementById("rh-status-pill");
+      pill.className = "pill pill-" + status;
+      const labels = {
+        unknown: "Not checked yet",
+        waitlist: "On waitlist (endpoint reachable)",
+        granted: "Access granted",
+        declined: "Skipped",
+        offline: "Offline — can't reach Robinhood",
+      };
+      pill.textContent = labels[status] || status;
+      document.getElementById("rh-status-detail").textContent = detail || "";
+    }
+
+    async function probeRobinhood() {
+      setRhPill("unknown", "checking…");
+      try {
+        const r = await fetch("/api/onboarding/check-robinhood", { method: "POST" });
+        const j = await r.json();
+        setRhPill(j.outcome || "unknown", j.detail || "");
+      } catch (e) {
+        setRhPill("offline", "couldn't reach the cockpit API");
+      }
+    }
+
+    document.getElementById("btn-next-1").addEventListener("click", () => {
+      state.display_name = document.getElementById("display_name").value.trim();
+      setStep(2);
+      probeRobinhood();
+    });
+    document.getElementById("btn-prev-2").addEventListener("click", () => setStep(1));
+    document.getElementById("btn-next-2").addEventListener("click", () => setStep(3));
+    document.getElementById("btn-recheck-rh").addEventListener("click", probeRobinhood);
+    document.getElementById("btn-decline-rh").addEventListener("click", () => {
+      setRhPill("declined", "you chose to skip Robinhood for now");
+    });
+
+    document.getElementById("btn-prev-3").addEventListener("click", () => setStep(2));
+    document.getElementById("accept_disclaimer").addEventListener("change", e => {
+      state.disclaimer = e.target.checked;
+      document.getElementById("btn-next-3").disabled = !state.disclaimer;
+    });
+    document.getElementById("btn-next-3").addEventListener("click", () => {
+      const v = parseFloat(document.getElementById("float_cap").value);
+      state.live_float_cap_usd = isFinite(v) && v >= 0 ? v : 300;
+      document.getElementById("summary-name").textContent = state.display_name || "(none)";
+      document.getElementById("summary-rh").textContent = ({
+        unknown: "Not checked",
+        waitlist: "On waitlist",
+        granted: "Access granted",
+        declined: "Skipped",
+        offline: "Offline",
+      }[state.rh_status]) || state.rh_status;
+      document.getElementById("summary-cap").textContent = "$" + state.live_float_cap_usd.toFixed(2);
+      setStep(4);
+    });
+
+    document.getElementById("btn-prev-4").addEventListener("click", () => setStep(3));
+    document.getElementById("btn-launch").addEventListener("click", async () => {
+      const btn = document.getElementById("btn-launch");
+      btn.disabled = true; btn.textContent = "Saving…";
+      try {
+        const r = await fetch("/api/onboarding/complete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            display_name: state.display_name,
+            robinhood_status: state.rh_status === "offline" ? "unknown" : state.rh_status,
+            live_float_cap_usd: state.live_float_cap_usd,
+            accept_disclaimer: state.disclaimer,
+          }),
+        });
+        if (!r.ok) {
+          const t = await r.text();
+          throw new Error(t || "save failed");
+        }
+        window.location.href = "/";
+      } catch (e) {
+        btn.disabled = false; btn.textContent = "Launch cockpit →";
+        alert("Couldn't save setup: " + e.message);
+      }
+    });
+  </script>
+</body>
+</html>
