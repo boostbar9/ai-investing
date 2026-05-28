@@ -85,3 +85,4 @@ data/promotion_candidates.jsonl
 data/audit/
 data/db/
 backups/
+data._tmp/
