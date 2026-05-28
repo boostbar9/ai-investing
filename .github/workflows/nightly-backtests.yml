@@ -41,8 +41,13 @@ jobs:
     name: Sharpe-drop gate
     needs: matrix
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # token with write access so post-gate baseline refresh can push
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
