@@ -152,12 +152,69 @@ TELEGRAM_CHAT_ID=your_chat_id_here</div>
       </div>
     </section>
 
+    <!-- Arm-live one-click action panel -->
+    <section id="arm-section" class="mb-6">
+      <h2 class="text-lg font-medium mb-3">Live trading switch</h2>
+      <div class="gate-row sev-info" style="align-items:flex-start">
+        <span class="dot" id="arm-dot"></span>
+        <div class="flex-1">
+          <div class="flex items-center justify-between flex-wrap gap-3">
+            <div>
+              <div class="font-medium" id="arm-label">Loading switch state…</div>
+              <div class="text-xs text-gray-500 mt-1" id="arm-sub">Checking ENABLE_LIVE_TRADING flag…</div>
+            </div>
+            <div class="flex gap-2">
+              <button id="arm-btn" class="btn btn-primary" disabled>Arm live trading</button>
+              <button id="disarm-btn" class="btn btn-ghost" style="display:none">Disarm</button>
+            </div>
+          </div>
+          <div id="arm-result" class="text-xs mt-3" style="display:none"></div>
+        </div>
+      </div>
+    </section>
+
     <p class="text-xs text-gray-500 mt-6">
-      The promotion gate is enforced server-side. Even after every check
-      passes, <code>ENABLE_LIVE_TRADING=true</code> must be set in your
-      <code>.env</code> for the trader to use real capital, and Telegram
-      approval is still required per trade.
+      The promotion gate is enforced server-side. The arm button above
+      writes <code>ENABLE_LIVE_TRADING=true</code> to your
+      <code>.env</code> only after every gate clears. Telegram approval
+      is still required per trade, and every arm/disarm action is
+      recorded in <code>data/cockpit/arm_live_audit.jsonl</code>.
     </p>
+  </div>
+
+  <!-- Arm-live confirmation modal -->
+  <div id="arm-modal" role="dialog" aria-modal="true" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);align-items:center;justify-content:center;z-index:1000;">
+    <div style="max-width:520px;width:92vw;background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:22px;">
+      <h3 style="font-size:18px;font-weight:600;margin-bottom:6px">Arm live trading?</h3>
+      <p style="font-size:13px;color:#94a3b8;margin-bottom:14px">
+        Real capital from your Robinhood account will be eligible for orders the
+        next time the worker loop runs. Each trade still requires Telegram
+        approval, and your $300 first-float guardrail remains in effect.
+      </p>
+      <label style="display:block;font-size:12px;color:#94a3b8;margin-bottom:6px">Optional note (recorded in audit log)</label>
+      <input id="arm-note" type="text" maxlength="500" placeholder="e.g. 14-day soak cleared on 2026-05-28" style="width:100%;background:#0f172a;border:1px solid #1f2937;border-radius:6px;padding:8px;color:#f1f5f9;margin-bottom:14px" />
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button id="arm-cancel" class="btn btn-ghost">Cancel</button>
+        <button id="arm-confirm" class="btn btn-primary">Confirm arm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Disarm confirmation modal -->
+  <div id="disarm-modal" role="dialog" aria-modal="true" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);align-items:center;justify-content:center;z-index:1000;">
+    <div style="max-width:520px;width:92vw;background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:22px;">
+      <h3 style="font-size:18px;font-weight:600;margin-bottom:6px">Disarm live trading?</h3>
+      <p style="font-size:13px;color:#94a3b8;margin-bottom:14px">
+        Live orders pause immediately. Open positions are not closed.
+        Provide a reason so future-you knows why this happened.
+      </p>
+      <label style="display:block;font-size:12px;color:#94a3b8;margin-bottom:6px">Reason (required)</label>
+      <input id="disarm-reason" type="text" maxlength="500" placeholder="e.g. unexpected drawdown, weekend pause, etc." style="width:100%;background:#0f172a;border:1px solid #1f2937;border-radius:6px;padding:8px;color:#f1f5f9;margin-bottom:14px" />
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button id="disarm-cancel" class="btn btn-ghost">Cancel</button>
+        <button id="disarm-confirm" class="btn btn-danger">Confirm disarm</button>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -203,6 +260,7 @@ TELEGRAM_CHAT_ID=your_chat_id_here</div>
           renderGates(j);
           renderCanary(j);
           renderTelegramHelp(j);
+          renderArmSection(j);
         } catch (e) {
           gatesEl.innerHTML = '<div class="gate-row sev-error"><span class="dot error"></span><div>Failed to load: ' + escapeHtml(e.message || "unknown error") + '</div></div>';
         }
@@ -337,6 +395,116 @@ TELEGRAM_CHAT_ID=your_chat_id_here</div>
         const el = document.getElementById("telegram-help");
         el.style.display = j.progress.telegram_connected ? "none" : "";
       }
+
+      function renderArmSection(j) {
+        const armBtn = document.getElementById("arm-btn");
+        const disarmBtn = document.getElementById("disarm-btn");
+        const label = document.getElementById("arm-label");
+        const sub = document.getElementById("arm-sub");
+        const dot = document.getElementById("arm-dot");
+        const prog = j.progress || {};
+        const armed = !!prog.enable_live_flag;
+        const canArm = !!j.live_enabled && !armed;
+        if (armed) {
+          dot.className = "dot ok";
+          label.textContent = "Live trading is ARMED.";
+          sub.textContent = "ENABLE_LIVE_TRADING=true is active. Telegram approval is still required per trade.";
+          armBtn.disabled = true;
+          armBtn.textContent = "Already armed";
+          disarmBtn.style.display = "";
+        } else if (canArm) {
+          dot.className = "dot ok";
+          label.textContent = "All gates green — ready to arm.";
+          sub.textContent = "Click to write ENABLE_LIVE_TRADING=true and start routing live orders.";
+          armBtn.disabled = false;
+          armBtn.textContent = "Arm live trading";
+          disarmBtn.style.display = "none";
+        } else {
+          dot.className = "dot warn";
+          label.textContent = "Disarmed (still soaking).";
+          sub.textContent = "Resolve every red/amber gate above to enable the arm button.";
+          armBtn.disabled = true;
+          armBtn.textContent = "Arm live trading";
+          disarmBtn.style.display = "none";
+        }
+      }
+
+      function showResult(msg, ok) {
+        const el = document.getElementById("arm-result");
+        el.style.display = "";
+        el.style.color = ok ? "#34d399" : "#f87171";
+        el.textContent = msg;
+      }
+
+      function openModal(id) { document.getElementById(id).style.display = "flex"; }
+      function closeModal(id) { document.getElementById(id).style.display = "none"; }
+
+      document.getElementById("arm-btn").addEventListener("click", function () {
+        document.getElementById("arm-note").value = "";
+        openModal("arm-modal");
+      });
+      document.getElementById("arm-cancel").addEventListener("click", function () { closeModal("arm-modal"); });
+      document.getElementById("arm-confirm").addEventListener("click", async function () {
+        const note = document.getElementById("arm-note").value || "";
+        const btn = document.getElementById("arm-confirm");
+        btn.disabled = true;
+        try {
+          const r = await fetch("/api/arm-live", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ note: note }),
+          });
+          const j = await r.json();
+          closeModal("arm-modal");
+          if (j.ok && j.action === "armed") {
+            showResult("Live trading armed. ENABLE_LIVE_TRADING=true persisted to .env.", true);
+          } else if (j.ok && j.action === "noop") {
+            showResult("Already armed (no change).", true);
+          } else {
+            showResult("Refused to arm: " + (j.reasons || []).join("; "), false);
+          }
+        } catch (e) {
+          closeModal("arm-modal");
+          showResult("Arm failed: " + (e.message || "network error"), false);
+        } finally {
+          btn.disabled = false;
+          load();
+        }
+      });
+
+      document.getElementById("disarm-btn").addEventListener("click", function () {
+        document.getElementById("disarm-reason").value = "";
+        openModal("disarm-modal");
+      });
+      document.getElementById("disarm-cancel").addEventListener("click", function () { closeModal("disarm-modal"); });
+      document.getElementById("disarm-confirm").addEventListener("click", async function () {
+        const reason = (document.getElementById("disarm-reason").value || "").trim();
+        if (!reason) { showResult("Reason is required.", false); return; }
+        const btn = document.getElementById("disarm-confirm");
+        btn.disabled = true;
+        try {
+          const r = await fetch("/api/disarm-live", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ reason: reason }),
+          });
+          const j = await r.json();
+          closeModal("disarm-modal");
+          if (j.ok && j.action === "disarmed") {
+            showResult("Live trading disarmed. Open positions left intact.", true);
+          } else if (j.ok && j.action === "noop") {
+            showResult("Already disarmed (no change).", true);
+          } else {
+            showResult("Disarm failed: " + (j.reasons || []).join("; "), false);
+          }
+        } catch (e) {
+          closeModal("disarm-modal");
+          showResult("Disarm failed: " + (e.message || "network error"), false);
+        } finally {
+          btn.disabled = false;
+          load();
+        }
+      });
 
       refreshBtn.onclick = load;
       Cockpit.poll(load, 60000, { name: 'promote' });

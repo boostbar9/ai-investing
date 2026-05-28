@@ -2980,14 +2980,12 @@ def promote_page() -> HTMLResponse:
     return _render("promote.html")
 
 
-@app.get("/api/promote")
-def api_promote() -> dict[str, Any]:
-    """Return the full live-trading readiness picture.
+def _compute_promote_payload() -> dict[str, Any]:
+    """Build the same payload ``/api/promote`` returns.
 
-    Pulls the paper equity curve, runs the §16 readiness gate, and
-    surfaces every reason live capital is (or isn't) allowed. Includes
-    the Telegram-bot-not-yet-connected line item so the operator knows
-    that channel is still required even after the metrics pass.
+    Extracted as a module function so ``arm_live`` can re-validate the
+    gate server-side without going through HTTP. Tests can monkey-patch
+    this whole function to inject a synthetic verdict.
     """
     import pandas as pd
 
@@ -3075,6 +3073,66 @@ def api_promote() -> dict[str, Any]:
             else None
         ),
     }
+
+
+@app.get("/api/promote")
+def api_promote() -> dict[str, Any]:
+    """Return the full live-trading readiness picture.
+
+    Pulls the paper equity curve, runs the §16 readiness gate, and
+    surfaces every reason live capital is (or isn't) allowed. Includes
+    the Telegram-bot-not-yet-connected line item so the operator knows
+    that channel is still required even after the metrics pass.
+    """
+    return _compute_promote_payload()
+
+
+@app.post("/api/arm-live")
+def api_arm_live(body: dict[str, Any] | None = None) -> dict[str, Any]:
+    """One-click promote to live trading.
+
+    Re-validates every gate server-side; the button is just a hint.
+    Writes ENABLE_LIVE_TRADING=true to .env, mirrors to os.environ,
+    and appends an immutable audit row.
+    """
+    from packages.cockpit.web.arm_live import arm_live
+
+    note = None
+    if isinstance(body, dict):
+        raw_note = body.get("note")
+        if isinstance(raw_note, str):
+            note = raw_note.strip()[:500] or None
+
+    result = arm_live(
+        actor="operator",
+        gate_evaluator=_compute_promote_payload,
+        note=note,
+    )
+    return result.to_response()
+
+
+@app.post("/api/disarm-live")
+def api_disarm_live(body: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Operator panic button: flip live trading off without a gate."""
+    from packages.cockpit.web.arm_live import disarm_live
+
+    reason = ""
+    if isinstance(body, dict):
+        raw = body.get("reason")
+        if isinstance(raw, str):
+            reason = raw.strip()[:500]
+    result = disarm_live(actor="operator", reason=reason)
+    return result.to_response()
+
+
+@app.get("/api/arm-live/audit")
+def api_arm_live_audit(limit: int = 50) -> dict[str, Any]:
+    """Tail the arm/disarm audit log."""
+    from packages.cockpit.web.arm_live import read_audit
+
+    capped = max(1, min(int(limit), 500))
+    rows = read_audit(limit=capped)
+    return {"events": rows, "count": len(rows)}
 
 
 # --------------------------------------------------------------------------
