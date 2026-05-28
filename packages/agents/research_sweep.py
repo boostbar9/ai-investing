@@ -101,6 +101,14 @@ class Candidate:
     # through to corroborate before acting.
     sample_headlines: list[str] = field(default_factory=list)
     created_at: str = ""
+    # Phase 3 additions. Default 0.0 / False / 0 means "never went through
+    # the trust+corroboration pipeline" (i.e. legacy candidate); the
+    # dashboard renders that as a question mark, not as 'bad'.
+    reddit_trust: float = 0.0
+    corroborated: bool = False
+    news_headlines: int = 0
+    corroboration_score: float = 0.0
+    corroboration_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -208,6 +216,113 @@ def candidates_from_sentiment(
     return out[:max_candidates]
 
 
+def apply_trust_and_corroboration(
+    candidates: list[Candidate],
+    news_items: list[NewsItem],
+    *,
+    reddit_posts: list[Any] | None = None,
+    portfolio_symbols: list[str] | None = None,
+    scorer: Any | None = None,
+    drop_uncorroborated: bool = True,
+) -> list[Candidate]:
+    """Decorate ``candidates`` with Reddit trust + news-corroboration
+    metadata, and (optionally) drop the ones that fail the gate.
+
+    This is the Phase 3 wire-in. It deliberately accepts everything via
+    injection so the function stays pure: no network, no global state.
+
+    * ``reddit_posts`` -- rich posts from :func:`fetch_rich_reddit`.
+      When omitted (or empty), every candidate gets ``reddit_trust=0.0``
+      and the corroboration gate relies solely on news headlines.
+    * ``scorer`` -- a :class:`RedditTrustScorer` instance. We accept it
+      via injection so callers can supply a history-aware scorer.
+      Built lazily from :func:`RedditTrustScorer()` if missing.
+    * ``drop_uncorroborated`` -- when True, candidates that fail the
+      gate AND are not portfolio holds are dropped. When False, they
+      stay in the list with ``corroborated=False`` for the dashboard
+      to render in a 'needs review' bucket.
+    """
+    # Lazy imports keep the existing import surface intact for callers
+    # that never touched Phase 3.
+    from packages.agents.reddit_trust import (
+        NewsCorroborationGate,
+        RedditTrustScorer,
+    )
+    from packages.agents.reddit_trust.schema import RedditPost
+
+    if scorer is None:
+        scorer = RedditTrustScorer()
+
+    held = {s.upper() for s in (portfolio_symbols or [])}
+
+    # Build per-symbol max trust weight from the rich Reddit posts. We
+    # take the *max* (not mean) because one strong, credible post is
+    # enough -- diluting it with chatter would hide the signal.
+    trust_by_symbol: dict[str, float] = {}
+    if reddit_posts:
+        for raw in reddit_posts:
+            # Allow either RedditPost or a dict from fetch_rich_reddit.
+            post: RedditPost
+            if isinstance(raw, dict):
+                try:
+                    post = RedditPost(
+                        id=raw["id"],
+                        permalink=raw["permalink"],
+                        subreddit=raw["subreddit"],
+                        title=raw["title"],
+                        selftext=raw.get("selftext", "") or "",
+                        author=raw.get("author"),
+                        author_created_utc=raw.get("author_created_utc"),
+                        author_karma=raw.get("author_karma"),
+                        score=int(raw.get("score") or 0),
+                        num_comments=int(raw.get("num_comments") or 0),
+                        upvote_ratio=raw.get("upvote_ratio"),
+                        created_utc=float(raw.get("created_utc") or 0.0),
+                        tickers=tuple(raw.get("tickers") or ()),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+            elif isinstance(raw, RedditPost):
+                post = raw
+            else:
+                # Anything else (None, str, etc.) is malformed -- skip.
+                continue
+            if not post.tickers:
+                continue
+            weight = scorer.score(post).weight
+            for sym in post.tickers:
+                key = sym.upper()
+                if weight > trust_by_symbol.get(key, 0.0):
+                    trust_by_symbol[key] = weight
+
+    gate = NewsCorroborationGate(news_items)
+
+    kept: list[Candidate] = []
+    for c in candidates:
+        sym = c.symbol.upper()
+        trust = trust_by_symbol.get(sym, 0.0)
+        result = gate.check(
+            sym,
+            reddit_trust_weight=trust,
+            is_portfolio=sym in held,
+        )
+        c.reddit_trust = round(trust, 4)
+        c.news_headlines = result.news_headlines
+        c.corroboration_score = round(result.corroboration_score, 4)
+        c.corroborated = result.passes
+        c.corroboration_reason = result.reason
+        if not result.passes and drop_uncorroborated:
+            logger.info(
+                "dropping uncorroborated candidate %s: %s", sym, result.reason
+            )
+            continue
+        kept.append(c)
+
+    # Re-sort: corroborated candidates first, then by confidence, then symbol.
+    kept.sort(key=lambda x: (not x.corroborated, -x.confidence, x.symbol))
+    return kept
+
+
 def merge_portfolio_candidates(
     base: list[Candidate],
     portfolio_symbols: list[str],
@@ -257,6 +372,34 @@ async def _gather_news(adapter: SentimentAdapter) -> list[NewsItem]:
         return []
 
 
+async def _gather_rich_reddit(
+    subreddits: tuple[str, ...] = (
+        "wallstreetbets",
+        "stocks",
+        "investing",
+    ),
+    *,
+    posts_per_sub: int = 10,
+) -> list[dict[str, Any]]:
+    """Pull trust-enriched Reddit posts in parallel. Best-effort: a
+    single bad subreddit doesn't take the others down."""
+    try:
+        from packages.agents.reddit_trust import fetch_rich_reddit
+    except Exception as exc:  # pragma: no cover - import safety
+        logger.warning("rich reddit import failed: %s", exc)
+        return []
+    out: list[dict[str, Any]] = []
+    results = await asyncio.gather(
+        *(fetch_rich_reddit(s, limit=posts_per_sub) for s in subreddits),
+        return_exceptions=True,
+    )
+    for res in results:
+        if isinstance(res, list):
+            out.extend(res)
+        # exceptions are silently dropped -- the fetcher already logs them
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Top-level sweep orchestration
 # ---------------------------------------------------------------------------
@@ -266,12 +409,23 @@ async def run_sweep(
     *,
     adapter: SentimentAdapter | None = None,
     portfolio_symbols: list[str] | None = None,
+    enable_trust_gate: bool = True,
+    reddit_posts: list[dict[str, Any]] | None = None,
 ) -> SweepResult:
     """Run one full sweep. NEVER raises -- failures end up as
     ``status='failed'`` on the returned ``SweepResult``.
 
     Both ``adapter`` and ``portfolio_symbols`` are injectable so tests
     can pass deterministic fakes without going through the network.
+
+    Phase 3 additions:
+      * ``enable_trust_gate`` -- when True (the default in production),
+        we pull rich Reddit posts, score author trust, and run the
+        news-corroboration gate. Tests that supply an ``adapter`` and
+        don't care about Phase 3 should pass ``enable_trust_gate=False``
+        to skip the extra network fan-out.
+      * ``reddit_posts`` -- inject pre-fetched rich posts (test seam).
+        When provided, we DON'T do the network fan-out for Reddit.
     """
     started = datetime.now(UTC)
     started_iso = started.isoformat(timespec="seconds")
@@ -280,29 +434,51 @@ async def run_sweep(
         adapter = SentimentAdapter()
 
     try:
-        async def _do() -> tuple[list[str], list[NewsItem]]:
-            # Run portfolio + news in parallel -- they're independent.
+        async def _do() -> tuple[
+            list[str], list[NewsItem], list[dict[str, Any]]
+        ]:
+            # Run portfolio + news + rich-reddit in parallel -- all
+            # independent. Rich-Reddit only runs when we don't have
+            # injected posts and the gate is enabled.
             pf_task = (
                 asyncio.create_task(_gather_portfolio())
                 if portfolio_symbols is None
                 else None
             )
             news_task = asyncio.create_task(_gather_news(adapter))  # type: ignore[arg-type]
+            rich_task = None
+            if enable_trust_gate and reddit_posts is None:
+                rich_task = asyncio.create_task(_gather_rich_reddit())
             news = await news_task
             pf = (
                 portfolio_symbols
                 if portfolio_symbols is not None
                 else await pf_task  # type: ignore[misc]
             )
-            return pf, news
+            rich: list[dict[str, Any]]
+            if reddit_posts is not None:
+                rich = reddit_posts
+            elif rich_task is not None:
+                rich = await rich_task
+            else:
+                rich = []
+            return pf, news, rich
 
-        pf_symbols, news_items = await asyncio.wait_for(
+        pf_symbols, news_items, rich_posts = await asyncio.wait_for(
             _do(), timeout=RESEARCH_SWEEP_TIMEOUT_S
         )
 
         aggregated = aggregate_sentiment(news_items, window_hours=24)
         cands = candidates_from_sentiment(aggregated)
         cands = merge_portfolio_candidates(cands, pf_symbols)
+        if enable_trust_gate:
+            cands = apply_trust_and_corroboration(
+                cands,
+                news_items,
+                reddit_posts=rich_posts,
+                portfolio_symbols=pf_symbols,
+                drop_uncorroborated=False,  # keep but tag -- user picks
+            )
 
         finished = datetime.now(UTC)
         return SweepResult(
