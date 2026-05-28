@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   One-click launcher for ai-investing on Windows.
 
@@ -285,7 +285,7 @@ try {
 
 if ($bootExit -ne 0) {
   $hint = switch ($bootExit) {
-    1 { "Python interpreter exited 1 — typically a ModuleNotFoundError or import-time crash. See $bootLog." }
+    1 { "Python interpreter exited 1 -- typically a ModuleNotFoundError or import-time crash. See $bootLog." }
     2 { "One or more boot steps failed (look for [XX] above)." }
     3 { "The boot orchestrator itself crashed (Python traceback above)." }
     default { "Unexpected exit code $bootExit from tools.boot. See $bootLog." }
@@ -323,7 +323,7 @@ if ($bootExit -ne 0) {
   if ($logTail) {
     Write-Host $logTail -ForegroundColor DarkGray
   } else {
-    Write-Host "  (log file empty — Python exited before producing any output)" -ForegroundColor DarkGray
+    Write-Host "  (log file empty -- Python exited before producing any output)" -ForegroundColor DarkGray
   }
   Write-Host "  --- end log ---" -ForegroundColor DarkGray
 

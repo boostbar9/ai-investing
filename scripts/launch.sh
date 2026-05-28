@@ -120,7 +120,7 @@ if [[ $WITH_DOCKER -eq 1 ]]; then
 fi
 
 # 6. Boot orchestrator (warm up Ollama, pull models, create data dirs, doctor).
-# Same code path the Windows launch.ps1 hits — keeps both platforms in lockstep.
+# Same code path the Windows launch.ps1 hits -- keeps both platforms in lockstep.
 # We deliberately omit --quiet so the per-step [ok]/[!!]/[XX] summary always
 # lands on the user's screen above any error banner. Tee combined stdout+stderr
 # to a permanent log file so the user can paste it into a bug report even if
