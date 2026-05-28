@@ -62,6 +62,10 @@ PROVIDERS: Final[dict[str, dict[str, list[str] | str]]] = {
         "label": "Finnhub",
         "keys": ["FINNHUB_API_KEY"],
     },
+    "notifications": {
+        "label": "Notifications (greenlight webhook)",
+        "keys": ["SHADOW_FLIP_WEBHOOK_URL"],
+    },
 }
 
 # Map env key -> provider id, for reverse lookups.

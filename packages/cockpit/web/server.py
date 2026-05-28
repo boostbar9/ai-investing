@@ -2894,6 +2894,19 @@ async def _automation_startup() -> None:  # pragma: no cover - long-lived tasks
             automation.audit_rotate_loop(path=AUDIT_LOG_PATH)
         )
 
+    # Flip-event notifier: poll data/cockpit/shadow_flips.jsonl every 60s
+    # and deliver any new rows to configured sinks (desktop toast +
+    # webhook). Env-gated so it can be disabled in CI.
+    if os.environ.get("COCKPIT_FLIP_NOTIFY", "1") in ("1", "true", "True"):
+        try:
+            from packages.shadow.notify_loop import flip_notify_loop
+
+            _AUTOMATION_TASKS["flip_notify"] = loop.create_task(
+                flip_notify_loop(poll_seconds=60.0)
+            )
+        except Exception as e:  # never crash boot over a notifier dep
+            log.warning("flip notify loop skipped: %s", e)
+
 
 @app.on_event("shutdown")
 async def _automation_shutdown() -> None:  # pragma: no cover - shutdown
