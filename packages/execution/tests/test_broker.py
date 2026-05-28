@@ -223,7 +223,8 @@ async def test_alpaca_liquidate_raises_on_hard_error():
         await broker.aclose()
 
 
-def test_alpaca_live_uses_live_env(monkeypatch):
+@pytest.mark.asyncio
+async def test_alpaca_live_uses_live_env(monkeypatch):
     from packages.execution.broker import AlpacaLiveBroker
 
     monkeypatch.setenv("ALPACA_LIVE_KEY_ID", "live-key")
@@ -235,10 +236,9 @@ def test_alpaca_live_uses_live_env(monkeypatch):
         assert b.secret == "live-secret"
         assert "paper" not in b.base_url
     finally:
-        # close synchronously via the underlying client to avoid asyncio fixture
-        import asyncio
-
-        asyncio.get_event_loop().run_until_complete(b.aclose())
+        # Python 3.12 deprecated get_event_loop() outside a running loop;
+        # use the pytest-asyncio managed loop instead.
+        await b.aclose()
 
 
 @pytest.mark.asyncio

@@ -91,9 +91,20 @@ def _make_graph_result(*, halted: bool, halt_reason: str | None) -> GraphResult:
 
 @pytest.fixture(autouse=True)
 def _isolate_log_dir(tmp_path, monkeypatch):
-    """Redirect paper-log writes + peak file into the tmp dir so tests are hermetic."""
+    """Redirect paper-log writes + peak file into the tmp dir so tests are hermetic.
+
+    Must also patch PAPER_LOG_FILE explicitly (it's resolved at import time
+    from PAPER_LOG_DIR, so patching only the dir leaves the file pointing at
+    the original relative path) and disable the §17 SQLite/snapshot
+    dual-writes so CI doesn't try to open data/db/trading.db on a fresh
+    checkout.
+    """
     monkeypatch.setattr(pt, "PAPER_LOG_DIR", tmp_path)
+    monkeypatch.setattr(pt, "PAPER_LOG_FILE", tmp_path / "runs.jsonl")
     monkeypatch.setattr(pt, "EQUITY_PEAK_FILE", tmp_path / "session_peak.json")
+    monkeypatch.setenv("COCKPIT_DB_DUAL_WRITE", "0")
+    # Snapshot writes its default path at module import; neuter it to a no-op.
+    monkeypatch.setattr(pt, "_write_snapshot", lambda **_kw: None)
     monkeypatch.setenv("ENABLE_PAPER_TRADING", "true")
     # Stub the heavy collaborators that would otherwise hit market data / strategy code.
     monkeypatch.setattr(pt, "compute_target_weights", lambda *_a, **_kw: {"SPY": 0.6, "QQQ": 0.4})

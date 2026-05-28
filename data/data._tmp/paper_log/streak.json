@@ -1,0 +1,26 @@
+{
+  "current_streak": 1,
+  "longest_streak": 1,
+  "total_days": 1,
+  "clean_days": 1,
+  "last_day": "2026-05-24",
+  "last_clean": true,
+  "last_break_reason": null,
+  "peak_equity": 100000.0,
+  "current_drawdown": 0.0,
+  "gate_target_days": 60,
+  "days_remaining": 59,
+  "gate_passed": false,
+  "per_day": [
+    {
+      "day": "2026-05-24",
+      "end_equity": 100000.0,
+      "peak_to_day": 100000.0,
+      "drawdown": 0.0,
+      "halted": false,
+      "error_count": 0,
+      "runs": 5,
+      "clean": true
+    }
+  ]
+}

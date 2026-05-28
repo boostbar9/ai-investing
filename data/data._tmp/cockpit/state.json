@@ -1,0 +1,14 @@
+{
+  "paused": true,
+  "regime_override": "auto",
+  "trading_mode": "paper",
+  "paused_strategies": [],
+  "last_action": "Liquidate all positions from cockpit",
+  "last_action_at": "2026-05-28T13:53:11+00:00",
+  "paper_loop_intended": false,
+  "paper_loop_strategy": "ensemble",
+  "paper_loop_dry_run": false,
+  "autopilot_enabled": false,
+  "autopilot_strategy": "ensemble",
+  "autopilot_dry_run": false
+}
