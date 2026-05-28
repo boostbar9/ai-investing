@@ -1,0 +1,11 @@
+{
+  "spec": "v3.1",
+  "phase": "2-backtests",
+  "regime": "chop",
+  "strategy": "sector-rotation",
+  "sharpe": 0.4165,
+  "max_drawdown": -0.1607,
+  "turnover_annual": 4.0385,
+  "cagr": 0.0339,
+  "n_days": 2600
+}

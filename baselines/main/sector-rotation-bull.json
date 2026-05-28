@@ -1,0 +1,11 @@
+{
+  "spec": "v3.1",
+  "phase": "2-backtests",
+  "regime": "bull",
+  "strategy": "sector-rotation",
+  "sharpe": 2.1195,
+  "max_drawdown": -0.0673,
+  "turnover_annual": 4.0385,
+  "cagr": 0.1612,
+  "n_days": 2600
+}
