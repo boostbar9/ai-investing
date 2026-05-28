@@ -119,9 +119,16 @@ if [[ $WITH_DOCKER -eq 1 ]]; then
   fi
 fi
 
-# 6. Cockpit
-section "Starting cockpit"
+# 6. Boot orchestrator (warm up Ollama, pull models, create data dirs, doctor).
+# Same code path the Windows launch.ps1 hits — keeps both platforms in lockstep.
+section "Warming up the stack"
 export PYTHONPATH=.
+if ! .venv/bin/python -m tools.boot --quiet; then
+  fail "boot orchestrator failed. Fix the [XX] step above, then re-run."
+fi
+
+# 7. Cockpit
+section "Starting cockpit"
 ok "Cockpit will be available at http://127.0.0.1:$PORT"
 echo
 echo "Press Ctrl+C to stop."

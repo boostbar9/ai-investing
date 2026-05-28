@@ -247,11 +247,27 @@ if ($WithDocker) {
 }
 
 # ----------------------------------------------------------------------
-# 6. Launch the cockpit
+# 6. Run the one-click boot orchestrator (tools/boot.py).
+#
+# This warms up Ollama, pulls any missing models, creates the data/
+# subtree, runs the doctor, and confirms the cockpit port is free.
+# Skipped steps and degraded states are surfaced inline so the user sees
+# the same picture the cockpit will. A 'failed' overall blocks the
+# cockpit launch; 'degraded' continues with a yellow badge.
 # ----------------------------------------------------------------------
-Write-Section "Starting cockpit"
+Write-Section "Warming up the stack"
 
 $env:PYTHONPATH = "."
+& $venvPython -m tools.boot --quiet
+$bootExit = $LASTEXITCODE
+if ($bootExit -ne 0) {
+  Fail "boot orchestrator failed (exit $bootExit). Fix the [XX] step above, then re-run."
+}
+
+# ----------------------------------------------------------------------
+# 7. Launch the cockpit
+# ----------------------------------------------------------------------
+Write-Section "Starting cockpit"
 Write-Ok "PYTHONPATH=."
 Write-Ok "Cockpit will be available at http://127.0.0.1:$Port"
 

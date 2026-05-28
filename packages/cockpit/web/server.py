@@ -1134,6 +1134,47 @@ def api_ollama_warmup_status() -> dict[str, Any]:
     return state
 
 
+# ---------------------------------------------------------------------------
+# /api/boot — one-click boot summary
+#
+# Reads the most-recent run-boot summary written by tools/boot.py. The
+# cockpit's first-boot wizard polls this to show which step is still
+# running and surface 'fix this' calls-to-action when something is
+# degraded. If the boot summary file is missing (older install, or first
+# launch before boot.py ran), we trigger a synchronous boot of the
+# read-only steps so the wizard always has something to show.
+# ---------------------------------------------------------------------------
+
+_BOOT_SUMMARY_PATH = Path("data/cockpit/boot.json")
+
+
+@app.get("/api/boot")
+def api_boot_summary(refresh: bool = False) -> dict[str, Any]:
+    """Return the latest boot summary.
+
+    Reads ``data/cockpit/boot.json`` (written by ``tools.boot.run_boot``)
+    so a cockpit restart inherits the launcher's snapshot without
+    re-running anything. When ``refresh=true``, re-runs the read-only
+    steps (env, venv, data_dirs, cockpit_port) inline so the wizard can
+    show fresh state after the user updates their .env, kills a port hog,
+    etc. We never re-run network-touching steps from this endpoint —
+    that's what the explicit Ollama setup button is for.
+    """
+    if refresh:
+        from tools.boot import run_boot
+
+        summary = run_boot(only={"env", "venv", "data_dirs", "cockpit_port"})
+        return summary.to_dict()
+    try:
+        return json.loads(_BOOT_SUMMARY_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        from tools.boot import run_boot
+
+        # First call before the launcher ran: synthesize a minimal snapshot.
+        summary = run_boot(only={"env", "venv", "data_dirs", "cockpit_port"})
+        return summary.to_dict()
+
+
 @app.get("/api/ollama/status")
 def api_ollama_status() -> dict[str, Any]:
     """Read-only inventory for the cockpit's Ollama panel.

@@ -951,6 +951,91 @@ def test_scorecard_limit_clamps_returned_rows(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Boot summary endpoint (/api/boot)
+# ---------------------------------------------------------------------------
+
+
+def test_boot_endpoint_reads_persisted_summary(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When tools.boot has already run and written data/cockpit/boot.json,
+    /api/boot returns that snapshot without re-running any steps."""
+    snapshot = {
+        "overall": "ok",
+        "started_at": 1700000000.0,
+        "finished_at": 1700000001.5,
+        "duration_s": 1.5,
+        "steps": [
+            {"name": "env", "status": "ok", "message": "keys present", "detail": {}, "duration_s": 0.01},
+        ],
+    }
+    summary_file = tmp_path / "boot.json"
+    summary_file.write_text(json.dumps(snapshot))
+    monkeypatch.setattr(srv, "_BOOT_SUMMARY_PATH", summary_file)
+
+    r = client.get("/api/boot")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["overall"] == "ok"
+    assert body["steps"][0]["name"] == "env"
+
+
+def test_boot_endpoint_synthesizes_when_no_summary(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the persisted summary is missing, the endpoint synthesizes one
+    from the read-only steps so the wizard always has something to show."""
+    monkeypatch.setattr(srv, "_BOOT_SUMMARY_PATH", tmp_path / "missing.json")
+    # Stub run_boot so we don't touch the real filesystem during the test.
+    fake_summary = type(
+        "S",
+        (),
+        {
+            "to_dict": lambda self: {
+                "overall": "degraded",
+                "steps": [
+                    {"name": "env", "status": "degraded", "message": "no .env", "detail": {}, "duration_s": 0}
+                ],
+            }
+        },
+    )()
+    monkeypatch.setattr("tools.boot.run_boot", lambda **kw: fake_summary)
+
+    r = client.get("/api/boot")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["overall"] == "degraded"
+
+
+def test_boot_endpoint_refresh_param_reruns(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """?refresh=true must re-run the read-only steps even when a persisted
+    summary exists — used by the wizard's 'Re-check' button."""
+    snapshot = {"overall": "ok", "steps": []}
+    summary_file = tmp_path / "boot.json"
+    summary_file.write_text(json.dumps(snapshot))
+    monkeypatch.setattr(srv, "_BOOT_SUMMARY_PATH", summary_file)
+
+    called: dict[str, bool] = {"hit": False}
+
+    def fake_run_boot(**_kw):
+        called["hit"] = True
+        return type("S", (), {"to_dict": lambda self: {"overall": "ok", "steps": [], "refreshed": True}})()
+
+    monkeypatch.setattr("tools.boot.run_boot", fake_run_boot)
+    r = client.get("/api/boot?refresh=true")
+    assert r.status_code == 200
+    assert called["hit"] is True
+    assert r.json().get("refreshed") is True
+
+
+# ---------------------------------------------------------------------------
+# Ollama setup GUI continued
+# ---------------------------------------------------------------------------
+
+
 def test_ollama_status_endpoint_reports_daemon_down(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
