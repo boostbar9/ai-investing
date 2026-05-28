@@ -50,6 +50,7 @@
       <a href="/trading" class="nav-link">Trading</a>
       <a href="/autopilot" class="nav-link">Autopilot</a>
       <a href="/promote" class="nav-link nav-active">Promote</a>
+      <a href="/shadow" class="nav-link">Shadow</a>
       <a href="/agents" class="nav-link">Agents</a>
       <a href="/models" class="nav-link">Models</a>
       <a href="/settings" class="nav-link">Settings</a>
@@ -290,7 +291,19 @@ TELEGRAM_CHAT_ID=your_chat_id_here</div>
             : "Not configured. See the setup card below."
         ));
 
-        // Gate 5: ENABLE_LIVE_TRADING -- informational only
+        // Gate 5: shadow soak (14-day greenlight)
+        const sReq = prog.shadow_days_required || 14;
+        const sStreak = prog.shadow_streak_days || 0;
+        const sReady = !!prog.shadow_ready;
+        gatesEl.appendChild(gateRow(
+          sReady ? "ok" : "warn",
+          "Shadow soak ≥ " + sReq + " non-negative days",
+          sReady
+            ? "Shadow soak complete (" + sStreak + " days). Auto-greenlight tripped."
+            : "Streak " + sStreak + " / " + sReq + ". See the Shadow page for daily PnL detail."
+        ));
+
+        // Gate 6: ENABLE_LIVE_TRADING -- informational only
         gatesEl.appendChild(gateRow(
           prog.enable_live_flag ? "ok" : "info",
           "ENABLE_LIVE_TRADING flag",
@@ -302,7 +315,7 @@ TELEGRAM_CHAT_ID=your_chat_id_here</div>
         // Extra reasons from the gate (non-redundant only)
         const extras = (j.readiness.reasons || []).filter(function (r) {
           const s = String(r).toLowerCase();
-          return !s.includes("paper") && !s.includes("drawdown") && !s.includes("sharpe") && !s.includes("telegram");
+          return !s.includes("paper") && !s.includes("drawdown") && !s.includes("sharpe") && !s.includes("telegram") && !s.includes("shadow");
         });
         extras.forEach(function (r) {
           gatesEl.appendChild(gateRow("warn", "Additional gating reason", r));

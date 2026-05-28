@@ -8,7 +8,9 @@ from pathlib import Path
 import pytest
 
 from packages.shadow import greenlight as gl_mod
+from packages.shadow import notify as notify_mod
 from packages.shadow.greenlight import GREENLIGHT_DAYS_REQUIRED
+from packages.shadow.notify import read_flip_events
 from packages.shadow.snapshot import ShadowDashboard, build_snapshot
 
 
@@ -16,6 +18,9 @@ from packages.shadow.snapshot import ShadowDashboard, build_snapshot
 def isolated_status(monkeypatch, tmp_path) -> Path:
     p = tmp_path / "shadow_status.json"
     monkeypatch.setattr(gl_mod, "STATUS_PATH", p)
+    # Snapshot also writes flip events on the upward edge -- isolate that
+    # log to the same tmp_path so tests don't pollute the real data dir.
+    monkeypatch.setattr(notify_mod, "FLIPS_PATH", tmp_path / "shadow_flips.jsonl")
     return p
 
 
@@ -78,6 +83,42 @@ def test_snapshot_to_payload_json_safe(isolated_status: Path) -> None:
     assert "total_pnl" in serialized
     assert payload["n_round_trips"] == 1
     assert payload["days_required"] == GREENLIGHT_DAYS_REQUIRED
+
+
+def test_snapshot_records_flip_event_on_greenlight(isolated_status: Path) -> None:
+    start = date(2026, 5, 1)
+    trades: list[dict] = []
+    for i in range(GREENLIGHT_DAYS_REQUIRED):
+        trades += _shadow_round_trip(
+            start + timedelta(days=i), start + timedelta(days=i), 1.0
+        )
+    build_snapshot(shadow_trades=trades)
+    events = read_flip_events()
+    assert len(events) == 1
+    assert events[0]["from"] == "shadow"
+    assert events[0]["to"] == "ready"
+    assert events[0]["streak_days"] == GREENLIGHT_DAYS_REQUIRED
+
+
+def test_snapshot_does_not_duplicate_flip_event(isolated_status: Path) -> None:
+    # Two refreshes in a row while already "ready" must not double-log.
+    start = date(2026, 5, 1)
+    trades: list[dict] = []
+    for i in range(GREENLIGHT_DAYS_REQUIRED):
+        trades += _shadow_round_trip(
+            start + timedelta(days=i), start + timedelta(days=i), 1.0
+        )
+    build_snapshot(shadow_trades=trades)
+    build_snapshot(shadow_trades=trades)
+    events = read_flip_events()
+    assert len(events) == 1
+
+
+def test_snapshot_no_flip_event_while_soaking(isolated_status: Path) -> None:
+    # Streak shorter than threshold -> no event logged.
+    trades = _shadow_round_trip(date(2026, 5, 1), date(2026, 5, 2), 2.0)
+    build_snapshot(shadow_trades=trades)
+    assert read_flip_events() == []
 
 
 def test_snapshot_includes_predicted_vs_actual(isolated_status: Path) -> None:

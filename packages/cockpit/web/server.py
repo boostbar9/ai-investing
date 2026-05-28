@@ -507,6 +507,21 @@ def api_shadow_snapshot() -> dict[str, Any]:
     return snap.to_payload()
 
 
+@app.get("/api/shadow/flip-events")
+def api_shadow_flip_events(limit: int = 20) -> dict[str, Any]:
+    """Recent SHADOW->READY transition events.
+
+    Surfaces these so the cockpit can show a one-time banner and the
+    autopilot can fan them out to Telegram / desktop notifications
+    without owning the persistence layer.
+    """
+    from packages.shadow.notify import read_flip_events
+
+    capped = max(1, min(int(limit), 100))
+    rows = read_flip_events(limit=capped)
+    return {"events": rows, "count": len(rows)}
+
+
 @app.get("/health", response_class=HTMLResponse)
 def health_page() -> HTMLResponse:
     return _render("health.html")
@@ -2977,6 +2992,12 @@ def api_promote() -> dict[str, Any]:
     import pandas as pd
 
     from packages.backtests import live_promotion as lp
+    from packages.shadow.greenlight import (
+        GREENLIGHT_DAYS_REQUIRED,
+    )
+    from packages.shadow.greenlight import (
+        read_status as read_shadow_status,
+    )
 
     points = equity_curve_points(window=200)
     series = pd.Series([float(p.get("equity", 0.0)) for p in points])
@@ -2994,22 +3015,36 @@ def api_promote() -> dict[str, Any]:
         "on",
     }
 
+    shadow_payload = read_shadow_status() or {}
+    shadow_status = str(shadow_payload.get("status", "shadow"))
+    shadow_streak = int(shadow_payload.get("streak_days", 0))
+    shadow_ready = shadow_status == "ready"
+
     gating_reasons = list(decision.readiness.reasons)
     if not telegram_connected:
         gating_reasons.append(
             "Telegram approval bot is not configured "
             "(set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env)"
         )
+    if not shadow_ready:
+        gating_reasons.append(
+            f"Shadow soak not complete "
+            f"({shadow_streak}/{GREENLIGHT_DAYS_REQUIRED} non-negative days)"
+        )
+
+    all_clear = (
+        decision.live_enabled
+        and telegram_connected
+        and shadow_ready
+    )
 
     return {
-        "live_enabled": bool(decision.live_enabled and telegram_connected),
+        "live_enabled": bool(all_clear),
         "capital_fraction": (
-            decision.capital_fraction
-            if decision.live_enabled and telegram_connected
-            else 0.0
+            decision.capital_fraction if all_clear else 0.0
         ),
         "readiness": {
-            "ready": decision.readiness.ready and telegram_connected,
+            "ready": decision.readiness.ready and telegram_connected and shadow_ready,
             "reasons": gating_reasons,
             "metrics": decision.readiness.metrics,
         },
@@ -3023,6 +3058,10 @@ def api_promote() -> dict[str, Any]:
             "days_remaining": days_remaining,
             "telegram_connected": telegram_connected,
             "enable_live_flag": enable_flag,
+            "shadow_status": shadow_status,
+            "shadow_streak_days": shadow_streak,
+            "shadow_days_required": GREENLIGHT_DAYS_REQUIRED,
+            "shadow_ready": shadow_ready,
         },
         "canary": (
             {

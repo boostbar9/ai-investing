@@ -23,6 +23,12 @@ from packages.shadow.greenlight import (
     read_status,
     write_status,
 )
+from packages.shadow.notify import (
+    FlipEvent,
+    append_flip_event,
+    detect_flip,
+    read_flip_events,
+)
 from packages.shadow.pairing import (
     PairedTrade,
     pair_round_trips,
@@ -38,15 +44,19 @@ from packages.shadow.snapshot import ShadowDashboard, build_snapshot
 __all__ = [
     "GREENLIGHT_DAYS_REQUIRED",
     "DailyPnL",
+    "FlipEvent",
     "GreenlightVerdict",
     "PairedTrade",
     "PredictedVsActual",
     "ShadowDashboard",
     "aggregate_daily",
+    "append_flip_event",
     "build_snapshot",
+    "detect_flip",
     "evaluate_greenlight",
     "pair_round_trips",
     "predicted_vs_actual",
+    "read_flip_events",
     "read_status",
     "write_status",
 ]

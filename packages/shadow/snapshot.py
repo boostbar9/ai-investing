@@ -15,7 +15,13 @@ from packages.shadow.greenlight import (
     GREENLIGHT_DAYS_REQUIRED,
     GreenlightVerdict,
     evaluate_greenlight,
+    read_status,
     write_status,
+)
+from packages.shadow.notify import (
+    FlipEvent,
+    append_flip_event,
+    detect_flip,
 )
 from packages.shadow.pairing import PairedTrade, pair_round_trips
 from packages.shadow.pnl import (
@@ -77,8 +83,15 @@ def build_snapshot(
     paired = pair_round_trips(trades)
     daily = aggregate_daily(paired)
     verdict = evaluate_greenlight(daily)
+    flip: FlipEvent | None = None
     if persist_status:
+        prev_payload = read_status()
+        flip = detect_flip(
+            prev_payload, verdict.status, verdict.streak_days, verdict.reasons
+        )
         write_status(verdict)
+        if flip is not None:
+            append_flip_event(flip)
     pva = predicted_vs_actual(predictions or [], paired)
     total = sum(p.pnl for p in paired)
     return ShadowDashboard(
