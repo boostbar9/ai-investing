@@ -359,6 +359,43 @@ def step_cockpit_port(ctx: BootContext) -> StepResult:
     return StepResult("cockpit_port", "ok", f"port {port} free", {"port": port})
 
 
+def step_research_sweep(ctx: BootContext) -> StepResult:
+    """Kick off the boot-time research sweep in the background.
+
+    Returns immediately (the sweep runs on its own thread / loop). We only
+    fail the step if the import itself blows up -- the sweep's own error
+    handling takes over once it's spawned, and the dashboard surfaces any
+    failure via the ``status`` heartbeat file.
+
+    This is intentionally the *last* step so the cockpit comes up first
+    and the user sees something useful while the agents gather data.
+    """
+    try:
+        from packages.agents.research_sweep import (
+            kick_off_background,
+            save_status,
+        )
+
+        # Pre-mark running so the dashboard tile shows 'running' even
+        # before the background task gets scheduled.
+        save_status("running", detail="boot-time sweep starting")
+        kick_off_background()
+        return StepResult(
+            "research_sweep",
+            "ok",
+            "boot-time sweep kicked off in background",
+        )
+    except Exception as exc:
+        # Never block the launch on this -- it's a 'nice to have' that
+        # the user can re-run manually from the dashboard.
+        return StepResult(
+            "research_sweep",
+            "degraded",
+            f"could not kick off sweep: {exc.__class__.__name__}",
+            {"error": str(exc)},
+        )
+
+
 def _split_host(host: str) -> tuple[str, int]:
     """``http://127.0.0.1:11434`` → ``('127.0.0.1', 11434)``."""
     stripped = host.replace("http://", "").replace("https://", "")
@@ -382,6 +419,9 @@ STEPS: list[tuple[str, Step]] = [
     ("models", step_models),
     ("doctor", step_doctor),
     ("cockpit_port", step_cockpit_port),
+    # research_sweep is last on purpose: it's a fire-and-forget background
+    # task that benefits from everything above being green first.
+    ("research_sweep", step_research_sweep),
 ]
 
 

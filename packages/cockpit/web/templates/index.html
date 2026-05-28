@@ -53,6 +53,151 @@
       })();
     </script>
 
+    <!-- {# Research Candidates tile (Phase 1D). Renders a compact list of
+         top candidates from the latest boot-time sweep. Polls /api/research-sweep
+         once on load and again every 15s while a sweep is running. #} -->
+    <section id="research-tile" class="mb-4 rounded-lg border border-gray-800 bg-gray-900/50 p-4">
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <div class="font-semibold text-gray-100">Research candidates</div>
+          <div id="research-meta" class="text-xs text-gray-500 mt-1">loading…</div>
+        </div>
+        <div class="flex items-center gap-2">
+          <span id="research-status-pill" class="pill pill-unknown" style="display:none"></span>
+          <button id="research-refresh" class="px-3 py-1.5 rounded-md bg-blue-600 hover:bg-blue-500 text-xs font-medium">
+            Refresh
+          </button>
+        </div>
+      </div>
+      <div id="research-list" class="divide-y divide-gray-800"></div>
+      <div id="research-empty" class="text-sm text-gray-500" style="display:none">
+        No candidates yet. Click Refresh to run a sweep.
+      </div>
+    </section>
+    <style>
+      /* Pill styles for the research tile (kept here so we don't touch
+         the global stylesheet for one feature). */
+      .pill { display: inline-flex; align-items: center; gap: 6px;
+              padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 500; }
+      .pill-unknown { background: #1f2937; color: #d1d5db; }
+      .pill-running { background: #1e3a8a; color: #bfdbfe; }
+      .pill-done    { background: #064e3b; color: #6ee7b7; }
+      .pill-failed  { background: #7f1d1d; color: #fecaca; }
+      .pill-idle    { background: #1f2937; color: #9ca3af; }
+      .pill-portfolio { background: #064e3b; color: #6ee7b7; }
+      .pill-sentiment { background: #1e293b; color: #93c5fd; }
+    </style>
+    <script>
+      // {# Single-file, dependency-free poller. Caches the last fetch so
+      //    repeated polls don't cause flicker; only re-renders when the
+      //    payload actually changed. #}
+      (function(){
+        const $list = document.getElementById("research-list");
+        const $meta = document.getElementById("research-meta");
+        const $pill = document.getElementById("research-status-pill");
+        const $empty = document.getElementById("research-empty");
+        const $refresh = document.getElementById("research-refresh");
+        let lastPayload = "";
+        let pollTimer = null;
+
+        const STATUS_LABEL = {
+          idle: "idle", running: "running…", done: "done", failed: "failed",
+        };
+
+        function renderStatus(status) {
+          if (!status || status === "idle") { $pill.style.display = "none"; return; }
+          $pill.style.display = "inline-flex";
+          $pill.className = "pill pill-" + status;
+          $pill.textContent = STATUS_LABEL[status] || status;
+        }
+
+        function fmtConfidence(c) {
+          if (typeof c !== "number") return "";
+          return Math.round(c * 100) + "%";
+        }
+
+        function renderCandidates(sweep) {
+          $list.innerHTML = "";
+          if (!sweep || !sweep.candidates || sweep.candidates.length === 0) {
+            $empty.style.display = "block";
+            return;
+          }
+          $empty.style.display = "none";
+          for (const c of sweep.candidates.slice(0, 5)) {
+            const row = document.createElement("div");
+            row.className = "py-2 flex items-center justify-between gap-3";
+            row.innerHTML = `
+              <div class="min-w-0 flex-1">
+                <div class="flex items-center gap-2 mb-1">
+                  <span class="font-mono text-sm font-semibold text-gray-100">${c.symbol}</span>
+                  <span class="pill pill-${c.signal_kind === 'portfolio' ? 'portfolio' : 'sentiment'}">${c.signal_kind}</span>
+                  <span class="text-xs text-gray-500">${c.mentions} mentions</span>
+                </div>
+                <div class="text-xs text-gray-400 truncate">${c.thesis}</div>
+              </div>
+              <div class="text-sm font-semibold text-gray-200 whitespace-nowrap">${fmtConfidence(c.confidence)}</div>
+            `;
+            $list.appendChild(row);
+          }
+        }
+
+        function renderMeta(payload) {
+          const s = payload.sweep;
+          const st = payload.status;
+          let line;
+          if (!s) {
+            line = "No sweep yet — click Refresh to gather portfolio + news.";
+          } else if (s.status === "failed") {
+            line = `Last sweep failed: ${s.error || "unknown error"}`;
+          } else {
+            const n = (s.candidates || []).length;
+            const pf = (s.portfolio_symbols || []).length;
+            line = `${n} candidates · ${pf} held positions · last run ${s.finished_at || "—"}`;
+          }
+          if (st && st.status === "running") line += " · sweep in progress…";
+          $meta.textContent = line;
+        }
+
+        async function fetchOnce() {
+          try {
+            const r = await fetch("/api/research-sweep");
+            if (!r.ok) return;
+            const payload = await r.json();
+            const key = JSON.stringify(payload);
+            if (key === lastPayload) return;
+            lastPayload = key;
+            renderStatus(payload.status && payload.status.status);
+            renderCandidates(payload.sweep);
+            renderMeta(payload);
+            // Keep polling while running; stop once done/failed/idle.
+            const running = payload.status && payload.status.status === "running";
+            if (running && !pollTimer) {
+              pollTimer = setInterval(fetchOnce, 5000);
+            } else if (!running && pollTimer) {
+              clearInterval(pollTimer); pollTimer = null;
+            }
+          } catch (_) { /* swallow */ }
+        }
+
+        $refresh.addEventListener("click", async () => {
+          $refresh.disabled = true;
+          const orig = $refresh.textContent;
+          $refresh.textContent = "Running…";
+          try {
+            await fetch("/api/research-sweep/run", { method: "POST" });
+            // Poll every 5s until done/failed.
+            if (!pollTimer) pollTimer = setInterval(fetchOnce, 5000);
+            await fetchOnce();
+          } finally {
+            $refresh.disabled = false;
+            $refresh.textContent = orig;
+          }
+        });
+
+        fetchOnce();
+      })();
+    </script>
+
     <!-- Nav -->
     <nav class="nav">
       <a href="/" class="nav-link nav-active">Dashboard</a>

@@ -1313,6 +1313,50 @@ def api_onboarding_reset() -> dict[str, Any]:
     return {"ok": True, "state": load_onboarding().to_dict()}
 
 
+# ---------------------------------------------------------------------------
+# /api/research-sweep -- Phase 1D
+#
+# The dashboard 'Research Candidates' tile polls these endpoints. GET
+# returns the last persisted sweep (read-only, fast). POST kicks off a
+# background sweep so the user can refresh on demand without blocking
+# the request thread.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/research-sweep")
+def api_research_sweep_get() -> dict[str, Any]:
+    """Return the most recent persisted sweep plus live status.
+
+    Shape: ``{"sweep": <SweepResult dict or None>, "status": {...}}``.
+    The dashboard treats ``sweep=None`` as 'no sweep ever ran'
+    (showing a 'Run sweep' CTA) versus ``status='failed'`` (showing
+    the error).
+    """
+    from packages.agents.research_sweep import load_status, load_sweep
+
+    return {"sweep": load_sweep(), "status": load_status()}
+
+
+@app.post("/api/research-sweep/run")
+def api_research_sweep_run() -> dict[str, Any]:
+    """Fire a background sweep. Returns immediately with current status.
+
+    The actual sweep persists its own status + result file; the
+    dashboard polls ``GET /api/research-sweep`` to see progress.
+    """
+    from packages.agents.research_sweep import (
+        kick_off_background,
+        load_status,
+        save_status,
+    )
+
+    # Pre-mark running so the dashboard reflects the kick-off even
+    # before the background task gets CPU time.
+    save_status("running", detail="kick-off requested")
+    kick_off_background()
+    return {"ok": True, "status": load_status()}
+
+
 @app.get("/api/ollama/status")
 def api_ollama_status() -> dict[str, Any]:
     """Read-only inventory for the cockpit's Ollama panel.

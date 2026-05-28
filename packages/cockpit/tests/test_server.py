@@ -1785,3 +1785,93 @@ def test_onboarding_check_robinhood_respects_declined_choice(
     assert r.status_code == 200
     body = r.json()
     assert body["outcome"] == "declined"
+
+
+# ===========================================================================
+# Research sweep endpoints (Phase 1D)
+# ===========================================================================
+
+
+@pytest.fixture
+def fake_sweep_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path]:
+    """Redirect research-sweep persistence to tmp_path."""
+    from packages.agents import research_sweep as rs_mod
+
+    sweep_p = tmp_path / "research_sweep.json"
+    status_p = tmp_path / "research_sweep_status.json"
+    monkeypatch.setattr(rs_mod, "SWEEP_PATH", sweep_p)
+    monkeypatch.setattr(rs_mod, "SWEEP_STATUS_PATH", status_p)
+    return sweep_p, status_p
+
+
+def test_research_sweep_get_returns_defaults_when_no_files(
+    client: TestClient, fake_sweep_paths: tuple[Path, Path]
+) -> None:
+    r = client.get("/api/research-sweep")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sweep"] is None
+    assert body["status"]["status"] == "idle"
+
+
+def test_research_sweep_get_returns_persisted_payload(
+    client: TestClient, fake_sweep_paths: tuple[Path, Path]
+) -> None:
+    from packages.agents.research_sweep import (
+        Candidate,
+        SweepResult,
+        save_status,
+        save_sweep,
+    )
+
+    save_sweep(
+        SweepResult(
+            status="done",
+            started_at="2026-05-28T15:00:00+00:00",
+            finished_at="2026-05-28T15:00:30+00:00",
+            duration_s=30.0,
+            candidates=[
+                Candidate(
+                    symbol="NVDA",
+                    signal_kind="sentiment",
+                    thesis="bullish chatter",
+                    confidence=0.72,
+                )
+            ],
+            portfolio_symbols=["AAPL"],
+        )
+    )
+    save_status("done", detail="1 candidate")
+
+    r = client.get("/api/research-sweep")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sweep"]["status"] == "done"
+    assert body["sweep"]["candidates"][0]["symbol"] == "NVDA"
+    assert body["status"]["status"] == "done"
+
+
+def test_research_sweep_run_marks_running_immediately(
+    client: TestClient,
+    fake_sweep_paths: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /api/research-sweep/run must respond promptly and the status
+    file must already reflect 'running' so the dashboard's first poll
+    after the click shows a sweep in progress."""
+    from packages.agents import research_sweep as rs_mod
+
+    # Replace kick_off_background with a no-op so the test never
+    # actually touches the network or spawns threads.
+    monkeypatch.setattr(rs_mod, "kick_off_background", lambda: None)
+
+    r = client.post("/api/research-sweep/run")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    assert r.json()["status"]["status"] == "running"
+
+    # And the persisted heartbeat agrees.
+    r2 = client.get("/api/research-sweep")
+    assert r2.json()["status"]["status"] == "running"

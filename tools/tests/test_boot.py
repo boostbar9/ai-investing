@@ -388,3 +388,46 @@ def test_persist_summary_writes_atomically(ctx: BootContext) -> None:
     # Temp file should be gone after a clean write.
     assert not target.with_suffix(".json.tmp").exists()
     assert target.exists()
+
+
+# ---------------------------------------------------------------------------
+# step_research_sweep -- Phase 1D wiring
+# ---------------------------------------------------------------------------
+
+
+def test_research_sweep_step_is_last(ctx: BootContext) -> None:
+    """The boot orchestrator must launch the cockpit *before* kicking off
+    the research sweep. The sweep is fire-and-forget; if it crashed during
+    boot, an earlier sweep step would block the cockpit. Lock the order
+    in so a future refactor doesn't accidentally reshuffle."""
+    names = [name for name, _ in STEPS]
+    assert names[-1] == "research_sweep"
+    assert "cockpit_port" in names
+    assert names.index("cockpit_port") < names.index("research_sweep")
+
+
+def test_research_sweep_step_is_degraded_tolerant(
+    ctx: BootContext, monkeypatch
+) -> None:
+    """If the kick-off raises (e.g. broken import), the step must degrade
+    rather than fail -- the cockpit should still launch."""
+    # Force the import to raise by injecting a bad sys.modules entry.
+    import sys
+
+    from tools.boot import step_research_sweep
+
+    real = sys.modules.get("packages.agents.research_sweep")
+
+    class _Boom:
+        def __getattr__(self, _name):
+            raise RuntimeError("simulated failure")
+
+    sys.modules["packages.agents.research_sweep"] = _Boom()
+    try:
+        result = step_research_sweep(ctx)
+    finally:
+        if real is not None:
+            sys.modules["packages.agents.research_sweep"] = real
+        else:
+            sys.modules.pop("packages.agents.research_sweep", None)
+    assert result.status == "degraded"
