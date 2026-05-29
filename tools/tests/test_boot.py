@@ -154,25 +154,108 @@ def test_step_ollama_skipped_when_disabled(ctx: BootContext, monkeypatch) -> Non
     assert r.status == "skipped"
 
 
-def test_step_ollama_ok_when_daemon_responds(ctx: BootContext, monkeypatch) -> None:
+def test_step_ollama_ok_fast_path_when_daemon_already_up(
+    ctx: BootContext, monkeypatch
+) -> None:
+    """If ``_daemon_alive`` returns True we skip the spawn path entirely
+    -- which is what protects us from the Python 3.12.0 Windows
+    subprocess.Popen abort. Verify no Popen-related code runs."""
     monkeypatch.setenv("COCKPIT_OLLAMA_AUTO_START", "1")
-    with patch("tools.check_ollama.ensure_daemon", return_value=True), patch(
+    with patch("tools.check_ollama._daemon_alive", return_value=True), patch(
+        "tools.check_ollama.status_snapshot",
+        return_value={"installed": ["qwen2.5:7b"]},
+    ), patch("tools.check_ollama.ensure_daemon") as ensure:
+        r = step_ollama(ctx)
+    assert r.status == "ok"
+    assert "already running" in r.message
+    assert "qwen2.5:7b" in r.detail["installed"]
+    ensure.assert_not_called()  # critical: we did NOT spawn anything
+
+
+def test_step_ollama_ok_when_ensure_daemon_succeeds(
+    ctx: BootContext, monkeypatch
+) -> None:
+    """Slow path: daemon not initially up, ensure_daemon spawns it."""
+    monkeypatch.setenv("COCKPIT_OLLAMA_AUTO_START", "1")
+    with patch("tools.check_ollama._daemon_alive", return_value=False), patch(
+        "tools.check_ollama.ensure_daemon", return_value=True
+    ), patch(
         "tools.check_ollama.status_snapshot",
         return_value={"installed": ["qwen2.5:7b"]},
     ):
         r = step_ollama(ctx)
     assert r.status == "ok"
-    assert "qwen2.5:7b" in r.detail["installed"]
+    assert r.message.startswith("daemon responding")
 
 
-def test_step_ollama_degraded_when_daemon_down(ctx: BootContext, monkeypatch) -> None:
+def test_step_ollama_degraded_when_daemon_down(
+    ctx: BootContext, monkeypatch
+) -> None:
     monkeypatch.setenv("COCKPIT_OLLAMA_AUTO_START", "1")
-    with patch("tools.check_ollama.ensure_daemon", return_value=False), patch(
-        "tools.check_ollama.status_snapshot", return_value={}
-    ):
+    with patch("tools.check_ollama._daemon_alive", return_value=False), patch(
+        "tools.check_ollama.ensure_daemon", return_value=False
+    ), patch("tools.check_ollama.status_snapshot", return_value={}):
         r = step_ollama(ctx)
     assert r.status == "degraded"
-    assert "Local LLM features disabled" in r.message or "disabled" in r.message
+    assert "disabled" in r.message.lower()
+
+
+def test_step_ollama_auto_skip_when_crash_sentinel_present(
+    ctx: BootContext, monkeypatch
+) -> None:
+    """The CORE crash-loop protection: if the previous boot left a
+    sentinel file behind (because Python aborted mid-step before the
+    finally block could clean it up), the next boot must auto-skip
+    this step instead of crashing again."""
+    from tools.boot import _crash_sentinel_path
+
+    monkeypatch.setenv("COCKPIT_OLLAMA_AUTO_START", "1")
+    sentinel = _crash_sentinel_path(ctx.repo_root, "ollama")
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.write_text("prev-crash", encoding="utf-8")
+
+    # ensure_daemon must NOT be called even if it would have succeeded --
+    # we never want to retry the step that just killed the interpreter.
+    with patch("tools.check_ollama._daemon_alive") as alive, patch(
+        "tools.check_ollama.ensure_daemon"
+    ) as ensure:
+        r = step_ollama(ctx)
+    assert r.status == "skipped"
+    assert "previous boot crashed" in r.message
+    alive.assert_not_called()
+    ensure.assert_not_called()
+    # The sentinel must be cleaned up so the *next* boot can try again.
+    assert not sentinel.exists()
+
+
+def test_step_ollama_writes_and_clears_sentinel_on_slow_path(
+    ctx: BootContext, monkeypatch
+) -> None:
+    """On the slow path (need to spawn) we drop a sentinel before
+    calling ensure_daemon and remove it afterwards. Verify the file
+    is gone after a successful run."""
+    from tools.boot import _crash_sentinel_path
+
+    monkeypatch.setenv("COCKPIT_OLLAMA_AUTO_START", "1")
+    sentinel = _crash_sentinel_path(ctx.repo_root, "ollama")
+    assert not sentinel.exists()
+
+    seen_sentinels: list[bool] = []
+
+    def _fake_ensure(host: str, *, verbose: bool = True) -> bool:
+        # While ensure_daemon is running, the sentinel MUST exist so
+        # that a hard abort here would be caught on the next boot.
+        seen_sentinels.append(sentinel.exists())
+        return True
+
+    with patch("tools.check_ollama._daemon_alive", return_value=False), patch(
+        "tools.check_ollama.ensure_daemon", side_effect=_fake_ensure
+    ), patch("tools.check_ollama.status_snapshot", return_value={"installed": []}):
+        r = step_ollama(ctx)
+
+    assert r.status == "ok"
+    assert seen_sentinels == [True], "sentinel must exist while ensure_daemon runs"
+    assert not sentinel.exists(), "sentinel must be cleaned up after success"
 
 
 # ---------------------------------------------------------------------------
@@ -390,22 +473,26 @@ def test_main_cli_returns_two_when_step_failed(ctx: BootContext, capsys, monkeyp
     assert "data_dirs" in out
 
 
-def test_run_boot_traces_each_step_to_stderr(ctx: BootContext, capsys, monkeypatch) -> None:
-    """>>> step X starting / <<< step X ok markers go to stderr so even a
-    hard exit during a step leaves a 'got this far' marker in the launcher
-    log."""
+def test_run_boot_traces_each_step_to_stdout(ctx: BootContext, capsys, monkeypatch) -> None:
+    """>>> step X starting / <<< step X ok markers go to STDOUT (not stderr)
+    so Windows PowerShell 5.1 doesn't wrap each line in a NativeCommandError
+    record. The launcher tees stdout to data/cockpit/boot_launcher.log so a
+    hard exit during a step still leaves a 'got this far' marker on disk."""
     monkeypatch.setenv("COCKPIT_BOOT_TRACE", "1")
     run_boot(only={"data_dirs"}, ctx=ctx, persist=False)
-    err = capsys.readouterr().err
-    assert ">>> step data_dirs starting" in err
-    assert "<<< step data_dirs ok" in err
+    cap = capsys.readouterr()
+    assert ">>> step data_dirs starting" in cap.out
+    assert "<<< step data_dirs ok" in cap.out
+    # Critical: stderr stays clean so PowerShell 5.1 doesn't editorialize.
+    assert ">>> step" not in cap.err
 
 
 def test_run_boot_trace_disabled_when_env_zero(ctx: BootContext, capsys, monkeypatch) -> None:
     monkeypatch.setenv("COCKPIT_BOOT_TRACE", "0")
     run_boot(only={"data_dirs"}, ctx=ctx, persist=False)
-    err = capsys.readouterr().err
-    assert ">>> step" not in err
+    cap = capsys.readouterr()
+    assert ">>> step" not in cap.out
+    assert ">>> step" not in cap.err
 
 
 def test_run_boot_catches_systemexit_in_step(ctx: BootContext, monkeypatch) -> None:

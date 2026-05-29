@@ -180,6 +180,97 @@ def test_ensure_daemon_reports_failure_on_timeout() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _start_daemon_background -- Windows-safe Popen kwargs
+# ---------------------------------------------------------------------------
+
+
+def test_start_daemon_uses_creationflags_on_windows() -> None:
+    """On Windows we must NOT pass start_new_session=True. Instead we pass
+    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP via creationflags. This
+    sidesteps the Python 3.12.0..3.12.5 Windows subprocess.Popen abort."""
+    captured: dict = {}
+
+    class _FakeProc:
+        pid = 999
+
+    def fake_popen(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return _FakeProc()
+
+    with patch.object(check_ollama, "resolve_ollama_binary",
+                      return_value=("C:\\Ollama\\ollama.exe", "standard")), \
+         patch.object(check_ollama.sys, "platform", "win32"), \
+         patch.object(check_ollama.subprocess, "Popen", side_effect=fake_popen):
+        proc = check_ollama._start_daemon_background()
+
+    assert proc is not None
+    assert captured["args"] == ["C:\\Ollama\\ollama.exe", "serve"]
+    kw = captured["kwargs"]
+    # The exact bug we are dodging:
+    assert "start_new_session" not in kw, \
+        "start_new_session must NOT be passed on Windows (Py 3.12.0 abort)"
+    # The fix:
+    assert "creationflags" in kw
+    # DETACHED_PROCESS (0x08) and CREATE_NEW_PROCESS_GROUP (0x200) must be set.
+    assert kw["creationflags"] & 0x00000008  # DETACHED_PROCESS
+    assert kw["creationflags"] & 0x00000200  # CREATE_NEW_PROCESS_GROUP
+    assert kw.get("close_fds") is True
+
+
+def test_start_daemon_uses_start_new_session_on_posix() -> None:
+    """On POSIX we still want start_new_session=True so the daemon
+    survives the parent shell's SIGHUP. Verify the platform branch."""
+    captured: dict = {}
+
+    class _FakeProc:
+        pid = 999
+
+    def fake_popen(args, **kwargs):
+        captured["kwargs"] = kwargs
+        return _FakeProc()
+
+    with patch.object(check_ollama, "resolve_ollama_binary",
+                      return_value=("/usr/local/bin/ollama", "path")), \
+         patch.object(check_ollama.sys, "platform", "linux"), \
+         patch.object(check_ollama.subprocess, "Popen", side_effect=fake_popen):
+        proc = check_ollama._start_daemon_background()
+
+    assert proc is not None
+    kw = captured["kwargs"]
+    assert kw.get("start_new_session") is True
+    assert "creationflags" not in kw  # POSIX has no such concept
+
+
+def test_start_daemon_swallows_baseexception_from_popen() -> None:
+    """If subprocess.Popen raises ANYTHING (including non-Exception
+    subclasses that Python 3.12.0 Windows has been seen to emit), we
+    must return None and let the caller treat it as degraded -- never
+    let the failure escape and kill the boot orchestrator."""
+    class WeirdAbort(BaseException):
+        """Simulates a non-Exception bubble from native code."""
+
+    def boom(*args, **kwargs):
+        raise WeirdAbort("native abort")
+
+    with patch.object(check_ollama, "resolve_ollama_binary",
+                      return_value=("/usr/bin/ollama", "path")), \
+         patch.object(check_ollama.subprocess, "Popen", side_effect=boom):
+        # Must NOT raise even though Popen raised a BaseException.
+        assert check_ollama._start_daemon_background() is None
+
+
+def test_start_daemon_returns_none_when_no_binary() -> None:
+    """If resolve_ollama_binary returns None we must short-circuit
+    without touching subprocess at all."""
+    with patch.object(check_ollama, "resolve_ollama_binary",
+                      return_value=(None, "missing")), \
+         patch.object(check_ollama.subprocess, "Popen") as popen:
+        assert check_ollama._start_daemon_background() is None
+        popen.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # pull_model — HTTP-first with CLI fallback
 # ---------------------------------------------------------------------------
 

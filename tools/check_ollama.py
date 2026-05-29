@@ -6,9 +6,9 @@ Usage:
     .venv/bin/python tools/check_ollama.py --auto         # one-shot: start daemon, pull, verify
 
 Exit codes:
-    0 — every required model present and daemon responds.
-    1 — daemon unreachable AND we couldn't start it.
-    2 — daemon up but at least one required model is missing.
+    0 -- every required model present and daemon responds.
+    1 -- daemon unreachable AND we couldn't start it.
+    2 -- daemon up but at least one required model is missing.
 
 What ``--auto`` does that ``--pull-missing`` didn't:
     * If the Ollama HTTP API is unreachable, try ``ollama serve`` in the
@@ -48,7 +48,7 @@ DEFAULT_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 # How long to wait for ``ollama serve`` to start responding before we give up.
 DAEMON_STARTUP_TIMEOUT_S = 15.0
 # How often to print pull progress (every N MB downloaded). Ollama's stream
-# is chatty — we don't want to flood the terminal with one line per chunk.
+# is chatty -- we don't want to flood the terminal with one line per chunk.
 PROGRESS_REPORT_EVERY_MB = 50
 
 
@@ -143,7 +143,7 @@ def resolve_ollama_binary() -> tuple[str | None, str]:
 
 
 def _daemon_alive(host: str, timeout: float = 2.0) -> bool:
-    """Cheap probe — does the HTTP API answer?"""
+    """Cheap probe -- does the HTTP API answer?"""
     try:
         urllib.request.urlopen(f"{host}/api/tags", timeout=timeout)
         return True
@@ -157,21 +157,53 @@ def _start_daemon_background() -> subprocess.Popen | None:
     Returns the Popen handle (caller does NOT need to wait) or None if the
     ``ollama`` CLI isn't on PATH. The daemon will keep running after this
     script exits because we don't tie its lifetime to ours.
+
+    Platform notes:
+      * POSIX: ``start_new_session=True`` calls ``setsid()`` so SIGHUP from
+        the parent shell can't kill the daemon.
+      * Windows: We use ``DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP``
+        instead. Passing ``start_new_session=True`` on Windows is a no-op
+        in modern CPython, but on Python 3.12.0..3.12.5 Windows there are
+        reports of subprocess.Popen aborting with STATUS_ACCESS_VIOLATION
+        when stdio handles are routed through DEVNULL and the spawned
+        binary has a long path. The explicit ``creationflags`` route
+        avoids that code path entirely.
+
+    Any exception from Popen is swallowed and converted to ``None`` --
+    the caller treats that as "daemon couldn't be started" and continues
+    in degraded mode instead of crashing the boot orchestrator.
     """
     binary, _flavor = resolve_ollama_binary()
     if binary is None:
         return None
-    try:
-        # stdout/stderr to DEVNULL so a slow daemon doesn't block us.
-        proc = subprocess.Popen(
-            [binary, "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,  # detach from this script's process group
+
+    popen_kwargs: dict = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32":
+        # Defined on Windows builds of Python. ``DETACHED_PROCESS`` makes
+        # the child not inherit the parent's console, ``CREATE_NEW_PROCESS_GROUP``
+        # gives it its own group so Ctrl+C on the parent doesn't kill it.
+        creationflags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         )
-        return proc
-    except (OSError, FileNotFoundError):
+        popen_kwargs["creationflags"] = creationflags
+        # close_fds is the safe Windows default; do NOT set start_new_session.
+        popen_kwargs["close_fds"] = True
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        return subprocess.Popen([binary, "serve"], **popen_kwargs)
+    except BaseException:
+        # BaseException because Python 3.12.0 Windows has been observed to
+        # raise non-Exception subclasses (e.g. abort signals) from inside
+        # subprocess.Popen on certain handle configurations. We must not
+        # let any of these propagate -- the boot orchestrator must keep
+        # going and report this step as degraded.
         return None
 
 
@@ -194,14 +226,14 @@ def ensure_daemon(host: str, *, verbose: bool = True) -> bool:
     proc = _start_daemon_background()
     if proc is None:
         if verbose:
-            print("  [ERR] 'ollama' CLI not on PATH — install Ollama or start the daemon manually.")
+            print("  [ERR] 'ollama' CLI not on PATH -- install Ollama or start the daemon manually.")
         return False
     if _wait_for_daemon(host):
         if verbose:
             print(f"  daemon up after starting (pid={proc.pid}).")
         return True
     if verbose:
-        print("  [ERR] daemon did not respond within timeout — check Ollama logs.")
+        print("  [ERR] daemon did not respond within timeout -- check Ollama logs.")
     return False
 
 
@@ -222,7 +254,7 @@ def _backend_snapshot(host: str, timeout: float = 2.0) -> dict:
       * backend:  'gpu' | 'cpu' | 'unknown'
       * loaded:   list of currently-loaded models (with size_vram + size)
       * vram_used_bytes: total VRAM in use
-      * gpu_fraction:  fraction of the loaded model on GPU (0.0–1.0)
+      * gpu_fraction:  fraction of the loaded model on GPU (0.0-1.0)
     """
     out: dict = {
         "backend": "unknown",
@@ -273,7 +305,7 @@ def _matches(required: str, installed: list[str]) -> bool:
     """An installed tag matches if the full name OR family prefix matches.
 
     Ollama tags look like ``deepseek-r1:32b``. Sometimes operators have a
-    differently-quantized variant like ``deepseek-r1:32b-q4_K_M`` — still
+    differently-quantized variant like ``deepseek-r1:32b-q4_K_M`` -- still
     fine for our purposes.
     """
     if required in installed:
@@ -312,7 +344,7 @@ def _pull_via_http(host: str, model: str, *, verbose: bool = True) -> bool:
     last_report_mb = -PROGRESS_REPORT_EVERY_MB  # ensure first chunk prints
     final_status = ""
     try:
-        # No timeout on the read itself — 20GB pulls can run for an hour.
+        # No timeout on the read itself -- 20GB pulls can run for an hour.
         # We do set a connect-side timeout so a wedged daemon fails loudly.
         with urllib.request.urlopen(req, timeout=10.0) as resp:
             for raw in resp:
@@ -340,7 +372,7 @@ def _pull_via_http(host: str, model: str, *, verbose: bool = True) -> bool:
                         )
                         last_report_mb = mb_done
                 elif verbose and status and status != final_status:
-                    # status changed but no progress numbers — print once.
+                    # status changed but no progress numbers -- print once.
                     print(f"    {status}")
         return final_status == "success" or "success" in final_status.lower()
     except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -458,7 +490,7 @@ def main() -> int:
     profile = active_profile(env_value=args.profile)
     required = all_models(profile)
 
-    print(f"profile        : {profile.name} — {profile.description}")
+    print(f"profile        : {profile.name} -- {profile.description}")
     print(f"ollama host    : {args.host}")
     print(f"models required: {len(required)}")
     print()
@@ -500,7 +532,7 @@ def main() -> int:
         print(f"    ollama pull {m}")
 
     if not want_pull:
-        # Read-only mode — exit with code 2 so CI/setup scripts can detect it.
+        # Read-only mode -- exit with code 2 so CI/setup scripts can detect it.
         return 2
 
     print()

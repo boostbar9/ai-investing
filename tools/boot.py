@@ -33,6 +33,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -129,13 +130,13 @@ def step_env(ctx: BootContext) -> StepResult:
         return StepResult(
             "env",
             "degraded",
-            "Created .env from .env.example — add your Alpaca paper keys",
+            "Created .env from .env.example -- add your Alpaca paper keys",
             {"path": str(env_file)},
         )
     return StepResult(
         "env",
         "failed",
-        ".env and .env.example both missing — run scripts/install.ps1",
+        ".env and .env.example both missing -- run scripts/install.ps1",
     )
 
 
@@ -150,7 +151,7 @@ def _line_blank(text: str, key: str) -> bool:
 
 
 def step_venv(ctx: BootContext) -> StepResult:
-    """Verify .venv exists. We don't create it here — install.ps1 owns that.
+    """Verify .venv exists. We don't create it here -- install.ps1 owns that.
 
     If the venv is missing, the launcher script (which already activates
     .venv) couldn't have invoked Python in the first place, so we'd never
@@ -165,14 +166,26 @@ def step_venv(ctx: BootContext) -> StepResult:
             return StepResult(
                 "venv",
                 "failed",
-                ".venv not found — run scripts/install.ps1 (Windows) or scripts/install.sh",
+                ".venv not found -- run scripts/install.ps1 (Windows) or scripts/install.sh",
             )
         return StepResult(
             "venv",
             "degraded",
-            "Python not running from .venv — restart via scripts/launch.cmd",
+            "Python not running from .venv -- restart via scripts/launch.cmd",
         )
     return StepResult("venv", "ok", f"venv active at {sys.prefix}")
+
+
+def _crash_sentinel_path(repo_root: Path, step: str) -> Path:
+    """Return the path used to mark a step as 'last attempt crashed hard'.
+
+    The sentinel is created right before a risky step runs and deleted
+    immediately afterwards. If the file is still on disk when the next
+    boot starts, we know the previous attempt died mid-step (likely a
+    hard interpreter abort that no try/except can catch) and we can
+    auto-skip that step to keep the cockpit reachable.
+    """
+    return repo_root / "data" / "cockpit" / f"_crash.{step}.sentinel"
 
 
 def step_ollama(ctx: BootContext) -> StepResult:
@@ -180,21 +193,73 @@ def step_ollama(ctx: BootContext) -> StepResult:
 
     Reuses ``tools.check_ollama.ensure_daemon`` so the resolution rules
     (Adrenalin bundle on Devin's box, then PATH) stay in one place.
+
+    Crash-loop protection:
+      * Drops a sentinel file before calling ``ensure_daemon`` and removes
+        it on the way out. If we see the sentinel at the start of a run
+        we skip the step -- the previous attempt killed the interpreter
+        before the sentinel could be cleaned up, so re-running the same
+        code would loop forever.
+      * Honors ``COCKPIT_OLLAMA_AUTO_START=0`` for explicit user override.
     """
     if not ctx.env_on("COCKPIT_OLLAMA_AUTO_START"):
         return StepResult("ollama", "skipped", "COCKPIT_OLLAMA_AUTO_START=0")
+
+    sentinel = _crash_sentinel_path(ctx.repo_root, "ollama")
+    if sentinel.exists():
+        # Clear the sentinel so the *next* run can try again if the user
+        # has since fixed Ollama. We only auto-skip once per crash.
+        with contextlib.suppress(OSError):
+            sentinel.unlink()
+        return StepResult(
+            "ollama",
+            "skipped",
+            "auto-skipped: previous boot crashed inside this step (sentinel found). "
+            "Start ollama manually (`ollama serve`) and relaunch to retry.",
+        )
+
     try:
-        from tools.check_ollama import (  # local import — keeps boot fast
+        from tools.check_ollama import (  # local import keeps boot fast
             DEFAULT_HOST,
+            _daemon_alive,
             ensure_daemon,
             status_snapshot,
         )
-    except Exception as exc:  # pragma: no cover — defensive
+    except Exception as exc:  # pragma: no cover -- defensive
         return StepResult("ollama", "failed", f"could not import check_ollama: {exc}")
 
     host = os.environ.get("OLLAMA_HOST", DEFAULT_HOST)
-    ok = ensure_daemon(host, verbose=False)
-    snap = status_snapshot(host=host)
+
+    # Fast path: if the daemon is already up we skip ensure_daemon
+    # entirely. That avoids any subprocess.Popen call -- which on
+    # Python 3.12.0..3.12.5 Windows has been observed to abort the
+    # interpreter from inside CPython native code (uncatchable).
+    if _daemon_alive(host):
+        snap = status_snapshot(host=host)
+        return StepResult(
+            "ollama",
+            "ok",
+            f"daemon already running at {host}",
+            {"installed": snap.get("installed", [])},
+        )
+
+    # Slow path: need to spawn the daemon. Drop the sentinel so a hard
+    # abort during Popen is recoverable on next boot.
+    try:
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text("ollama-step-in-progress", encoding="utf-8")
+    except OSError:
+        pass
+
+    try:
+        ok = ensure_daemon(host, verbose=False)
+        snap = status_snapshot(host=host)
+    finally:
+        # Always remove the sentinel on the way out -- if we got here
+        # at all, ensure_daemon did not hard-abort.
+        with contextlib.suppress(OSError):
+            sentinel.unlink(missing_ok=True)
+
     if ok:
         return StepResult(
             "ollama",
@@ -205,7 +270,7 @@ def step_ollama(ctx: BootContext) -> StepResult:
     return StepResult(
         "ollama",
         "degraded",
-        "Ollama not responding — local LLM features disabled until you start it",
+        "Ollama not responding -- local LLM features disabled until you start it",
         snap,
     )
 
@@ -214,7 +279,7 @@ def step_models(ctx: BootContext) -> StepResult:
     """Pull any missing models for the active hardware profile.
 
     Only runs if Ollama is up. ``COCKPIT_OLLAMA_AUTO_PULL=0`` skips this.
-    Missing models don't fail the boot — the LLM router falls back to a
+    Missing models don't fail the boot -- the LLM router falls back to a
     smaller available chain.
     """
     if not ctx.env_on("COCKPIT_OLLAMA_AUTO_PULL"):
@@ -259,7 +324,7 @@ def step_models(ctx: BootContext) -> StepResult:
                 pulled.append(model)
             else:
                 failed.append(model)
-        except Exception as exc:  # pragma: no cover — network flakes
+        except Exception as exc:  # pragma: no cover -- network flakes
             ctx.log.warning("pull %s failed: %s", model, exc)
             failed.append(model)
 
@@ -343,17 +408,17 @@ def step_doctor(ctx: BootContext) -> StepResult:
 
 def step_cockpit_port(ctx: BootContext) -> StepResult:
     """Confirm the cockpit port is free (or owned by us). Don't start the
-    cockpit here — the launcher script does that as its foreground process
+    cockpit here -- the launcher script does that as its foreground process
     so logs show in the terminal.
     """
     port = int(os.environ.get("COCKPIT_PORT", "8765"))
     if _port_open("127.0.0.1", port):
         # Someone is on the port. Could be a stale cockpit from a prior
-        # session — flag, don't kill (that's the watchdog's job).
+        # session -- flag, don't kill (that's the watchdog's job).
         return StepResult(
             "cockpit_port",
             "degraded",
-            f"port {port} already in use — kill the other cockpit or change COCKPIT_PORT",
+            f"port {port} already in use -- kill the other cockpit or change COCKPIT_PORT",
             {"port": port},
         )
     return StepResult("cockpit_port", "ok", f"port {port} free", {"port": port})
@@ -406,7 +471,7 @@ def _split_host(host: str) -> tuple[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# Step registry — ordered list. Keep dependencies obvious.
+# Step registry -- ordered list. Keep dependencies obvious.
 # ---------------------------------------------------------------------------
 
 Step = Callable[[BootContext], StepResult]
@@ -473,7 +538,7 @@ def run_boot(
         skip: step names to skip (e.g. for CI hermetic runs).
         only: if set, run only these steps.
         ctx: pre-built context (mostly for tests).
-        on_step: callback invoked after each step completes — used by the
+        on_step: callback invoked after each step completes -- used by the
             cockpit /api/boot/stream endpoint to push progress live.
         persist: write summary to ``data/cockpit/boot.json``. The cockpit
             and tray read this so a restart inherits the prior state
@@ -494,8 +559,11 @@ def run_boot(
     trace = os.environ.get("COCKPIT_BOOT_TRACE", "1") in ("1", "true", "yes")
 
     def _trace(msg: str) -> None:
+        # Use stdout (not stderr) so Windows PowerShell 5.1 doesn't wrap
+        # each trace line in a NativeCommandError record. The launcher
+        # tees stdout to data/cockpit/boot_launcher.log either way.
         if trace:
-            print(msg, file=sys.stderr, flush=True)
+            print(msg, flush=True)
 
     started = time.time()
     results: list[StepResult] = []
@@ -546,7 +614,7 @@ def _persist_summary(repo_root: Path, summary: BootSummary) -> None:
         tmp = target.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(summary.to_dict(), indent=2), encoding="utf-8")
         tmp.replace(target)
-    except OSError:  # pragma: no cover — disk full / readonly fs
+    except OSError:  # pragma: no cover -- disk full / readonly fs
         pass
 
 
@@ -609,6 +677,12 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
         print("", flush=True)
+
+    # JSON mode must emit ONLY the JSON payload on stdout so callers can
+    # pipe the output straight into ``jq`` / ``json.loads``. Suppress trace
+    # markers (which also go to stdout) for the duration of this call.
+    if args.json:
+        os.environ["COCKPIT_BOOT_TRACE"] = "0"
 
     # Run with a defensive outer try/except so an unhandled error inside a
     # step (or in run_boot itself) NEVER leaves the launcher staring at an
