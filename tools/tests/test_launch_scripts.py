@@ -28,7 +28,10 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 UTF8_BOM = b"\xef\xbb\xbf"
 
 
-@pytest.mark.parametrize("script_name", ["launch.ps1"])
+@pytest.mark.parametrize(
+    "script_name",
+    ["launch.ps1", "repair.ps1", "install-repair-shortcut.ps1"],
+)
 def test_powershell_scripts_start_with_utf8_bom(script_name: str) -> None:
     """PowerShell 5.1 only treats a .ps1 file as UTF-8 when the BOM is
     present. Without it, the file is decoded using the active Windows
@@ -45,7 +48,16 @@ def test_powershell_scripts_start_with_utf8_bom(script_name: str) -> None:
     )
 
 
-@pytest.mark.parametrize("script_name", ["launch.ps1", "launch.sh", "launch.cmd"])
+@pytest.mark.parametrize(
+    "script_name",
+    [
+        "launch.ps1",
+        "launch.sh",
+        "launch.cmd",
+        "repair.ps1",
+        "install-repair-shortcut.ps1",
+    ],
+)
 def test_launch_scripts_are_ascii_only(script_name: str) -> None:
     """No em-dashes, en-dashes, smart-quotes, or other non-ASCII bytes
     in the launch scripts. They get re-encoded by every tool in the
