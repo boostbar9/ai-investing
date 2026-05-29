@@ -111,6 +111,21 @@ class Candidate:
     news_headlines: int = 0
     corroboration_score: float = 0.0
     corroboration_reason: str = ""
+    # Phase 10: per-ticker enrichment from Yahoo / EDGAR / StockTwits.
+    # Defaults of 0 / empty mean the source was unavailable or the
+    # ticker wasn't in the per-ticker fan-out budget.
+    analyst_mean_rating: float = 0.0       # 1=Strong Buy ... 5=Strong Sell
+    analyst_num: int = 0
+    analyst_target_mean: float = 0.0
+    analyst_recent_action: str = ""        # "upgrade" / "downgrade" / ""
+    analyst_recent_firm: str = ""
+    insider_net_shares: float = 0.0
+    insider_buy_count: int = 0
+    insider_sell_count: int = 0
+    insider_form4_30d: int = 0             # Form 4 filings in last 30d
+    stocktwits_trending: bool = False
+    stocktwits_watchlist: int = 0
+    yahoo_news_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -127,6 +142,10 @@ class SweepResult:
     candidates: list[Candidate]
     portfolio_symbols: list[str]
     error: str = ""
+    # Phase 10: per-source health/contribution telemetry. Map of
+    # source name -> ``{"ok": bool, "count": int, "latency_ms": float}``.
+    # Powers the /data-sources cockpit page.
+    sources_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -137,6 +156,7 @@ class SweepResult:
             "portfolio_symbols": self.portfolio_symbols,
             "candidates": [c.to_dict() for c in self.candidates],
             "error": self.error,
+            "sources_meta": self.sources_meta,
         }
 
 
@@ -375,21 +395,28 @@ async def _gather_news(adapter: SentimentAdapter) -> list[NewsItem]:
 
 
 async def _gather_rich_reddit(
-    subreddits: tuple[str, ...] = (
-        "wallstreetbets",
-        "stocks",
-        "investing",
-    ),
+    subreddits: tuple[str, ...] | None = None,
     *,
     posts_per_sub: int = 10,
 ) -> list[dict[str, Any]]:
     """Pull trust-enriched Reddit posts in parallel. Best-effort: a
-    single bad subreddit doesn't take the others down."""
+    single bad subreddit doesn't take the others down.
+
+    Phase 10: when ``subreddits`` is None, the roster comes from
+    :func:`packages.agents.reddit_trust.fetch_roster` so the tiered
+    quality list (SecurityAnalysis, ValueInvesting, Bogleheads ...)
+    is used by default instead of the legacy WSB-only triplet.
+    """
     try:
-        from packages.agents.reddit_trust import fetch_rich_reddit
+        from packages.agents.reddit_trust import (
+            fetch_rich_reddit,
+            fetch_roster,
+        )
     except Exception as exc:  # pragma: no cover - import safety
         logger.warning("rich reddit import failed: %s", exc)
         return []
+    if subreddits is None:
+        subreddits = fetch_roster()
     out: list[dict[str, Any]] = []
     results = await asyncio.gather(
         *(fetch_rich_reddit(s, limit=posts_per_sub) for s in subreddits),
@@ -400,6 +427,211 @@ async def _gather_rich_reddit(
             out.extend(res)
         # exceptions are silently dropped -- the fetcher already logs them
     return out
+
+
+async def _gather_yahoo_news(
+    tickers: list[str], *, limit_per_ticker: int = 8
+) -> tuple[list[NewsItem], dict[str, dict[str, Any]]]:
+    """Phase 10: per-ticker Yahoo Finance news + analyst + insider.
+
+    Returns ``(news_items, signals_by_symbol)`` where ``signals_by_symbol``
+    maps symbol -> ``{"analyst": {...}, "insider": {...}, "news_count": int}``.
+    The news items flow into the corroboration gate; the signals are
+    persisted alongside each candidate for the dashboard.
+    """
+    if not tickers:
+        return [], {}
+    try:
+        from packages.data.adapters.yahoo_news import YahooNewsAdapter
+    except Exception as exc:  # pragma: no cover - import safety
+        logger.warning("yahoo news import failed: %s", exc)
+        return [], {}
+    adapter = YahooNewsAdapter()
+    news_out: list[NewsItem] = []
+    signals: dict[str, dict[str, Any]] = {}
+    try:
+        # Cap fan-out so a 50-ticker candidate set can't fire 150
+        # requests at Yahoo and burn through the rate-limit bucket.
+        capped = tickers[:25]
+        news_results = await asyncio.gather(
+            *(
+                adapter.fetch_ticker_news(t, limit=limit_per_ticker)
+                for t in capped
+            ),
+            return_exceptions=True,
+        )
+        analyst_results = await asyncio.gather(
+            *(adapter.fetch_analyst_signal(t) for t in capped),
+            return_exceptions=True,
+        )
+        insider_results = await asyncio.gather(
+            *(adapter.fetch_insider_summary(t) for t in capped),
+            return_exceptions=True,
+        )
+        for t, news, analyst, insider in zip(
+            capped,
+            news_results,
+            analyst_results,
+            insider_results,
+            strict=False,
+        ):
+            news_list = news if isinstance(news, list) else []
+            news_out.extend(news_list)
+            signals[t.upper()] = {
+                "analyst": analyst if isinstance(analyst, dict) else {},
+                "insider": insider if isinstance(insider, dict) else {},
+                "news_count": len(news_list),
+            }
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "yahoo gather failed: %s", exc.__class__.__name__
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await adapter.aclose()
+    return news_out, signals
+
+
+async def _gather_stocktwits_trending(
+    *, limit: int = 30
+) -> list[dict[str, Any]]:
+    """Phase 10: trending tickers from StockTwits. Returns ``[]`` on
+    any failure."""
+    try:
+        from packages.data.adapters.stocktwits import StockTwitsAdapter
+    except Exception as exc:  # pragma: no cover - import safety
+        logger.warning("stocktwits import failed: %s", exc)
+        return []
+    adapter = StockTwitsAdapter()
+    try:
+        return await adapter.fetch_trending(limit=limit)
+    except Exception as exc:  # pragma: no cover - network varies
+        logger.warning(
+            "stocktwits gather failed: %s", exc.__class__.__name__
+        )
+        return []
+    finally:
+        with contextlib.suppress(Exception):
+            await adapter.aclose()
+
+
+async def _gather_insider_form4(
+    tickers: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Phase 10: Form 4 insider transaction counts from SEC EDGAR for
+    each candidate ticker. Returns ``{symbol: {"count": int, "latest": str}}``.
+    """
+    if not tickers:
+        return {}
+    try:
+        from packages.data.adapters.sec_edgar import SecEdgarAdapter
+    except Exception as exc:  # pragma: no cover - import safety
+        logger.warning("sec_edgar import failed: %s", exc)
+        return {}
+    adapter = SecEdgarAdapter()
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        capped = tickers[:25]
+        results = await asyncio.gather(
+            *(adapter.get_recent_form4_count(t) for t in capped),
+            return_exceptions=True,
+        )
+        for t, res in zip(capped, results, strict=False):
+            if isinstance(res, dict):
+                out[t.upper()] = res
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "edgar form4 gather failed: %s", exc.__class__.__name__
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await adapter.aclose()
+    return out
+
+
+async def _gather_per_ticker_reddit(
+    tickers: list[str], *, posts_per_sub: int = 10
+) -> list[dict[str, Any]]:
+    """Phase 10: discover per-ticker subreddits for the candidate set,
+    then fetch hot posts from each discovered sub. Best-effort."""
+    if not tickers:
+        return []
+    try:
+        from packages.agents.reddit_trust import (
+            discover_for_tickers,
+            fetch_rich_reddit,
+        )
+    except Exception as exc:  # pragma: no cover - import safety
+        logger.warning("per-ticker discovery import failed: %s", exc)
+        return []
+    try:
+        discovered = await discover_for_tickers(
+            tickers, max_per_ticker=2, max_total=6
+        )
+    except Exception as exc:  # pragma: no cover - network varies
+        logger.warning(
+            "per-ticker discovery failed: %s", exc.__class__.__name__
+        )
+        return []
+    if not discovered:
+        return []
+    out: list[dict[str, Any]] = []
+    results = await asyncio.gather(
+        *(fetch_rich_reddit(s, limit=posts_per_sub) for s in discovered),
+        return_exceptions=True,
+    )
+    for res in results:
+        if isinstance(res, list):
+            out.extend(res)
+    return out
+
+
+def _apply_phase10_enrichment(
+    candidates: list[Candidate],
+    *,
+    yahoo_signals: dict[str, dict[str, Any]],
+    insider_form4: dict[str, dict[str, Any]],
+    stocktwits_trending: list[dict[str, Any]],
+) -> list[Candidate]:
+    """Phase 10: stamp per-ticker enrichment fields onto each candidate.
+
+    Pure function (no I/O) so tests can drive it with fixture dicts.
+    Mutates the dataclass via :func:`dataclasses.replace` to keep the
+    upstream frozen-by-convention invariant intact.
+    """
+    if not candidates:
+        return candidates
+    trending_set = {
+        (t.get("symbol") or "").upper(): int(t.get("watchlist_count") or 0)
+        for t in stocktwits_trending
+    }
+    enriched: list[Candidate] = []
+    for c in candidates:
+        sym = c.symbol.upper()
+        yahoo = yahoo_signals.get(sym) or {}
+        analyst = yahoo.get("analyst") or {}
+        insider = yahoo.get("insider") or {}
+        form4 = insider_form4.get(sym) or {}
+        watchlist = trending_set.get(sym, 0)
+
+        c.analyst_mean_rating = float(analyst.get("mean_rating") or 0.0)
+        c.analyst_num = int(analyst.get("num_analysts") or 0)
+        c.analyst_target_mean = float(
+            analyst.get("target_mean") or 0.0
+        )
+        c.analyst_recent_action = str(
+            analyst.get("recent_action") or ""
+        )
+        c.analyst_recent_firm = str(analyst.get("recent_firm") or "")
+        c.insider_net_shares = float(insider.get("net_shares") or 0.0)
+        c.insider_buy_count = int(insider.get("buy_count") or 0)
+        c.insider_sell_count = int(insider.get("sell_count") or 0)
+        c.insider_form4_30d = int(form4.get("count") or 0)
+        c.stocktwits_trending = sym in trending_set
+        c.stocktwits_watchlist = watchlist
+        c.yahoo_news_count = int(yahoo.get("news_count") or 0)
+        enriched.append(c)
+    return enriched
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +667,17 @@ async def run_sweep(
     if own_adapter:
         adapter = SentimentAdapter()
 
+    # Phase 10: per-source telemetry. Populated as each gather returns;
+    # rolled into ``SweepResult.sources_meta`` at the end.
+    sources_meta: dict[str, dict[str, Any]] = {}
+
+    def _meta(name: str, ok: bool, count: int, t0: float) -> None:
+        sources_meta[name] = {
+            "ok": ok,
+            "count": count,
+            "latency_ms": round((time.monotonic() - t0) * 1000.0, 1),
+        }
+
     try:
         async def _do() -> tuple[
             list[str], list[NewsItem], list[dict[str, Any]]
@@ -447,11 +690,20 @@ async def run_sweep(
                 if portfolio_symbols is None
                 else None
             )
+            news_t0 = time.monotonic()
             news_task = asyncio.create_task(_gather_news(adapter))  # type: ignore[arg-type]
             rich_task = None
+            rich_t0 = time.monotonic()
             if enable_trust_gate and reddit_posts is None:
                 rich_task = asyncio.create_task(_gather_rich_reddit())
+            stocktwits_task = (
+                asyncio.create_task(_gather_stocktwits_trending())
+                if enable_trust_gate
+                else None
+            )
+            stocktwits_t0 = time.monotonic()
             news = await news_task
+            _meta("rss_news", True, len(news), news_t0)
             pf = (
                 portfolio_symbols
                 if portfolio_symbols is not None
@@ -460,19 +712,88 @@ async def run_sweep(
             rich: list[dict[str, Any]]
             if reddit_posts is not None:
                 rich = reddit_posts
+                _meta("reddit_rich", True, len(rich), rich_t0)
             elif rich_task is not None:
                 rich = await rich_task
+                _meta("reddit_rich", True, len(rich), rich_t0)
             else:
                 rich = []
+                _meta("reddit_rich", False, 0, rich_t0)
+            trending: list[dict[str, Any]]
+            if stocktwits_task is not None:
+                trending = await stocktwits_task
+                _meta(
+                    "stocktwits", bool(trending), len(trending),
+                    stocktwits_t0,
+                )
+            else:
+                trending = []
+            # Stash trending on the closure so the outer scope can read
+            # it after the gather. Returning a 4-tuple would also work
+            # but breaks the existing type signature subagents rely on.
+            _do.trending = trending  # type: ignore[attr-defined]
             return pf, news, rich
 
         pf_symbols, news_items, rich_posts = await asyncio.wait_for(
             _do(), timeout=RESEARCH_SWEEP_TIMEOUT_S
         )
+        trending_symbols: list[dict[str, Any]] = getattr(
+            _do, "trending", []
+        )
 
         aggregated = aggregate_sentiment(news_items, window_hours=24)
         cands = candidates_from_sentiment(aggregated)
         cands = merge_portfolio_candidates(cands, pf_symbols)
+
+        # Phase 10: per-ticker fan-out for Yahoo + EDGAR + per-ticker
+        # Reddit. Runs AFTER first-pass candidate generation so we
+        # only spend the rate-limit budget on tickers we actually care
+        # about. Budget-capped inside each gather helper.
+        candidate_symbols = sorted({c.symbol.upper() for c in cands})
+        yahoo_signals: dict[str, dict[str, Any]] = {}
+        insider_form4: dict[str, dict[str, Any]] = {}
+        per_ticker_posts: list[dict[str, Any]] = []
+        if enable_trust_gate and candidate_symbols:
+            yahoo_t0 = time.monotonic()
+            edgar_t0 = time.monotonic()
+            pt_t0 = time.monotonic()
+            yahoo_res, edgar_res, pt_res = await asyncio.gather(
+                _gather_yahoo_news(candidate_symbols),
+                _gather_insider_form4(candidate_symbols),
+                _gather_per_ticker_reddit(candidate_symbols),
+                return_exceptions=True,
+            )
+            if isinstance(yahoo_res, tuple):
+                yahoo_news_items, yahoo_signals = yahoo_res
+                news_items = news_items + yahoo_news_items
+                _meta(
+                    "yahoo_news", True, len(yahoo_news_items), yahoo_t0
+                )
+            else:
+                _meta("yahoo_news", False, 0, yahoo_t0)
+            if isinstance(edgar_res, dict):
+                insider_form4 = edgar_res
+                _meta(
+                    "sec_form4",
+                    True,
+                    sum(
+                        int(v.get("count") or 0)
+                        for v in edgar_res.values()
+                    ),
+                    edgar_t0,
+                )
+            else:
+                _meta("sec_form4", False, 0, edgar_t0)
+            if isinstance(pt_res, list):
+                per_ticker_posts = pt_res
+                rich_posts = rich_posts + per_ticker_posts
+                _meta(
+                    "reddit_per_ticker", True, len(per_ticker_posts),
+                    pt_t0,
+                )
+            else:
+                _meta("reddit_per_ticker", False, 0, pt_t0)
+
         if enable_trust_gate:
             cands = apply_trust_and_corroboration(
                 cands,
@@ -480,6 +801,12 @@ async def run_sweep(
                 reddit_posts=rich_posts,
                 portfolio_symbols=pf_symbols,
                 drop_uncorroborated=False,  # keep but tag -- user picks
+            )
+            cands = _apply_phase10_enrichment(
+                cands,
+                yahoo_signals=yahoo_signals,
+                insider_form4=insider_form4,
+                stocktwits_trending=trending_symbols,
             )
 
         finished = datetime.now(UTC)
@@ -490,6 +817,7 @@ async def run_sweep(
             duration_s=round((finished - started).total_seconds(), 3),
             candidates=cands,
             portfolio_symbols=pf_symbols,
+            sources_meta=sources_meta,
         )
 
     except TimeoutError:

@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Sources - ai-investing</title>
+  {% include "_head_icons.html" %}
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/cockpit.css" />
+  <script src="/static/cockpit.js"></script>
+  <style>
+    .panel { background: #0b1220; border: 1px solid #1f2937; border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+    .pill { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+    .pill-ok { background: #064e3b; color: #6ee7b7; border: 1px solid #10b981; }
+    .pill-fail { background: #450a0a; color: #fca5a5; border: 1px solid #b91c1c; }
+    .pill-idle { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
+    .tier-news { background: #1e3a8a; color: #bfdbfe; border: 1px solid #3b82f6; }
+    .tier-social { background: #4c1d95; color: #ddd6fe; border: 1px solid #8b5cf6; }
+    .tier-filings { background: #064e3b; color: #6ee7b7; border: 1px solid #10b981; }
+    .tier-other { background: #1e293b; color: #cbd5e1; border: 1px solid #334155; }
+    table.dense { width: 100%; border-collapse: collapse; font-size: 12px; }
+    table.dense th, table.dense td { padding: 8px 12px; border-bottom: 1px solid #1f2937; text-align: right; font-variant-numeric: tabular-nums; }
+    table.dense th { color: #94a3b8; font-weight: 500; text-transform: uppercase; font-size: 10px; letter-spacing: .05em; }
+    table.dense td:first-child, table.dense th:first-child { text-align: left; }
+    table.dense td:nth-child(2), table.dense th:nth-child(2) { text-align: left; }
+    .empty { padding: 32px; text-align: center; color: #64748b; font-style: italic; }
+    .roster-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
+    .roster-cell { background: #0f172a; border: 1px solid #1f2937; border-radius: 6px; padding: 8px 10px; font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
+    .roster-cell .mult { font-variant-numeric: tabular-nums; color: #94a3b8; font-size: 11px; }
+    .stat { display: flex; flex-direction: column; gap: 4px; }
+    .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #94a3b8; }
+    .stat-value { font-size: 22px; font-weight: 600; color: #f1f5f9; font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="topbar"><div class="topbar-inner">
+    <a href="/" class="topbar-brand">
+      <span id="cockpit-conn-dot" class="topbar-brand-dot idle"></span>
+      <span>ai-investing</span>
+    </a>
+    <div id="cockpit-topbar"></div>
+  </div></div>
+
+  <div class="max-w-6xl mx-auto p-6">
+    <nav class="nav flex items-center gap-1 mb-4 text-sm flex-wrap">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/trading" class="nav-link">Trading</a>
+      <a href="/shadow" class="nav-link">Shadow</a>
+      <a href="/autopilot" class="nav-link">Autopilot</a>
+      <a href="/agents" class="nav-link">Agents</a>
+      <a href="/models" class="nav-link">Models</a>
+      <a href="/data-sources" class="nav-link nav-active">Data Sources</a>
+      <a href="/health" class="nav-link">Health</a>
+      <a href="/settings" class="nav-link">Settings</a>
+    </nav>
+
+    <h1 class="text-2xl font-semibold mb-2">Data Sources</h1>
+    <p class="text-gray-400 text-sm mb-6">
+      Per-source health and contribution from the most recent research sweep.
+      Each row shows whether the source responded, how many items it returned,
+      and how long it took. Empty rows mean the source has not been touched yet.
+    </p>
+
+    <div class="panel">
+      <div class="grid grid-cols-3 gap-6">
+        <div class="stat">
+          <span class="stat-label">Last sweep</span>
+          <span class="stat-value" id="sweep-started">--</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Status</span>
+          <span class="stat-value" id="sweep-status">--</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Candidates</span>
+          <span class="stat-value" id="candidate-count">--</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2 class="text-lg font-semibold mb-3">Source health</h2>
+      <table class="dense">
+        <thead>
+          <tr>
+            <th>Source</th>
+            <th>Tier</th>
+            <th>Status</th>
+            <th>Items</th>
+            <th>Latency</th>
+          </tr>
+        </thead>
+        <tbody id="sources-body">
+          <tr><td colspan="5" class="empty">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h2 class="text-lg font-semibold mb-1">Subreddit roster</h2>
+      <p class="text-gray-400 text-xs mb-3">
+        Static high-quality roster used at the start of every sweep. Per-ticker
+        subs (NVDA_Stock, teslainvestorsclub, etc.) get discovered dynamically
+        and appear in the Reddit per-ticker source row above.
+      </p>
+      <div class="roster-grid" id="roster"></div>
+    </div>
+  </div>
+
+  <script>
+    const tierClass = {
+      news: 'pill tier-news',
+      social: 'pill tier-social',
+      filings: 'pill tier-filings',
+      other: 'pill tier-other',
+      high_quality: 'pill tier-filings',
+      general: 'pill tier-news',
+      sector: 'pill tier-other',
+      per_ticker: 'pill tier-news',
+      wsb: 'pill tier-social',
+      penny: 'pill tier-fail',
+    };
+
+    function fmtTs(iso) {
+      if (!iso) return 'never';
+      try {
+        const d = new Date(iso);
+        return d.toLocaleString();
+      } catch (e) {
+        return iso;
+      }
+    }
+
+    function renderSnapshot(s) {
+      document.getElementById('sweep-started').textContent = fmtTs(s.sweep_started_at);
+      document.getElementById('sweep-status').textContent = s.sweep_status || '--';
+      document.getElementById('candidate-count').textContent = s.candidate_count ?? '--';
+
+      const tbody = document.getElementById('sources-body');
+      tbody.innerHTML = '';
+      if (!s.sources || s.sources.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" class="empty">No sweep has run yet.</td></tr>';
+      } else {
+        for (const src of s.sources) {
+          const tr = document.createElement('tr');
+          const statusPill = !src.present
+            ? '<span class="pill pill-idle">not run</span>'
+            : (src.ok ? '<span class="pill pill-ok">ok</span>' : '<span class="pill pill-fail">failed</span>');
+          const tierCls = tierClass[src.tier] || 'pill tier-other';
+          tr.innerHTML = `
+            <td><div class="font-medium">${src.label}</div>
+                <div class="text-gray-500 text-xs font-mono">${src.name}</div></td>
+            <td><span class="${tierCls}">${src.tier}</span></td>
+            <td>${statusPill}</td>
+            <td>${src.present ? src.count : '--'}</td>
+            <td>${src.present ? src.latency_ms.toFixed(0) + ' ms' : '--'}</td>
+          `;
+          tbody.appendChild(tr);
+        }
+      }
+
+      const roster = document.getElementById('roster');
+      roster.innerHTML = '';
+      for (const r of (s.subreddit_roster || [])) {
+        const cell = document.createElement('div');
+        cell.className = 'roster-cell';
+        const tierCls = tierClass[r.tier] || 'pill tier-other';
+        cell.innerHTML = `<span>r/${r.name}</span>
+          <span class="mult">x${r.multiplier.toFixed(2)}</span>`;
+        roster.appendChild(cell);
+      }
+    }
+
+    async function refresh() {
+      try {
+        const r = await fetch('/api/data-sources/snapshot', { cache: 'no-store' });
+        if (r.ok) {
+          renderSnapshot(await r.json());
+        }
+      } catch (e) { /* offline, keep last state */ }
+    }
+
+    refresh();
+    setInterval(refresh, 30000);
+  </script>
+</body>
+</html>

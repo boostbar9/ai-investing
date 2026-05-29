@@ -35,16 +35,34 @@ from packages.agents.reddit_trust.scorer import (
     RedditTrustScorer,
     TrustBreakdown,
 )
+from packages.agents.reddit_trust.subreddit_quality import (
+    DEFAULT_SWEEP_ROSTER,
+    SUBREDDIT_QUALITY,
+    SubredditQuality,
+    fetch_roster,
+    quality_for,
+)
+from packages.agents.reddit_trust.ticker_discovery import (
+    candidate_subreddits,
+    discover_for_tickers,
+)
 
 __all__ = [
+    "DEFAULT_SWEEP_ROSTER",
     "RICH_REDDIT_URL",
+    "SUBREDDIT_QUALITY",
     "CorroborationResult",
     "NewsCorroborationGate",
     "PostTrust",
     "PumpFlag",
     "RedditPost",
     "RedditTrustScorer",
+    "SubredditQuality",
     "TrustBreakdown",
     "TrustHistory",
+    "candidate_subreddits",
+    "discover_for_tickers",
     "fetch_rich_reddit",
+    "fetch_roster",
+    "quality_for",
 ]

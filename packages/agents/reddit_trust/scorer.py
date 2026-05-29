@@ -288,7 +288,24 @@ class RedditTrustScorer:
         penalty = min(0.60, 0.15 * len(pump_flags))
         weight = max(0.0, weight * (1.0 - penalty))
 
+        # Phase 10: subreddit quality multiplier. A great DD on
+        # r/SecurityAnalysis stays at full weight; the same post on
+        # r/pennystocks gets cut roughly in half before the gate sees
+        # it. Applied AFTER pump penalty so a pumped post in a quality
+        # sub still gets penalized once, not twice.
+        from packages.agents.reddit_trust.subreddit_quality import (
+            quality_for,
+        )
+
+        sub_q = quality_for(post.subreddit)
+        weight = max(0.0, weight * sub_q.multiplier)
+
         reasons: list[str] = []
+        if sub_q.multiplier < 0.95:
+            reasons.append(
+                f"subreddit {post.subreddit!r} tier={sub_q.tier} "
+                f"(x{sub_q.multiplier:.2f})"
+            )
         if post.author is None:
             reasons.append("deleted/automod author -- karma & age unknown")
         if hist_n == 0 and post.author:

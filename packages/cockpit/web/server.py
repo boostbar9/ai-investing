@@ -1391,6 +1391,113 @@ def api_research_sweep_run() -> dict[str, Any]:
     return {"ok": True, "status": load_status()}
 
 
+# ---------------------------------------------------------------------------
+# Phase 10: per-source health / contribution dashboard.
+# ---------------------------------------------------------------------------
+
+
+# Stable display order + human-readable labels for each source.
+# Sources not in this map still render at the bottom, alphabetically.
+_SOURCE_DISPLAY: dict[str, dict[str, str]] = {
+    "rss_news":           {"label": "RSS news (Yahoo / MarketWatch / Seeking Alpha)",       "tier": "news"},
+    "yahoo_news":         {"label": "Yahoo Finance per-ticker (news + analyst + insider)",  "tier": "news"},
+    "sec_form4":          {"label": "SEC EDGAR Form 4 (insider transactions)",              "tier": "filings"},
+    "reddit_rich":        {"label": "Reddit (tiered roster: SecurityAnalysis, investing...)","tier": "social"},
+    "reddit_per_ticker":  {"label": "Reddit per-ticker subs (discovered)",                  "tier": "social"},
+    "stocktwits":         {"label": "StockTwits trending",                                  "tier": "social"},
+}
+
+
+@app.get("/data-sources", response_class=HTMLResponse)
+def data_sources_page() -> HTMLResponse:
+    """Phase 10: per-source health + contribution dashboard.
+
+    Renders a static template; the page polls
+    ``/api/data-sources/snapshot`` every 30s for fresh telemetry.
+    """
+    return _render("data_sources.html")
+
+
+@app.get("/api/data-sources/snapshot")
+def api_data_sources_snapshot() -> dict[str, Any]:
+    """Return per-source telemetry from the most recent sweep.
+
+    Shape:
+        {
+            "sources": [
+                {"name": "yahoo_news", "label": "...", "tier": "news",
+                 "ok": bool, "count": int, "latency_ms": float},
+                ...
+            ],
+            "sweep_started_at": iso str | "",
+            "sweep_status": "done" | "failed" | "running" | "",
+            "candidate_count": int,
+            "subreddit_roster": [
+                {"name": str, "tier": str, "multiplier": float},
+                ...
+            ],
+        }
+    """
+    from packages.agents.reddit_trust import (
+        DEFAULT_SWEEP_ROSTER,
+        quality_for,
+    )
+    from packages.agents.research_sweep import load_sweep
+
+    sweep = load_sweep() or {}
+    sources_meta = sweep.get("sources_meta") or {}
+
+    # Build the source list. Use the canonical order from
+    # _SOURCE_DISPLAY; unknown sources tack onto the end.
+    rendered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for key, display in _SOURCE_DISPLAY.items():
+        meta = sources_meta.get(key) or {}
+        rendered.append(
+            {
+                "name": key,
+                "label": display["label"],
+                "tier": display["tier"],
+                "ok": bool(meta.get("ok", False)),
+                "count": int(meta.get("count", 0)),
+                "latency_ms": float(meta.get("latency_ms", 0.0)),
+                "present": bool(meta),
+            }
+        )
+        seen.add(key)
+    for key, meta in sorted(sources_meta.items()):
+        if key in seen:
+            continue
+        rendered.append(
+            {
+                "name": key,
+                "label": key.replace("_", " ").title(),
+                "tier": "other",
+                "ok": bool(meta.get("ok", False)),
+                "count": int(meta.get("count", 0)),
+                "latency_ms": float(meta.get("latency_ms", 0.0)),
+                "present": True,
+            }
+        )
+
+    roster = [
+        {
+            "name": s,
+            "tier": quality_for(s).tier,
+            "multiplier": round(quality_for(s).multiplier, 2),
+        }
+        for s in DEFAULT_SWEEP_ROSTER
+    ]
+
+    return {
+        "sources": rendered,
+        "sweep_started_at": sweep.get("started_at", ""),
+        "sweep_status": sweep.get("status", ""),
+        "candidate_count": len(sweep.get("candidates") or []),
+        "subreddit_roster": roster,
+    }
+
+
 @app.get("/api/ollama/status")
 def api_ollama_status() -> dict[str, Any]:
     """Read-only inventory for the cockpit's Ollama panel.

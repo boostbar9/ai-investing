@@ -111,12 +111,16 @@ def test_apply_trust_portfolio_symbol_always_passes():
 
 def test_apply_trust_high_reddit_trust_passes_without_news():
     """A trusted-author Reddit-only signal must pass the gate -- but
-    the dashboard should see news_headlines=0 so it can warn."""
+    the dashboard should see news_headlines=0 so it can warn.
+
+    Uses r/investing (Phase 10 high-quality tier, multiplier 1.0) so
+    the test isolates author trust from subreddit quality.
+    """
     # Craft a post that scores high: old account, decent karma, clean copy.
     post = {
         "id": "abc",
         "permalink": "/x/",
-        "subreddit": "stocks",
+        "subreddit": "investing",
         "title": "SPY long thesis",
         "selftext": "Steady setup, clear thesis.",
         "author": "vet_trader",
@@ -174,7 +178,7 @@ def test_apply_trust_uses_max_not_mean_trust():
     strong_post = {
         "id": "good",
         "permalink": "/x/",
-        "subreddit": "stocks",
+        "subreddit": "investing",
         "title": "SPY setup",
         "selftext": "",
         "author": "vet",
