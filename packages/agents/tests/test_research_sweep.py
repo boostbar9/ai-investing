@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -450,3 +451,84 @@ def test_candidate_to_dict_serializes_cleanly() -> None:
     encoded = json.dumps(d)
     assert "AAPL" in encoded
     assert "portfolio" in encoded
+
+
+# ---------------------------------------------------------------------------
+# _atomic_write_json Windows-safety: relative-path handling + retry-on-EACCES
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_write_resolves_relative_target_to_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The original Windows bug: caller passed a relative Path; the temp
+    file was created absolute (because tempfile.NamedTemporaryFile
+    resolves ``dir=`` against CWD) and os.replace then failed with
+    'Access is denied' because the two sides looked like different roots
+    once the cockpit's CWD-juggling kicked in. We now resolve() before
+    doing anything so this can never happen again."""
+    monkeypatch.chdir(tmp_path)
+    rel_target = Path("data/cockpit/heartbeat.json")
+    rs_mod._atomic_write_json(rel_target, {"ok": True})
+
+    # File must exist at the *resolved* absolute location.
+    abs_target = (tmp_path / rel_target).resolve()
+    assert abs_target.exists()
+    assert json.loads(abs_target.read_text(encoding="utf-8")) == {"ok": True}
+    # No leftover tmp files in the directory.
+    assert list(abs_target.parent.glob("*.tmp")) == []
+
+
+def test_atomic_write_retries_on_transient_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulate the Windows sharing-violation: ``os.replace`` raises
+    PermissionError once, then succeeds. The retry loop must absorb the
+    transient error and complete normally."""
+    target = tmp_path / "status.json"
+
+    real_replace = os.replace
+    attempts = {"n": 0}
+
+    def flaky_replace(src, dst):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise PermissionError(5, "Access is denied (simulated)")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(rs_mod.os, "replace", flaky_replace)
+    # Tighten the retry cadence so this test stays fast.
+    monkeypatch.setattr(rs_mod, "_REPLACE_RETRY_SLEEP_S", 0.001)
+    monkeypatch.setattr(rs_mod, "_REPLACE_RETRY_BUDGET_S", 0.5)
+
+    rs_mod._atomic_write_json(target, {"v": 42})
+
+    assert attempts["n"] == 2, "second attempt should have succeeded"
+    assert json.loads(target.read_text(encoding="utf-8")) == {"v": 42}
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_atomic_write_gives_up_after_retry_budget_and_cleans_tmp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the destination is held open forever (pathological case), we
+    must eventually raise the PermissionError instead of looping forever.
+    The temp file must be cleaned up so we don't leak tmp* on every
+    failed write."""
+    target = tmp_path / "locked.json"
+
+    def always_denied(src, dst):
+        raise PermissionError(5, "Access is denied (permanent)")
+
+    monkeypatch.setattr(rs_mod.os, "replace", always_denied)
+    monkeypatch.setattr(rs_mod, "_REPLACE_RETRY_SLEEP_S", 0.001)
+    monkeypatch.setattr(rs_mod, "_REPLACE_RETRY_BUDGET_S", 0.01)
+
+    with pytest.raises(PermissionError):
+        rs_mod._atomic_write_json(target, {"v": 1})
+
+    # The destination should NOT exist (we never landed the write).
+    assert not target.exists()
+    # Temp files MUST be cleaned up so we don't leak them on every
+    # failed write. The dashboard polls 1 Hz; even a small leak adds up.
+    assert list(tmp_path.glob("*.tmp")) == []

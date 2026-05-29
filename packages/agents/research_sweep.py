@@ -30,10 +30,12 @@ Design constraints:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -523,18 +525,65 @@ async def run_sweep(
 # ---------------------------------------------------------------------------
 
 
+# How many times to retry os.replace when Windows reports a transient
+# sharing-violation (WinError 5 / 32). The dashboard polls this file
+# every ~1s and Windows can refuse the rename for tens of milliseconds
+# while a reader still holds the destination handle. Half a second of
+# retry budget at 25ms cadence is more than enough.
+_REPLACE_RETRY_BUDGET_S = 0.5
+_REPLACE_RETRY_SLEEP_S = 0.025
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Atomically write JSON to ``path``.
+
+    Both temp and target are resolved to ABSOLUTE paths up-front. Mixing
+    an absolute temp path with a relative target on Windows produced
+    'Access is denied' from os.replace because Windows treats the two
+    sides as different roots when the CWD has changed during the write.
+
+    On Windows the rename is retried for a short window when it fails
+    with WinError 5 (Access denied) or WinError 32 (Sharing violation).
+    Both errors are emitted when another process has the destination
+    open for reading -- which happens constantly here because the
+    cockpit dashboard polls research_sweep_status.json once per second.
+    """
+    target = Path(path).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
-        dir=path.parent,
+        dir=target.parent,
         delete=False,
         suffix=".tmp",
     ) as f:
         json.dump(payload, f, indent=2)
-        tmp_name = f.name
-    os.replace(tmp_name, path)
+        tmp_name = Path(f.name).resolve()
+
+    deadline = time.monotonic() + _REPLACE_RETRY_BUDGET_S
+    last_err: OSError | None = None
+    while True:
+        try:
+            os.replace(tmp_name, target)
+            return
+        except PermissionError as exc:
+            # WinError 5 (ERROR_ACCESS_DENIED) or 32 (ERROR_SHARING_VIOLATION).
+            # Both are transient on Windows when a reader has the
+            # destination open. Retry quietly until our budget runs out.
+            last_err = exc
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(_REPLACE_RETRY_SLEEP_S)
+        except OSError as exc:
+            last_err = exc
+            break
+
+    # Out of retries. Clean up the temp file so we don't leak it on every
+    # failed write, then re-raise the original error so the caller can log it.
+    with contextlib.suppress(OSError):
+        tmp_name.unlink()
+    assert last_err is not None
+    raise last_err
 
 
 def save_sweep(result: SweepResult, path: Path | None = None) -> None:
