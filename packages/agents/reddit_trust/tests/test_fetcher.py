@@ -233,6 +233,184 @@ async def test_skips_post_with_empty_title():
     assert out == []
 
 
+# ---------------------------------------------------------------------------
+# Phase 12: fallback chain (primary 403 -> old.reddit.com / api.reddit.com /
+# RSS) so the corroboration gate has *something* to chew on even when
+# www.reddit.com blanket-403s anonymous JSON.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_falls_back_to_old_reddit_after_primary_403():
+    """Primary www.reddit.com returns 403; old.reddit.com returns 200.
+    We MUST emit the records from the fallback host, not give up."""
+    hits: list[str] = []
+
+    def handler(request):
+        host = request.url.host
+        hits.append(host)
+        if "hot.json" in request.url.path or request.url.path.endswith("/hot"):
+            if host == "www.reddit.com":
+                return httpx.Response(403, text="blocked")
+            # old.reddit.com (or api) serves the payload.
+            return httpx.Response(
+                200,
+                json=_hot_response(
+                    [
+                        {
+                            "id": "old1",
+                            "permalink": "/r/stocks/old1/",
+                            "title": "NVDA rip",
+                            "selftext": "",
+                            "author": "chartmaster",
+                            "score": 99,
+                            "num_comments": 12,
+                            "upvote_ratio": 0.88,
+                            "created_utc": 1_700_000_500.0,
+                        }
+                    ]
+                ),
+            )
+        if "about.json" in request.url.path:
+            return httpx.Response(
+                200,
+                json=_about_response(
+                    created_utc=1_500_000_000.0, total_karma=12_000
+                ),
+            )
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    try:
+        out = await fetch_rich_reddit("stocks", client=client)
+    finally:
+        await client.aclose()
+
+    assert len(out) == 1
+    assert out[0]["id"] == "old1"
+    assert out[0]["author"] == "chartmaster"
+    assert out[0]["author_karma"] == 12_000
+    # We must have tried www.reddit.com FIRST, then fallen through.
+    assert hits[0] == "www.reddit.com"
+    assert "old.reddit.com" in hits, f"expected old.reddit.com fallback, hits={hits!r}"
+
+
+@pytest.mark.asyncio
+async def test_falls_back_to_rss_when_all_json_hosts_403():
+    """Every JSON host (primary + both fallbacks) returns 403. The
+    fetcher MUST switch to the RSS feed and emit a reduced-fidelity
+    record so the corroboration gate is not starved."""
+    rss_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<feed xmlns="http://www.w3.org/2005/Atom">'
+        "<entry>"
+        "<id>t3_abc</id>"
+        '<link href="https://www.reddit.com/r/stocks/comments/abc/spy_breakout/"/>'
+        "<title>SPY breakout incoming</title>"
+        '<content type="html">long thesis on SPY</content>'
+        "<author><name>/u/rss_trader</name></author>"
+        "</entry>"
+        "</feed>"
+    )
+
+    def handler(request):
+        if request.url.path.endswith(".rss"):
+            return httpx.Response(
+                200,
+                text=rss_xml,
+                headers={"content-type": "application/atom+xml"},
+            )
+        if "hot.json" in request.url.path or request.url.path.endswith("/hot"):
+            return httpx.Response(403, text="blocked everywhere")
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    try:
+        out = await fetch_rich_reddit("stocks", client=client)
+    finally:
+        await client.aclose()
+
+    assert len(out) == 1
+    r = out[0]
+    assert r["title"] == "SPY breakout incoming"
+    assert r["author"] == "rss_trader"
+    # RSS path: karma/score must be neutral defaults.
+    assert r["author_karma"] is None
+    assert r["score"] == 0
+    assert r["upvote_ratio"] is None
+    assert "SPY" in r["tickers"]
+
+
+@pytest.mark.asyncio
+async def test_returns_empty_when_all_hosts_and_rss_fail():
+    """If even the RSS endpoint is 403, we must return [] rather than
+    raising or returning garbage."""
+
+    def handler(request):
+        return httpx.Response(403, text="blocked")
+
+    client = _make_client(handler)
+    try:
+        out = await fetch_rich_reddit("stocks", client=client)
+    finally:
+        await client.aclose()
+    assert out == []
+
+
+def test_parse_rss_to_records_skips_empty_titles():
+    """Unit test for the RSS parser: a feed with title-less entries
+    must drop them silently (same contract as the JSON path)."""
+    from packages.agents.reddit_trust.fetcher import _parse_rss_to_records
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<feed xmlns="http://www.w3.org/2005/Atom">'
+        "<entry>"
+        "<id>t3_x</id><title></title>"
+        "<author><name>/u/ghost</name></author>"
+        "</entry>"
+        "<entry>"
+        "<id>t3_y</id><title>AAPL discussion</title>"
+        "<author><name>/u/active_trader</name></author>"
+        "</entry>"
+        "</feed>"
+    )
+    out = _parse_rss_to_records(xml, "stocks", limit=10)
+    assert len(out) == 1
+    assert out[0]["title"] == "AAPL discussion"
+    assert out[0]["author"] == "active_trader"
+
+
+def test_parse_rss_strips_deleted_and_automoderator_authors():
+    from packages.agents.reddit_trust.fetcher import _parse_rss_to_records
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<feed xmlns="http://www.w3.org/2005/Atom">'
+        "<entry><id>t3_a</id><title>p1</title>"
+        "<author><name>/u/[deleted]</name></author></entry>"
+        "<entry><id>t3_b</id><title>p2</title>"
+        "<author><name>/u/AutoModerator</name></author></entry>"
+        "<entry><id>t3_c</id><title>p3</title>"
+        "<author><name>/u/real_user</name></author></entry>"
+        "</feed>"
+    )
+    out = _parse_rss_to_records(xml, "stocks", limit=10)
+    assert len(out) == 3
+    authors = [r["author"] for r in out]
+    # [deleted] and AutoModerator are normalised to None; real users survive.
+    assert authors[0] is None
+    assert authors[1] is None
+    assert authors[2] == "real_user"
+
+
+def test_parse_rss_handles_malformed_xml_gracefully():
+    from packages.agents.reddit_trust.fetcher import _parse_rss_to_records
+
+    out = _parse_rss_to_records("<this is not valid xml", "stocks", limit=10)
+    assert out == []
+
+
 @pytest.mark.asyncio
 async def test_author_meta_fetch_partial_failure_does_not_break_post():
     """If /about.json is broken, the post should still come back -- just

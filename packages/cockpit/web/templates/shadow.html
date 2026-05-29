@@ -161,7 +161,17 @@
 
     <!-- Per-cycle decisions -->
     <div class="panel">
-      <h2 class="text-lg font-semibold mb-3">Per-cycle Decisions (last 25)</h2>
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-lg font-semibold">Per-cycle Decisions (last 25)</h2>
+        <div class="flex items-center gap-2">
+          <span id="force-cycle-status" class="text-xs text-gray-400"></span>
+          <button id="force-cycle-btn"
+                  class="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm font-medium"
+                  title="Run one paper-trade cycle now (dry-run, no live orders)">
+            Run one cycle now
+          </button>
+        </div>
+      </div>
       <div id="decisions-container">
         <div class="empty">Loading...</div>
       </div>
@@ -474,6 +484,53 @@
       loadPipeline();
       loadDecisions();
     }
+
+    // Force-cycle button: triggers one paper-trade cycle synchronously,
+    // then refreshes all panels so the new decision row appears immediately.
+    // Defaults to dry_run=true so this can never accidentally fire a live order.
+    async function forceCycle() {
+      const btn = document.getElementById("force-cycle-btn");
+      const status = document.getElementById("force-cycle-status");
+      if (!btn) return;
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "Running...";
+      status.textContent = "";
+      status.className = "text-xs text-gray-400";
+      try {
+        const res = await Cockpit.api.post(
+          "/api/shadow/force-cycle?strategy=ensemble&dry_run=true",
+          null
+        );
+        if (!res.ok) {
+          status.textContent = res.error || "cycle failed";
+          status.className = "text-xs text-red-400";
+        } else if (res.halted) {
+          const reasons = (res.reasons || []).join(", ") || "unknown";
+          status.textContent = `halted: ${reasons}`;
+          status.className = "text-xs text-yellow-400";
+        } else {
+          status.textContent = `ok \u2014 planned ${res.planned}, submitted ${res.submitted}`;
+          status.className = "text-xs text-green-400";
+        }
+        // Always refresh so even halted cycles show up as a new row.
+        refresh();
+      } catch (e) {
+        status.textContent = String(e.message || e);
+        status.className = "text-xs text-red-400";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+        // Clear status after 10s so it doesn't linger forever.
+        setTimeout(() => {
+          if (status.textContent && !btn.disabled) {
+            status.textContent = "";
+          }
+        }, 10000);
+      }
+    }
+    document.getElementById("force-cycle-btn").addEventListener("click", forceCycle);
+
     refresh();
     setInterval(refresh, 30000);
   </script>

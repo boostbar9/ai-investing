@@ -337,3 +337,153 @@ def test_api_promote_clears_shadow_gate_when_ready(isolated_shadow) -> None:
     assert payload["progress"]["shadow_ready"] is True
     reasons = [str(r).lower() for r in payload["readiness"]["reasons"]]
     assert not any("shadow soak" in r for r in reasons)
+
+
+# ---------------------------------------------------------------------------
+# Phase 12: /api/shadow/force-cycle -- the "Run one cycle now" button on the
+# /shadow page POSTs here so the user can trigger a paper-trade cycle without
+# waiting for the background loop.
+# ---------------------------------------------------------------------------
+
+
+def test_force_cycle_runs_paper_cycle_and_returns_summary(monkeypatch) -> None:
+    """Happy path: the endpoint imports tools.paper_trade.run, awaits it,
+    and returns the shaped summary the dashboard renders."""
+    import sys
+    import types
+
+    called: dict[str, object] = {}
+
+    async def fake_run(strategy_name: str, *, dry_run: bool = False, **_kw):
+        called["strategy"] = strategy_name
+        called["dry_run"] = dry_run
+        return {
+            "ts": "2026-05-29T15:00:00+00:00",
+            "halted": False,
+            "reasons": [],
+            "orders_planned": 3,
+            "orders_submitted": 0,
+            "account_equity": 100_001.23,
+        }
+
+    # Inject a stub tools.paper_trade module so the endpoint's lazy
+    # import sees our fake_run. Save+restore so we don't leak across
+    # tests in the same session.
+    fake_mod = types.ModuleType("tools.paper_trade")
+    fake_mod.run = fake_run  # type: ignore[attr-defined]
+    saved = sys.modules.get("tools.paper_trade")
+    sys.modules["tools.paper_trade"] = fake_mod
+    try:
+        client = TestClient(srv.app)
+        r = client.post("/api/shadow/force-cycle?strategy=ensemble&dry_run=true")
+    finally:
+        if saved is not None:
+            sys.modules["tools.paper_trade"] = saved
+        else:
+            sys.modules.pop("tools.paper_trade", None)
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["strategy"] == "ensemble"
+    assert body["dry_run"] is True
+    assert body["halted"] is False
+    assert body["planned"] == 3
+    assert body["submitted"] == 0
+    assert body["equity"] == pytest.approx(100_001.23)
+    assert called == {"strategy": "ensemble", "dry_run": True}
+
+
+def test_force_cycle_reports_halted_cycle(monkeypatch) -> None:
+    """When the paper_trade cycle halts (e.g. kill-switch tripped), the
+    endpoint must still return ok=True with halted=True + reasons so the
+    dashboard can render the yellow status."""
+    import sys
+    import types
+
+    async def fake_run(strategy_name: str, *, dry_run: bool = False, **_kw):
+        return {
+            "ts": "2026-05-29T15:01:00+00:00",
+            "halted": True,
+            "reasons": ["kill switch: SPY drawdown -3.2%"],
+            "orders_planned": 0,
+            "orders_submitted": 0,
+            "account_equity": 99_000.0,
+        }
+
+    fake_mod = types.ModuleType("tools.paper_trade")
+    fake_mod.run = fake_run  # type: ignore[attr-defined]
+    saved = sys.modules.get("tools.paper_trade")
+    sys.modules["tools.paper_trade"] = fake_mod
+    try:
+        client = TestClient(srv.app)
+        r = client.post("/api/shadow/force-cycle")
+    finally:
+        if saved is not None:
+            sys.modules["tools.paper_trade"] = saved
+        else:
+            sys.modules.pop("tools.paper_trade", None)
+
+    body = r.json()
+    assert r.status_code == 200
+    assert body["ok"] is True
+    assert body["halted"] is True
+    assert "kill switch: SPY drawdown -3.2%" in body["reasons"]
+
+
+def test_force_cycle_catches_paper_trade_exceptions(monkeypatch) -> None:
+    """If the paper-trade cycle blows up, the endpoint MUST return
+    ok=False with a readable error -- never a 500. The dashboard
+    surfaces this inline next to the button."""
+    import sys
+    import types
+
+    async def fake_run(strategy_name: str, *, dry_run: bool = False, **_kw):
+        raise RuntimeError("alpaca down")
+
+    fake_mod = types.ModuleType("tools.paper_trade")
+    fake_mod.run = fake_run  # type: ignore[attr-defined]
+    saved = sys.modules.get("tools.paper_trade")
+    sys.modules["tools.paper_trade"] = fake_mod
+    try:
+        client = TestClient(srv.app)
+        r = client.post("/api/shadow/force-cycle")
+    finally:
+        if saved is not None:
+            sys.modules["tools.paper_trade"] = saved
+        else:
+            sys.modules.pop("tools.paper_trade", None)
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "RuntimeError" in body["error"]
+    assert "alpaca down" in body["error"]
+
+
+def test_force_cycle_single_flight_lock() -> None:
+    """If a cycle is already in flight, a second request must bail with a
+    friendly error rather than running a second concurrent cycle. We
+    simulate this by acquiring the module lock directly."""
+    import asyncio
+
+    async def _acquire_then_call() -> tuple[int, dict]:
+        async with srv._FORCE_CYCLE_LOCK:
+            client = TestClient(srv.app)
+            r = client.post("/api/shadow/force-cycle")
+            return r.status_code, r.json()
+
+    status, body = asyncio.run(_acquire_then_call())
+    assert status == 200
+    assert body["ok"] is False
+    assert "already running" in body["error"].lower()
+
+
+def test_shadow_page_contains_force_cycle_button() -> None:
+    """The /shadow template must render the "Run one cycle now" button so
+    the endpoint above is actually reachable from the dashboard."""
+    client = TestClient(srv.app)
+    body = client.get("/shadow").text
+    assert "force-cycle-btn" in body
+    assert "Run one cycle now" in body
+    assert "/api/shadow/force-cycle" in body

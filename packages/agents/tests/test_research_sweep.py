@@ -508,13 +508,17 @@ def test_atomic_write_retries_on_transient_permission_error(
     assert list(tmp_path.glob("*.tmp")) == []
 
 
-def test_atomic_write_gives_up_after_retry_budget_and_cleans_tmp(
+def test_atomic_write_falls_back_to_direct_write_after_exhaustion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If the destination is held open forever (pathological case), we
-    must eventually raise the PermissionError instead of looping forever.
-    The temp file must be cleaned up so we don't leak tmp* on every
-    failed write."""
+    """If the destination is held open forever (pathological case), all
+    outer retry attempts will exhaust. Phase 12 added a direct-write
+    fallback so the background sweep no longer crashes -- the write
+    still lands (non-atomically) and the next successful atomic write
+    self-heals any torn dashboard read.
+
+    We must NOT raise PermissionError up to the caller, and we must
+    clean up every temp file we created."""
     target = tmp_path / "locked.json"
 
     def always_denied(src, dst):
@@ -523,12 +527,50 @@ def test_atomic_write_gives_up_after_retry_budget_and_cleans_tmp(
     monkeypatch.setattr(rs_mod.os, "replace", always_denied)
     monkeypatch.setattr(rs_mod, "_REPLACE_RETRY_SLEEP_S", 0.001)
     monkeypatch.setattr(rs_mod, "_REPLACE_RETRY_BUDGET_S", 0.01)
+    monkeypatch.setattr(rs_mod, "_OUTER_ATTEMPTS", 3)
 
-    with pytest.raises(PermissionError):
-        rs_mod._atomic_write_json(target, {"v": 1})
+    rs_mod._atomic_write_json(target, {"v": 1})
 
-    # The destination should NOT exist (we never landed the write).
-    assert not target.exists()
-    # Temp files MUST be cleaned up so we don't leak them on every
-    # failed write. The dashboard polls 1 Hz; even a small leak adds up.
+    # Direct-write fallback: the destination MUST exist with the payload.
+    assert target.exists()
+    assert json.loads(target.read_text(encoding="utf-8")) == {"v": 1}
+    # Temp files from every outer attempt MUST be cleaned up so we don't
+    # leak them on every failed write. The dashboard polls 1 Hz.
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_atomic_write_outer_retry_rolls_fresh_tmp_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 12 fix: when os.replace keeps failing on a specific tmp
+    name (the AV-lock pattern), the next outer attempt MUST use a
+    different tmp filename. Verify by capturing the tmp name on each
+    os.replace call -- they should all differ."""
+    target = tmp_path / "av_locked.json"
+    seen_srcs: list[str] = []
+    real_replace = os.replace
+
+    def deny_on_first_two_unique_tmps(src, dst):
+        seen_srcs.append(str(src))
+        unique = len(set(seen_srcs))
+        # Deny until we've seen at least three distinct tmp names. That
+        # forces the outer loop to roll new tmp files past attempt 1 and 2.
+        if unique < 3:
+            raise PermissionError(5, "Access is denied (simulated AV)")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(rs_mod.os, "replace", deny_on_first_two_unique_tmps)
+    monkeypatch.setattr(rs_mod, "_REPLACE_RETRY_SLEEP_S", 0.0)
+    monkeypatch.setattr(rs_mod, "_REPLACE_RETRY_BUDGET_S", 0.005)
+    monkeypatch.setattr(rs_mod, "_OUTER_ATTEMPTS", 3)
+
+    rs_mod._atomic_write_json(target, {"v": 7})
+
+    assert target.exists()
+    assert json.loads(target.read_text(encoding="utf-8")) == {"v": 7}
+    # Across the three outer attempts we should have seen at least 3
+    # *distinct* source tmp names -- the whole point of the fix.
+    unique_srcs = set(seen_srcs)
+    assert len(unique_srcs) >= 3, f"expected fresh tmp per outer attempt, got {unique_srcs!r}"
+    # No leaked temp files.
     assert list(tmp_path.glob("*.tmp")) == []

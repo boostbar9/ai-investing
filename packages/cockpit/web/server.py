@@ -576,6 +576,52 @@ def api_shadow_window() -> dict[str, Any]:
     return window_status(target_days=14)
 
 
+# Phase 12: manual one-shot cycle trigger. Lets the user click a button
+# on /shadow and immediately see a new decision row appear in the table.
+# Default strategy = 'ensemble' (the same one tools/boot.py drives in the
+# background) and dry_run=True so this never accidentally sends a live
+# order from the dashboard.
+_FORCE_CYCLE_LOCK = asyncio.Lock()
+
+
+@app.post("/api/shadow/force-cycle")
+async def api_shadow_force_cycle(
+    strategy: str = "ensemble",
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Run one paper-trade cycle synchronously and return the record.
+
+    Single-flight via a module-level lock so a user mashing the button
+    doesn't kick off overlapping cycles. The response includes the new
+    decision_id so the page can highlight the row that just appeared.
+    """
+    if _FORCE_CYCLE_LOCK.locked():
+        return {
+            "ok": False,
+            "error": "a cycle is already running; try again in a few seconds",
+        }
+    async with _FORCE_CYCLE_LOCK:
+        try:
+            from tools.paper_trade import run as run_cycle
+        except ImportError as exc:
+            return {"ok": False, "error": f"paper_trade unavailable: {exc}"}
+        try:
+            record = await run_cycle(strategy, dry_run=bool(dry_run))
+        except Exception as exc:
+            return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+        return {
+            "ok": True,
+            "strategy": strategy,
+            "dry_run": bool(dry_run),
+            "halted": bool(record.get("halted")),
+            "reasons": list(record.get("reasons", []) or []),
+            "planned": int(record.get("orders_planned", 0) or 0),
+            "submitted": int(record.get("orders_submitted", 0) or 0),
+            "equity": float(record.get("account_equity", 0) or 0),
+            "ts": record.get("ts"),
+        }
+
+
 @app.get("/health", response_class=HTMLResponse)
 def health_page() -> HTMLResponse:
     return _render("health.html")

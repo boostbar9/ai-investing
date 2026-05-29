@@ -853,13 +853,28 @@ async def run_sweep(
 # ---------------------------------------------------------------------------
 
 
-# How many times to retry os.replace when Windows reports a transient
-# sharing-violation (WinError 5 / 32). The dashboard polls this file
-# every ~1s and Windows can refuse the rename for tens of milliseconds
-# while a reader still holds the destination handle. Half a second of
-# retry budget at 25ms cadence is more than enough.
-_REPLACE_RETRY_BUDGET_S = 0.5
+# Windows-safety knobs for the atomic write helper.
+#
+# Two-tier retry strategy:
+#
+#   1. Inner: retry os.replace() at 25ms cadence for ~1.5s. Handles the
+#      common case where the dashboard's 1s poll holds a brief read
+#      handle on the destination.
+#
+#   2. Outer: if the inner budget is exhausted, throw away the temp file
+#      and try the WHOLE sequence again with a fresh temp name. This is
+#      the fix for the lingering WinError 5 crashes -- on Windows, Defender
+#      and other AV scanners hold a handle to the *source* temp file for
+#      hundreds of ms after creation, and os.replace cannot rename a file
+#      that is still being scanned. The fresh-temp retry cycles past any
+#      lock that is scoped to a specific path.
+#
+# Final fallback: if all outer attempts fail, write directly to the
+# destination (non-atomic, but tolerable for a polled heartbeat -- the
+# next successful write fixes any torn read on the dashboard's next poll).
+_REPLACE_RETRY_BUDGET_S = 1.5
 _REPLACE_RETRY_SLEEP_S = 0.025
+_OUTER_ATTEMPTS = 3
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -873,45 +888,71 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     On Windows the rename is retried for a short window when it fails
     with WinError 5 (Access denied) or WinError 32 (Sharing violation).
     Both errors are emitted when another process has the destination
-    open for reading -- which happens constantly here because the
-    cockpit dashboard polls research_sweep_status.json once per second.
+    open for reading -- or when AV is scanning the source temp file.
+    See the constants above for the two-tier retry strategy.
     """
     target = Path(path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=target.parent,
-        delete=False,
-        suffix=".tmp",
-    ) as f:
-        json.dump(payload, f, indent=2)
-        tmp_name = Path(f.name).resolve()
 
-    deadline = time.monotonic() + _REPLACE_RETRY_BUDGET_S
     last_err: OSError | None = None
-    while True:
-        try:
-            os.replace(tmp_name, target)
-            return
-        except PermissionError as exc:
-            # WinError 5 (ERROR_ACCESS_DENIED) or 32 (ERROR_SHARING_VIOLATION).
-            # Both are transient on Windows when a reader has the
-            # destination open. Retry quietly until our budget runs out.
-            last_err = exc
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(_REPLACE_RETRY_SLEEP_S)
-        except OSError as exc:
-            last_err = exc
-            break
+    for attempt in range(_OUTER_ATTEMPTS):
+        # Fresh temp file each outer attempt -- key insight: if AV is
+        # scanning a specific tmpXXXXXXX.tmp filename, we have to pick a
+        # *different* filename to escape the lock.
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            delete=False,
+            suffix=".tmp",
+        ) as f:
+            json.dump(payload, f, indent=2)
+            tmp_name = Path(f.name).resolve()
 
-    # Out of retries. Clean up the temp file so we don't leak it on every
-    # failed write, then re-raise the original error so the caller can log it.
-    with contextlib.suppress(OSError):
-        tmp_name.unlink()
-    assert last_err is not None
-    raise last_err
+        deadline = time.monotonic() + _REPLACE_RETRY_BUDGET_S
+        replaced = False
+        while True:
+            try:
+                os.replace(tmp_name, target)
+                replaced = True
+                break
+            except PermissionError as exc:
+                # WinError 5 / 32: transient on Windows. Retry quietly.
+                last_err = exc
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(_REPLACE_RETRY_SLEEP_S)
+            except OSError as exc:
+                last_err = exc
+                break
+
+        if replaced:
+            return
+
+        # Clean up this attempt's temp file before re-rolling.
+        with contextlib.suppress(OSError):
+            tmp_name.unlink()
+
+        if attempt < _OUTER_ATTEMPTS - 1:
+            # Brief gap so any AV scan window can drain before we try again.
+            time.sleep(_REPLACE_RETRY_SLEEP_S * 4)
+
+    # All outer attempts exhausted. Fall back to a direct (non-atomic)
+    # write. This can cause a single torn read on the dashboard, but the
+    # next successful write self-heals -- and crucially, the background
+    # sweep no longer crashes. Log loudly so we still know if AV is
+    # actually getting in the way.
+    logger.warning(
+        "atomic write to %s exhausted retries (%s); falling back to direct write",
+        target,
+        last_err.__class__.__name__ if last_err else "unknown",
+    )
+    try:
+        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as exc:
+        # Genuine I/O failure -- propagate so the caller's defensive
+        # except-block can log it. We've done our best.
+        raise exc from last_err
 
 
 def save_sweep(result: SweepResult, path: Path | None = None) -> None:
