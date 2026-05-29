@@ -13,6 +13,7 @@
     .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
     .pill-shadow { background: #1e293b; color: #cbd5e1; border: 1px solid #334155; }
     .pill-ready { background: #064e3b; color: #6ee7b7; border: 1px solid #10b981; }
+    .pill-sim { background: #1e3a8a; color: #93c5fd; border: 1px solid #3b82f6; }
     .stat { display: flex; flex-direction: column; gap: 4px; }
     .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #94a3b8; }
     .stat-value { font-size: 24px; font-weight: 600; color: #f1f5f9; font-variant-numeric: tabular-nums; }
@@ -28,6 +29,28 @@
     .pnl-neg { color: #f87171; }
     .pnl-flat { color: #94a3b8; }
     .empty { padding: 32px; text-align: center; color: #64748b; font-style: italic; }
+
+    /* 14-day calendar grid */
+    .cal-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; }
+    .cal-cell { padding: 8px; border-radius: 6px; background: #111827; border: 1px solid #1f2937; min-height: 64px; }
+    .cal-cell.active { border-color: #10b981; background: #064e3b22; }
+    .cal-cell.halted { border-color: #f87171; background: #7f1d1d22; }
+    .cal-cell.future { opacity: .4; }
+    .cal-cell.today { box-shadow: 0 0 0 2px #2563eb inset; }
+    .cal-date { font-size: 10px; color: #94a3b8; letter-spacing: .04em; text-transform: uppercase; }
+    .cal-cycles { font-size: 16px; font-weight: 600; color: #e2e8f0; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .cal-meta { font-size: 10px; color: #64748b; margin-top: 2px; }
+
+    /* candidate funnel */
+    .funnel-row { display: grid; grid-template-columns: 220px 1fr 80px; align-items: center; gap: 12px; margin-bottom: 8px; }
+    .funnel-stage { font-size: 12px; color: #cbd5e1; text-transform: capitalize; }
+    .funnel-bar-bg { background: #1f2937; height: 18px; border-radius: 4px; overflow: hidden; }
+    .funnel-bar-fill { height: 100%; background: linear-gradient(90deg, #2563eb, #10b981); transition: width .4s ease; }
+    .funnel-count { font-size: 13px; color: #e2e8f0; text-align: right; font-variant-numeric: tabular-nums; }
+    .funnel-sample { font-size: 10px; color: #64748b; margin-left: 220px; margin-bottom: 8px; margin-top: -4px; font-family: ui-monospace, monospace; }
+
+    /* equity curve */
+    #equity-chart { width: 100%; height: 200px; }
   </style>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
@@ -39,7 +62,7 @@
     <div id="cockpit-topbar"></div>
   </div></div>
 
-  <div class="max-w-5xl mx-auto p-6">
+  <div class="max-w-6xl mx-auto p-6">
     <nav class="nav flex items-center gap-1 mb-4 text-sm">
       <a href="/" class="nav-link">Dashboard</a>
       <a href="/trading" class="nav-link">Trading</a>
@@ -54,18 +77,20 @@
 
     <h1 class="text-2xl font-semibold mb-2">Shadow Trading</h1>
     <p class="text-gray-400 text-sm mb-6">
-      Predicted-vs-actual reconciliation for shadow-mode orders.
+      Decision instrumentation + simulated PnL for the paper-trade loop.
       The system auto-greenlights for live capital after
       <span class="font-mono" id="days-required">14</span>
       consecutive non-negative days.
     </p>
 
+    <!-- Status + headline metrics -->
     <div class="panel">
       <div class="flex items-start justify-between gap-6 flex-wrap">
         <div>
           <div class="stat-label">Status</div>
           <div class="mt-2" id="status-pill-container">
             <span class="pill pill-shadow" id="status-pill">SHADOW</span>
+            <span class="pill pill-sim ml-2" id="sim-pill" style="display:none;">SIMULATED</span>
           </div>
           <div class="mt-3 text-sm text-gray-400" id="status-reason">Loading...</div>
         </div>
@@ -83,10 +108,50 @@
         <div class="stat">
           <div class="stat-label">Round trips</div>
           <div class="stat-value" id="round-trips">0</div>
+          <div class="text-xs text-gray-500" id="round-trips-meta">&nbsp;</div>
         </div>
       </div>
     </div>
 
+    <!-- 14-day window calendar -->
+    <div class="panel">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-lg font-semibold">14-day Window Progress</h2>
+        <div class="text-xs text-gray-400" id="window-meta">Loading...</div>
+      </div>
+      <div id="window-grid">
+        <div class="empty">Loading...</div>
+      </div>
+      <div class="text-xs text-gray-500 mt-3">
+        <span class="inline-block w-3 h-3 rounded bg-green-900 border border-green-500 align-middle mr-1"></span> cycles ran &nbsp;
+        <span class="inline-block w-3 h-3 rounded bg-red-900 border border-red-500 align-middle mr-1"></span> halt(s) &nbsp;
+        <span class="inline-block w-3 h-3 rounded bg-gray-800 border border-gray-700 align-middle mr-1"></span> idle &nbsp;
+        <span class="inline-block w-3 h-3 rounded bg-blue-900 border border-blue-600 align-middle mr-1"></span> today
+      </div>
+    </div>
+
+    <!-- Candidate funnel (24h) -->
+    <div class="panel">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-lg font-semibold">Candidate Pipeline (24h)</h2>
+        <div class="text-xs text-gray-400" id="pipeline-meta">&nbsp;</div>
+      </div>
+      <div id="funnel-container">
+        <div class="empty">Loading...</div>
+      </div>
+      <div id="halt-summary" class="mt-3 text-xs text-gray-500"></div>
+    </div>
+
+    <!-- Simulated PnL equity curve -->
+    <div class="panel">
+      <h2 class="text-lg font-semibold mb-3">Simulated Equity Curve</h2>
+      <canvas id="equity-chart"></canvas>
+      <div class="text-xs text-gray-500 mt-2" id="equity-meta">
+        PnL is simulated from planned orders at last-known prices. Once live orders flow, real fills override.
+      </div>
+    </div>
+
+    <!-- Daily PnL -->
     <div class="panel">
       <h2 class="text-lg font-semibold mb-3">Daily PnL</h2>
       <div id="daily-container">
@@ -94,6 +159,15 @@
       </div>
     </div>
 
+    <!-- Per-cycle decisions -->
+    <div class="panel">
+      <h2 class="text-lg font-semibold mb-3">Per-cycle Decisions (last 25)</h2>
+      <div id="decisions-container">
+        <div class="empty">Loading...</div>
+      </div>
+    </div>
+
+    <!-- Predicted vs Actual -->
     <div class="panel">
       <h2 class="text-lg font-semibold mb-3">Predicted vs Actual</h2>
       <div id="pva-container">
@@ -113,6 +187,12 @@
       if (v < 0) return "pnl-neg";
       return "pnl-flat";
     }
+    function escapeHtml(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+
     async function loadShadow() {
       try {
         const data = await Cockpit.api.get("/api/shadow/snapshot");
@@ -122,7 +202,11 @@
         pill.textContent = status.toUpperCase();
         pill.className = "pill " + (status === "ready" ? "pill-ready" : "pill-shadow");
 
-        document.getElementById("status-reason").textContent = (gl.reasons || []).join(" · ") || "—";
+        const nSynth = data.n_synthetic || 0;
+        const simPill = document.getElementById("sim-pill");
+        simPill.style.display = nSynth > 0 ? "inline-block" : "none";
+
+        document.getElementById("status-reason").textContent = (gl.reasons || []).join(" \u00B7 ") || "\u2014";
         document.getElementById("streak-days").textContent = gl.streak_days || 0;
         document.getElementById("streak-required").textContent = data.days_required || 14;
         document.getElementById("days-required").textContent = data.days_required || 14;
@@ -134,12 +218,225 @@
         totalEl.textContent = fmtMoney(total);
         totalEl.className = "stat-value " + (total > 0 ? "positive" : total < 0 ? "negative" : "");
         document.getElementById("round-trips").textContent = data.n_round_trips || 0;
+        document.getElementById("round-trips-meta").textContent =
+          nSynth > 0 ? `(${nSynth} simulated)` : "\u00A0";
 
+        renderEquity(data.equity_curve || []);
         renderDaily(data.daily || []);
         renderPva(data.predicted_vs_actual || []);
       } catch (e) {
         document.getElementById("status-reason").textContent = "Error loading: " + e.message;
       }
+    }
+
+    async function loadWindow() {
+      try {
+        const w = await Cockpit.api.get("/api/shadow/window");
+        renderWindow(w);
+      } catch (e) {
+        document.getElementById("window-grid").innerHTML =
+          '<div class="empty">Error loading: ' + escapeHtml(e.message) + '</div>';
+      }
+    }
+
+    async function loadPipeline() {
+      try {
+        const p = await Cockpit.api.get("/api/shadow/pipeline");
+        renderPipeline(p);
+      } catch (e) {
+        document.getElementById("funnel-container").innerHTML =
+          '<div class="empty">Error loading: ' + escapeHtml(e.message) + '</div>';
+      }
+    }
+
+    async function loadDecisions() {
+      try {
+        const d = await Cockpit.api.get("/api/shadow/decisions?limit=25");
+        renderDecisions(d.decisions || []);
+      } catch (e) {
+        document.getElementById("decisions-container").innerHTML =
+          '<div class="empty">Error loading: ' + escapeHtml(e.message) + '</div>';
+      }
+    }
+
+    function renderWindow(w) {
+      const meta = document.getElementById("window-meta");
+      meta.textContent =
+        `day ${w.days_elapsed || 0} of ${w.target_days || 14}` +
+        ` \u00B7 ${w.days_with_activity || 0} active days` +
+        ` \u00B7 ${w.days_remaining || 0} remaining`;
+      const wrap = document.getElementById("window-grid");
+      const grid = w.grid || [];
+      if (!grid.length) {
+        wrap.innerHTML = '<div class="empty">No paper-cycle activity yet. Start the loop from /trading.</div>';
+        return;
+      }
+      const today = w.today;
+      let html = '<div class="cal-grid">';
+      for (const cell of grid) {
+        const classes = ["cal-cell"];
+        if (cell.is_future) classes.push("future");
+        if (cell.day === today) classes.push("today");
+        if (cell.halted > 0) classes.push("halted");
+        else if (cell.cycles > 0) classes.push("active");
+        const short = cell.day.slice(5); // MM-DD
+        const meta = cell.submitted > 0
+          ? `${cell.submitted} ord`
+          : cell.halted > 0
+            ? `${cell.halted} halt`
+            : cell.errors > 0
+              ? `${cell.errors} err`
+              : "\u2014";
+        html += `<div class="${classes.join(" ")}" title="${escapeHtml(cell.day)}">`;
+        html += `<div class="cal-date">${escapeHtml(short)}</div>`;
+        html += `<div class="cal-cycles">${cell.cycles}</div>`;
+        html += `<div class="cal-meta">${escapeHtml(meta)}</div>`;
+        html += `</div>`;
+      }
+      html += "</div>";
+      wrap.innerHTML = html;
+    }
+
+    function renderPipeline(p) {
+      const wrap = document.getElementById("funnel-container");
+      const stages = p.stages || [];
+      const haltsBlock = document.getElementById("halt-summary");
+      const meta = document.getElementById("pipeline-meta");
+      meta.textContent = `${p.n_cycles || 0} cycle(s) in window`;
+      if (!stages.length) {
+        wrap.innerHTML = '<div class="empty">No decision cycles logged yet.</div>';
+        haltsBlock.innerHTML = "";
+        return;
+      }
+      const max = Math.max(1, ...stages.map(s => s.total || 0));
+      let html = "";
+      for (const s of stages) {
+        const pct = ((s.total || 0) / max) * 100;
+        const stageLabel = s.name.replace(/_/g, " ");
+        html += `<div class="funnel-row">`;
+        html += `  <div class="funnel-stage">${escapeHtml(stageLabel)}</div>`;
+        html += `  <div class="funnel-bar-bg"><div class="funnel-bar-fill" style="width:${pct}%"></div></div>`;
+        html += `  <div class="funnel-count">${s.total || 0} <span class="text-gray-500">(${s.avg_per_cycle || 0}/cyc)</span></div>`;
+        html += `</div>`;
+        if (s.sample_symbols && s.sample_symbols.length) {
+          html += `<div class="funnel-sample">${escapeHtml(s.sample_symbols.join(", "))}</div>`;
+        }
+      }
+      wrap.innerHTML = html;
+      const halts = p.halts || {};
+      const keys = Object.keys(halts);
+      if (!keys.length) {
+        haltsBlock.innerHTML = "";
+      } else {
+        const parts = keys.map(k => `<span class="pnl-neg">${escapeHtml(k)}</span> (${halts[k]})`);
+        haltsBlock.innerHTML = "halt reasons in window: " + parts.join(" \u00B7 ");
+      }
+    }
+
+    function renderDecisions(rows) {
+      const wrap = document.getElementById("decisions-container");
+      if (!rows.length) {
+        wrap.innerHTML = '<div class="empty">No decision cycles logged yet. The paper loop writes one row per cycle.</div>';
+        return;
+      }
+      let html = '<table class="dense"><thead><tr>';
+      html += '<th>Time</th><th>Strategy</th><th>Regime</th><th>Equity</th>';
+      html += '<th>Sweep</th><th>Approved</th><th>Planned</th><th>Submitted</th>';
+      html += '<th>Status</th></tr></thead><tbody>';
+      for (const r of rows) {
+        const pipe = r.pipeline || [];
+        const byName = {};
+        for (const s of pipe) byName[s.name] = s.count;
+        const ts = (r.ts || "").replace("T", " ").slice(0, 16);
+        const status = r.halted
+          ? `<span class="pnl-neg">HALT</span>`
+          : r.submitted_count > 0
+            ? `<span class="pnl-pos">SENT ${r.submitted_count}</span>`
+            : r.dry_run
+              ? `<span class="pnl-flat">DRY</span>`
+              : `<span class="pnl-flat">NO-OP</span>`;
+        const reasons = (r.halt_reasons || []).join(" \u00B7 ");
+        const eq = fmtMoney(r.account_equity || 0);
+        html += `<tr title="${escapeHtml(reasons)}">`;
+        html += `<td>${escapeHtml(ts)}</td>`;
+        html += `<td>${escapeHtml(r.strategy || "")}</td>`;
+        html += `<td>${escapeHtml(r.regime || "\u2014")}</td>`;
+        html += `<td>${eq}</td>`;
+        html += `<td>${byName.sweep_candidates || 0}</td>`;
+        html += `<td>${byName.agent_approved || 0}</td>`;
+        html += `<td>${r.planned_count || 0}</td>`;
+        html += `<td>${r.submitted_count || 0}</td>`;
+        html += `<td>${status}</td>`;
+        html += `</tr>`;
+      }
+      html += "</tbody></table>";
+      wrap.innerHTML = html;
+    }
+
+    function renderEquity(rows) {
+      const canvas = document.getElementById("equity-chart");
+      const ctx = canvas.getContext("2d");
+      // Hi-DPI
+      const dpr = window.devicePixelRatio || 1;
+      const cssW = canvas.clientWidth || 600;
+      const cssH = 200;
+      canvas.width = cssW * dpr;
+      canvas.height = cssH * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cssW, cssH);
+
+      const pts = (rows || []).filter(r => r.day);
+      if (pts.length < 2) {
+        ctx.fillStyle = "#64748b";
+        ctx.font = "12px ui-sans-serif, system-ui";
+        ctx.textAlign = "center";
+        ctx.fillText("No closed round-trips yet \u2014 chart populates after the first sell.", cssW / 2, cssH / 2);
+        document.getElementById("equity-meta").textContent =
+          "PnL is simulated from planned orders at last-known prices. Once live orders flow, real fills override.";
+        return;
+      }
+      const eqs = pts.map(p => p.equity);
+      const min = Math.min(...eqs);
+      const max = Math.max(...eqs);
+      const pad = 24;
+      const w = cssW - pad * 2;
+      const h = cssH - pad * 2;
+      const span = max - min || 1;
+      // grid line
+      ctx.strokeStyle = "#1f2937";
+      ctx.beginPath();
+      ctx.moveTo(pad, cssH - pad);
+      ctx.lineTo(cssW - pad, cssH - pad);
+      ctx.stroke();
+      // path
+      ctx.strokeStyle = "#34d399";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      pts.forEach((p, i) => {
+        const x = pad + (i / (pts.length - 1)) * w;
+        const y = pad + (1 - (p.equity - min) / span) * h;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      // labels
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "10px ui-monospace, monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(fmtMoney(max), pad + 2, pad + 10);
+      ctx.fillText(fmtMoney(min), pad + 2, cssH - pad - 2);
+      ctx.textAlign = "right";
+      ctx.fillText(pts[0].day, pad + 40, cssH - pad + 14);
+      ctx.fillText(pts[pts.length - 1].day, cssW - pad, cssH - pad + 14);
+
+      const first = pts[0].equity;
+      const last = pts[pts.length - 1].equity;
+      const pct = first > 0 ? ((last - first) / first) * 100 : 0;
+      const meta = document.getElementById("equity-meta");
+      meta.innerHTML =
+        `${pts.length} day(s) \u00B7 net ` +
+        `<span class="${pnlClass(last - first)}">${fmtMoney(last - first)}</span> ` +
+        `(<span class="${pnlClass(last - first)}">${pct.toFixed(2)}%</span>) ` +
+        `\u00B7 PnL is simulated from planned orders.`;
     }
 
     function renderDaily(rows) {
@@ -150,7 +447,7 @@
       }
       let html = '<table class="dense"><thead><tr><th>Day</th><th>PnL</th><th>Trades</th></tr></thead><tbody>';
       for (const r of rows.slice().reverse()) {
-        html += `<tr><td>${r.day}</td><td class="${pnlClass(r.pnl)}">${fmtMoney(r.pnl)}</td><td>${r.n_trades}</td></tr>`;
+        html += `<tr><td>${escapeHtml(r.day)}</td><td class="${pnlClass(r.pnl)}">${fmtMoney(r.pnl)}</td><td>${r.n_trades}</td></tr>`;
       }
       html += "</tbody></table>";
       wrap.innerHTML = html;
@@ -159,20 +456,26 @@
     function renderPva(rows) {
       const wrap = document.getElementById("pva-container");
       if (!rows.length) {
-        wrap.innerHTML = '<div class="empty">No predictions logged yet.</div>';
+        wrap.innerHTML = '<div class="empty">No predictions logged yet. The paper loop writes one per symbol per cycle.</div>';
         return;
       }
       let html = '<table class="dense"><thead><tr><th>Symbol</th><th>Predicted</th><th>Actual</th><th>Delta</th><th>Matched</th></tr></thead><tbody>';
       for (const r of rows) {
         const delta = r.actual_pnl - r.predicted_pnl;
-        html += `<tr><td>${r.symbol}</td><td>${fmtMoney(r.predicted_pnl)}</td><td class="${pnlClass(r.actual_pnl)}">${fmtMoney(r.actual_pnl)}</td><td class="${pnlClass(delta)}">${fmtMoney(delta)}</td><td>${r.matched ? "yes" : "—"}</td></tr>`;
+        html += `<tr><td>${escapeHtml(r.symbol)}</td><td>${fmtMoney(r.predicted_pnl)}</td><td class="${pnlClass(r.actual_pnl)}">${fmtMoney(r.actual_pnl)}</td><td class="${pnlClass(delta)}">${fmtMoney(delta)}</td><td>${r.matched ? "yes" : "\u2014"}</td></tr>`;
       }
       html += "</tbody></table>";
       wrap.innerHTML = html;
     }
 
-    loadShadow();
-    setInterval(loadShadow, 30000);
+    function refresh() {
+      loadShadow();
+      loadWindow();
+      loadPipeline();
+      loadDecisions();
+    }
+    refresh();
+    setInterval(refresh, 30000);
   </script>
 </body>
 </html>

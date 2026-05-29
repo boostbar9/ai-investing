@@ -522,6 +522,60 @@ def api_shadow_flip_events(limit: int = 20) -> dict[str, Any]:
     return {"events": rows, "count": len(rows)}
 
 
+# ---------------------------------------------------------------------------
+# Phase 11 -- decision instrumentation endpoints.
+#
+# Three sibling routes power the new /shadow page panels:
+#   /api/shadow/decisions -- last N per-cycle decision rows (table)
+#   /api/shadow/pipeline  -- aggregated candidate funnel (24h window)
+#   /api/shadow/window    -- 14-day shadow-trading window progress
+# All three are read-only and pure-stdlib so they stay fast under the
+# dashboard's 30s polling cadence.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/shadow/decisions")
+def api_shadow_decisions(limit: int = 50) -> dict[str, Any]:
+    """Recent per-cycle decision traces, newest-first.
+
+    Each row exposes the candidate funnel (sweep -> corroborated ->
+    agent-approved -> target -> planned -> submitted), halt reasons,
+    and a few headline metrics. The /shadow page renders this as the
+    'Per-cycle decisions' table.
+    """
+    from packages.paper.decisions import load_recent
+
+    capped = max(1, min(int(limit), 500))
+    rows = load_recent(limit=capped)
+    return {"decisions": rows, "count": len(rows), "limit": capped}
+
+
+@app.get("/api/shadow/pipeline")
+def api_shadow_pipeline() -> dict[str, Any]:
+    """Aggregated candidate-funnel across the last 24h.
+
+    Returns one entry per stage with totals + average-per-cycle. The
+    /shadow page renders this as a horizontal funnel so the user can
+    see at a glance which stage is filtering out their candidates.
+    """
+    from packages.paper.decisions import latest_pipeline
+
+    return latest_pipeline()
+
+
+@app.get("/api/shadow/window")
+def api_shadow_window() -> dict[str, Any]:
+    """Shadow-trading window progress.
+
+    Reads the decision log to derive a per-day activity calendar and
+    a 'day X of 14' counter. The /shadow page uses this for the window
+    progress card at the top.
+    """
+    from packages.paper.decisions import window_status
+
+    return window_status(target_days=14)
+
+
 @app.get("/health", response_class=HTMLResponse)
 def health_page() -> HTMLResponse:
     return _render("health.html")

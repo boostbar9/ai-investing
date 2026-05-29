@@ -348,10 +348,84 @@ async def plan_orders(
 # ---------------------------------------------------------------------------
 
 
+def _load_latest_sweep_candidates() -> list[dict[str, Any]]:
+    """Best-effort: fetch the most recent research sweep's candidate list.
+
+    Returned shape is the JSON-serialised ``Candidate`` rows the sweep
+    persists. Any failure (no sweep yet, IO error, schema drift) returns
+    an empty list -- decision logging stays best-effort.
+    """
+    try:
+        from packages.agents.research_sweep import load_sweep
+
+        snap = load_sweep()
+        if not isinstance(snap, dict):
+            return []
+        cands = snap.get("candidates") or []
+        return [c for c in cands if isinstance(c, dict)]
+    except Exception as exc:  # pragma: no cover - defensive only
+        log.debug("sweep load for decisions failed: %s", exc)
+        return []
+
+
+def _log_decision_record(record: dict[str, Any]) -> None:
+    """Phase 11: write per-cycle decision trace to the shadow log.
+
+    Best-effort: never raises. The decision log is purely observational;
+    a failure here must not poison the actual trade loop. Pulls the
+    sweep snapshot fresh on each cycle so the pipeline funnel reflects
+    whatever signals were *available* at decision time, not stale state.
+    """
+    try:
+        from packages.paper.decisions import append_decision, build_record
+
+        sweep_candidates = _load_latest_sweep_candidates()
+        agent_audit = record.get("agent_audit") or []
+        approved_syms: list[str] = []
+        # Recover approved symbols from the agent audit trail. The risk
+        # agent emits one event with the approved list; if absent, we
+        # fall back to whatever ended up in target_weights with weight>0.
+        for evt in agent_audit:
+            if not isinstance(evt, dict):
+                continue
+            payload = evt.get("payload") or {}
+            if isinstance(payload, dict) and payload.get("approved_symbols"):
+                approved_syms = list(payload["approved_symbols"])
+                break
+        if not approved_syms:
+            approved_syms = [
+                s for s, w in (record.get("target_weights") or {}).items()
+                if abs(float(w)) >= 1e-6
+            ]
+
+        rec = build_record(
+            ts=str(record.get("ts") or datetime.now(UTC).isoformat()),
+            strategy=str(record.get("strategy") or ""),
+            dry_run=bool(record.get("dry_run", False)),
+            halted=bool(record.get("halted", False)),
+            halt_reasons=list(record.get("reasons") or []),
+            sweep_candidates=sweep_candidates,
+            agent_approved_symbols=approved_syms,
+            target_weights=record.get("target_weights") or {},
+            planned_orders=record.get("orders_planned") or [],
+            submitted_orders=record.get("orders_submitted") or [],
+            errors=record.get("errors") or [],
+            account_equity=float(record.get("account_equity") or 0.0),
+            regime=str(record.get("agent_regime") or ""),
+            decision_id=str(record.get("agent_decision_id") or ""),
+        )
+        append_decision(rec)
+    except Exception as exc:  # pragma: no cover - defensive only
+        log.warning("decision-log write failed: %s", exc)
+
+
 def log_run(record: dict[str, Any]) -> None:
     PAPER_LOG_DIR.mkdir(parents=True, exist_ok=True)
     with PAPER_LOG_FILE.open("a") as f:
         f.write(json.dumps(record, default=str) + "\n")
+    # Phase 11: structured decision trace alongside the raw run record.
+    # Best-effort; safe to call on every code path (halt + success).
+    _log_decision_record(record)
     # Dual-write to SQLite (best-effort). JSONL remains the source of truth
     # during this transition; the SQL mirror unlocks queryable history.
     if os.getenv("COCKPIT_DB_DUAL_WRITE", "1") != "0":
@@ -550,10 +624,32 @@ async def run(
             "errors": errors,
             "agent_decision_id": str(agent_result.decision_id),
             "agent_sentiment": agent_result.research.sentiment,
+            "agent_regime": _live_regime,
             "agent_thesis": agent_result.research.thesis,
             "agent_audit": agent_audit,
             "duration_sec": (datetime.now(UTC) - started).total_seconds(),
         }
+        # Phase 11: emit per-symbol predicted PnL so the /shadow page
+        # has an ex-ante baseline to score actuals against. Best-effort.
+        try:
+            from packages.paper.predictions import append_predictions
+
+            current_weights_for_pred = {
+                po.symbol: float(po.current_weight) for po in planned
+            }
+            n_pred = append_predictions(
+                target_weights=target,
+                current_weights=current_weights_for_pred,
+                equity=equity,
+                strategy=strategy_name,
+                regime=_live_regime,
+                decision_id=str(agent_result.decision_id),
+                ts=started.isoformat(),
+            )
+            if n_pred:
+                log.info("wrote %d predictions for shadow reconciliation", n_pred)
+        except Exception as exc:  # pragma: no cover - defensive only
+            log.warning("prediction-log write failed: %s", exc)
         log_run(record)
         # Refresh the §16 streak snapshot AFTER appending this run so the
         # dashboard always sees the latest day. Best-effort: a failure here

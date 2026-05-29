@@ -134,6 +134,187 @@ def test_api_promote_includes_shadow_gate(isolated_shadow) -> None:
     assert any("shadow soak" in r for r in reasons)
 
 
+# ---------------------------------------------------------------------------
+# Phase 11 — decision instrumentation endpoints.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def isolated_decisions(monkeypatch, tmp_path) -> Path:
+    """Point the decisions JSONL log at tmp_path."""
+    from packages.paper import decisions as dec_mod
+
+    p = tmp_path / "decisions.jsonl"
+    monkeypatch.setattr(dec_mod, "DEFAULT_DECISIONS_PATH", p)
+    return p
+
+
+def _decision_row(
+    *,
+    ts: str = "2026-05-29T20:00:00+00:00",
+    halted: bool = False,
+    halt_reasons: list[str] | None = None,
+    submitted: int = 0,
+) -> dict:
+    return {
+        "ts": ts,
+        "strategy": "ensemble",
+        "dry_run": True,
+        "halted": halted,
+        "halt_reasons": halt_reasons or [],
+        "pipeline": [
+            {"name": "sweep_candidates", "count": 5, "sample_symbols": ["SPY", "QQQ"]},
+            {"name": "corroborated", "count": 2, "sample_symbols": ["SPY"]},
+            {"name": "agent_approved", "count": 1, "sample_symbols": ["SPY"]},
+            {"name": "target_weighted", "count": 1, "sample_symbols": ["SPY"]},
+            {"name": "orders_planned", "count": 1, "sample_symbols": ["SPY"]},
+            {"name": "orders_submitted", "count": submitted, "sample_symbols": []},
+        ],
+        "planned_count": 1,
+        "submitted_count": submitted,
+        "error_count": 0,
+        "account_equity": 100_000.0,
+        "regime": "chop",
+        "decision_id": "abc",
+    }
+
+
+def _write_decisions(path: Path, rows: list[dict]) -> None:
+    import json as _json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(_json.dumps(r) for r in rows) + "\n")
+
+
+def test_api_shadow_decisions_empty(isolated_decisions: Path) -> None:
+    client = TestClient(srv.app)
+    r = client.get("/api/shadow/decisions")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["decisions"] == []
+    assert payload["count"] == 0
+    assert payload["limit"] == 50
+
+
+def test_api_shadow_decisions_returns_newest_first(isolated_decisions: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    base = datetime(2026, 5, 29, 12, 0, tzinfo=UTC)
+    rows = [
+        _decision_row(ts=(base + timedelta(minutes=i)).isoformat()) for i in range(3)
+    ]
+    # Tag each so we can verify ordering.
+    for i, r in enumerate(rows):
+        r["decision_id"] = f"id{i}"
+    _write_decisions(isolated_decisions, rows)
+
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/decisions").json()
+    assert payload["count"] == 3
+    assert [d["decision_id"] for d in payload["decisions"]] == ["id2", "id1", "id0"]
+
+
+def test_api_shadow_decisions_caps_limit(isolated_decisions: Path) -> None:
+    client = TestClient(srv.app)
+    # 999 -> capped to 500.
+    r = client.get("/api/shadow/decisions?limit=999")
+    assert r.json()["limit"] == 500
+    # 0 -> raised to 1.
+    r = client.get("/api/shadow/decisions?limit=0")
+    assert r.json()["limit"] == 1
+
+
+def test_api_shadow_pipeline_empty_skeleton(isolated_decisions: Path) -> None:
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/pipeline").json()
+    assert payload == {
+        "stages": [],
+        "n_cycles": 0,
+        "window_hours": 24,
+        "halts": {},
+    }
+
+
+def test_api_shadow_pipeline_aggregates_canonical_stages(
+    isolated_decisions: Path,
+) -> None:
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    _write_decisions(isolated_decisions, [_decision_row(ts=now), _decision_row(ts=now)])
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/pipeline").json()
+    assert payload["n_cycles"] == 2
+    names = [s["name"] for s in payload["stages"]]
+    assert names == [
+        "sweep_candidates",
+        "corroborated",
+        "agent_approved",
+        "target_weighted",
+        "orders_planned",
+        "orders_submitted",
+    ]
+    sweep = next(s for s in payload["stages"] if s["name"] == "sweep_candidates")
+    assert sweep["total"] == 10  # 5 * 2 cycles
+    assert sweep["avg_per_cycle"] == 5.0
+
+
+def test_api_shadow_pipeline_records_halt_tally(isolated_decisions: Path) -> None:
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    _write_decisions(
+        isolated_decisions,
+        [
+            _decision_row(ts=now, halted=True, halt_reasons=["kill_switch:dd"]),
+            _decision_row(ts=now, halted=True, halt_reasons=["cockpit_pause"]),
+        ],
+    )
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/pipeline").json()
+    assert payload["halts"].get("kill_switch") == 1
+    assert payload["halts"].get("cockpit_pause") == 1
+
+
+def test_api_shadow_window_empty_returns_target(isolated_decisions: Path) -> None:
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/window").json()
+    assert payload["target_days"] == 14
+    assert payload["days_remaining"] == 14
+    assert payload["days_with_activity"] == 0
+    assert payload["grid"] == []
+
+
+def test_api_shadow_window_dense_grid(isolated_decisions: Path) -> None:
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    _write_decisions(
+        isolated_decisions,
+        [_decision_row(ts=now, submitted=1)],
+    )
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/window").json()
+    assert payload["days_with_activity"] == 1
+    # 14-day window -> grid spans at least 14 days.
+    assert len(payload["grid"]) >= 14
+    today_str = datetime.now(UTC).date().isoformat()
+    today_cell = next((c for c in payload["grid"] if c["day"] == today_str), None)
+    assert today_cell is not None
+    assert today_cell["cycles"] == 1
+    assert today_cell["submitted"] == 1
+
+
+def test_shadow_page_includes_phase11_panel_endpoints() -> None:
+    """The /shadow template must reference the three new endpoints so
+    its JS poller can render the new panels."""
+    client = TestClient(srv.app)
+    body = client.get("/shadow").text
+    assert "/api/shadow/decisions" in body
+    assert "/api/shadow/pipeline" in body
+    assert "/api/shadow/window" in body
+
+
 def test_api_promote_clears_shadow_gate_when_ready(isolated_shadow) -> None:
     """Pre-populating shadow_status.json with status=ready clears the soak gate."""
     _, status = isolated_shadow
