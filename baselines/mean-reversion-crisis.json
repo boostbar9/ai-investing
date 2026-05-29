@@ -1,0 +1,11 @@
+{
+  "spec": "v3.1",
+  "phase": "2-backtests",
+  "regime": "crisis",
+  "strategy": "mean-reversion",
+  "sharpe": -0.5987,
+  "max_drawdown": -0.4623,
+  "turnover_annual": 11.655,
+  "cagr": -0.0507,
+  "n_days": 2600
+}
