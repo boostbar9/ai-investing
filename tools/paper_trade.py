@@ -96,9 +96,16 @@ STRATEGY_UNIVERSE = {
         "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA",
         "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU",
     ],
+    # Phase 13: confidence-gated policy. Same universe as ensemble so the
+    # A/B comparison during shadow soak is apples-to-apples -- only the
+    # decision *policy* differs, not the candidate set.
+    "policy": [
+        "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA",
+        "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU",
+    ],
 }
 
-STRATEGY_CHOICES = [*STRATEGIES, "ensemble"]
+STRATEGY_CHOICES = [*STRATEGIES, "ensemble", "policy"]
 
 
 # ---------------------------------------------------------------------------
@@ -187,10 +194,24 @@ def check_kill_switches(account: dict[str, Any]) -> KillSwitchResult:
 # ---------------------------------------------------------------------------
 
 
+# Phase 13: holder for the policy's per-symbol decisions from the last
+# compute_target_weights() call. Read by _log_decision_record so the
+# calibration log captures the confidences that drove the trade.
+# Cleared at the start of each cycle so stale decisions never bleed
+# across cycles. Module-level so callers don't have to thread it
+# through every signature.
+_LAST_POLICY_DECISIONS: list[dict[str, Any]] = []
+
+
 def compute_target_weights(strategy_name: str) -> dict[str, float]:
     """Run the strategy on real data; return last-bar weights as a dict."""
+    # Reset policy decisions; only the 'policy' branch repopulates this.
+    global _LAST_POLICY_DECISIONS
+    _LAST_POLICY_DECISIONS = []
     if strategy_name == "ensemble":
         return compute_ensemble_weights()
+    if strategy_name == "policy":
+        return compute_policy_weights()
     symbols = STRATEGY_UNIVERSE[strategy_name]
     panel = load_panel(symbols)
     if panel.empty:
@@ -235,6 +256,73 @@ def compute_ensemble_weights() -> dict[str, float]:
     weights = ensemble.generate_signals(panel, regimes)
     last_row = weights.iloc[-1].to_dict()
     return {k: float(v) for k, v in last_row.items() if not pd.isna(v) and float(v) > 0}
+
+
+def compute_policy_weights() -> dict[str, float]:
+    """Phase 13: run the confidence-gated policy and return target weights.
+
+    The policy reads the *same* inputs as the ensemble (regime, panel,
+    research sweep) so the two strategies can be A/B-compared during the
+    shadow soak. The key difference: this returns weights only for
+    symbols whose composite confidence cleared the BUY threshold, plus
+    explicit zeros for symbols whose confidence dropped below the SELL
+    threshold (so the rebalancer flattens them).
+
+    Side effect: populates ``_LAST_POLICY_DECISIONS`` with the per-symbol
+    decision detail so the cycle's decision log can record calibration
+    pairs (confidence -> action -> later realised outcome).
+    """
+    global _LAST_POLICY_DECISIONS
+    from packages.agents.policy import ConfidenceGatedPolicy
+    from packages.regime.hmm import detect_regime
+
+    symbols = STRATEGY_UNIVERSE["policy"]
+    panel = load_panel(symbols)
+    if panel.empty:
+        raise RuntimeError("no price panel for policy")
+
+    # Regime + posterior confidence from the HMM (or its heuristic fallback).
+    spy = panel["SPY"] if "SPY" in panel.columns else panel.iloc[:, 0]
+    realised_vol = spy.pct_change().rolling(20).std() * np.sqrt(252) * 100
+    vix_proxy = realised_vol.fillna(15.0)
+    rets_5d = panel.pct_change(5)
+    breadth = (rets_5d > 0).mean(axis=1).fillna(0.5)
+    reading = detect_regime(spy, vix_proxy, breadth)
+    regime_name = str(reading.regime)
+    regime_conf = float(reading.confidence)
+
+    # Pull the latest research sweep (per-symbol confidence + trust).
+    sweep_cands = _load_latest_sweep_candidates()
+
+    # Use the ensemble's signal as the "alignment" input -- if the
+    # ensemble also wants a name, that's an independent vote.
+    try:
+        ensemble_weights = compute_ensemble_weights()
+    except Exception as exc:  # pragma: no cover - defensive only
+        log.warning("policy: ensemble alignment unavailable: %s", exc)
+        ensemble_weights = {}
+
+    # Current holdings: empty here because compute_target_weights is
+    # called BEFORE we fetch positions in run(). The policy still emits
+    # correct BUY decisions; SELLs for names we hold get handled the
+    # next cycle once positions are visible. (Acceptable: the existing
+    # rebalancer flattens dropped names anyway via weight=0 absence.)
+    policy = ConfidenceGatedPolicy()
+    decisions = policy.decide(
+        sweep_candidates=sweep_cands,
+        ensemble_weights=ensemble_weights,
+        current_holdings=set(),
+        regime=regime_name,
+        regime_confidence=regime_conf,
+    )
+    _LAST_POLICY_DECISIONS = [d.to_dict() for d in decisions]
+
+    weights = policy.to_target_weights(decisions)
+    # Drop the explicit zeros from the return value -- the rebalancer
+    # treats an absent symbol as "flatten if held" anyway, and zero
+    # weights confuse downstream sentiment-overlay code that multiplies
+    # weights. Zeros stay in _LAST_POLICY_DECISIONS for the calibration log.
+    return {k: v for k, v in weights.items() if v > 0}
 
 
 def compute_target_weights_with_sentiment(
@@ -398,6 +486,11 @@ def _log_decision_record(record: dict[str, Any]) -> None:
                 if abs(float(w)) >= 1e-6
             ]
 
+        # Phase 13: capture the confidence-gated policy's per-symbol
+        # decisions if this cycle ran the 'policy' strategy. List is
+        # always present (defaults to []) so dashboards can rely on it.
+        policy_decisions = list(_LAST_POLICY_DECISIONS or [])
+
         rec = build_record(
             ts=str(record.get("ts") or datetime.now(UTC).isoformat()),
             strategy=str(record.get("strategy") or ""),
@@ -413,6 +506,7 @@ def _log_decision_record(record: dict[str, Any]) -> None:
             account_equity=float(record.get("account_equity") or 0.0),
             regime=str(record.get("agent_regime") or ""),
             decision_id=str(record.get("agent_decision_id") or ""),
+            policy_decisions=policy_decisions,
         )
         append_decision(rec)
     except Exception as exc:  # pragma: no cover - defensive only

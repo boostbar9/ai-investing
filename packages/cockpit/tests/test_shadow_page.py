@@ -487,3 +487,157 @@ def test_shadow_page_contains_force_cycle_button() -> None:
     assert "force-cycle-btn" in body
     assert "Run one cycle now" in body
     assert "/api/shadow/force-cycle" in body
+
+
+# ---------------------------------------------------------------------------
+# Phase 13: /api/shadow/policy -- confidence-gated policy decision feed for
+# the new "Confidence-Gated Policy" panel.
+# ---------------------------------------------------------------------------
+
+
+def _policy_decision_row(
+    *,
+    ts: str,
+    decisions: list[dict],
+    regime: str = "chop",
+) -> dict:
+    """Build a cycle row that carries Phase 13 policy_decisions payload."""
+    return {
+        "ts": ts,
+        "strategy": "policy",
+        "dry_run": True,
+        "halted": False,
+        "halt_reasons": [],
+        "pipeline": [],
+        "planned_count": 0,
+        "submitted_count": 0,
+        "error_count": 0,
+        "account_equity": 100_000.0,
+        "regime": regime,
+        "decision_id": "pid",
+        "policy_decisions": decisions,
+    }
+
+
+def test_api_shadow_policy_empty(isolated_decisions: Path) -> None:
+    """No cycles logged yet -> empty payload with default thresholds."""
+    client = TestClient(srv.app)
+    r = client.get("/api/shadow/policy")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["decisions"] == []
+    assert payload["count"] == 0
+    assert payload["buckets"] == {}
+    assert payload["thresholds"]["buy"] == pytest.approx(0.65)
+    assert payload["thresholds"]["sell"] == pytest.approx(0.35)
+
+
+def test_api_shadow_policy_flattens_decisions_newest_first(
+    isolated_decisions: Path,
+) -> None:
+    """Multiple cycles' policy_decisions should flatten into one list,
+    newest cycle first, with cycle_ts + cycle_regime stamped onto each row."""
+    from datetime import UTC, datetime, timedelta
+
+    base = datetime(2026, 5, 29, 12, 0, tzinfo=UTC)
+    rows = [
+        _policy_decision_row(
+            ts=base.isoformat(),
+            regime="bull",
+            decisions=[
+                {"symbol": "NVDA", "action": "buy", "confidence": 0.9},
+                {"symbol": "AAPL", "action": "hold", "confidence": 0.5},
+            ],
+        ),
+        _policy_decision_row(
+            ts=(base + timedelta(minutes=5)).isoformat(),
+            regime="chop",
+            decisions=[
+                {"symbol": "TSLA", "action": "sell", "confidence": 0.2},
+            ],
+        ),
+    ]
+    _write_decisions(isolated_decisions, rows)
+
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/policy").json()
+
+    assert payload["count"] == 3
+    # Newest cycle first: TSLA's row should come before NVDA/AAPL.
+    syms = [d["symbol"] for d in payload["decisions"]]
+    assert syms[0] == "TSLA"
+    # Every decision must carry the cycle context.
+    first = payload["decisions"][0]
+    assert first["cycle_ts"].startswith("2026-05-29T12:05")
+    assert first["cycle_regime"] == "chop"
+
+
+def test_api_shadow_policy_buckets_by_confidence_band(
+    isolated_decisions: Path,
+) -> None:
+    """Decisions group into 0.1-wide confidence buckets x action counts."""
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    row = _policy_decision_row(
+        ts=now,
+        decisions=[
+            # 0.83 + 0.87 both fall in [0.8, 0.9) -> bucket key "0.8".
+            {"symbol": "A", "action": "buy", "confidence": 0.83},
+            {"symbol": "B", "action": "buy", "confidence": 0.87},
+            {"symbol": "C", "action": "hold", "confidence": 0.55},
+            {"symbol": "D", "action": "sell", "confidence": 0.15},
+        ],
+    )
+    _write_decisions(isolated_decisions, [row])
+
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/policy").json()
+    buckets = payload["buckets"]
+    # Both 0.83 and 0.87 sit in the [0.8, 0.9) bucket.
+    assert buckets["0.8"]["buy"] == 2
+    # 0.55 -> [0.5, 0.6) bucket
+    assert buckets["0.5"]["hold"] == 1
+    # 0.15 -> [0.1, 0.2) bucket
+    assert buckets["0.1"]["sell"] == 1
+
+
+def test_api_shadow_policy_ignores_cycles_without_policy_payload(
+    isolated_decisions: Path,
+) -> None:
+    """Pre-Phase-13 cycle rows (no policy_decisions key) must be skipped
+    cleanly. The endpoint is additive and shouldn't blow up on legacy data."""
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    legacy = _decision_row(ts=now)  # no policy_decisions field
+    _write_decisions(isolated_decisions, [legacy])
+
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/policy").json()
+    assert payload["count"] == 0
+    assert payload["decisions"] == []
+
+
+def test_api_shadow_policy_respects_thresholds_env(
+    isolated_decisions: Path, monkeypatch
+) -> None:
+    """Env overrides should bubble through to the thresholds payload
+    so the dashboard draws threshold lines at the configured values."""
+    monkeypatch.setenv("POLICY_BUY_THRESHOLD", "0.80")
+    monkeypatch.setenv("POLICY_SELL_THRESHOLD", "0.20")
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/policy").json()
+    assert payload["thresholds"]["buy"] == pytest.approx(0.80)
+    assert payload["thresholds"]["sell"] == pytest.approx(0.20)
+
+
+def test_shadow_page_includes_policy_panel_hooks() -> None:
+    """The /shadow template must reference the new endpoint + DOM hooks so
+    the JS poller can render the confidence-gated policy panel."""
+    client = TestClient(srv.app)
+    body = client.get("/shadow").text
+    assert "/api/shadow/policy" in body
+    assert "policy-histogram" in body
+    assert "policy-decisions" in body
+    assert "Confidence-Gated Policy" in body

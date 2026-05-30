@@ -51,6 +51,19 @@
 
     /* equity curve */
     #equity-chart { width: 100%; height: 200px; }
+
+    /* Phase 13: confidence-gated policy panel */
+    .policy-chip { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; font-variant-numeric: tabular-nums; }
+    .policy-chip.buy { background: #064e3b; color: #6ee7b7; border: 1px solid #10b981; }
+    .policy-chip.hold { background: #1f2937; color: #cbd5e1; border: 1px solid #374151; }
+    .policy-chip.sell { background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444; }
+    .conf-bar-bg { background: #1f2937; height: 6px; border-radius: 3px; overflow: hidden; position: relative; }
+    .conf-bar-fill { height: 100%; transition: width .3s ease; }
+    .conf-bar-fill.buy { background: linear-gradient(90deg, #10b981, #34d399); }
+    .conf-bar-fill.hold { background: linear-gradient(90deg, #6b7280, #9ca3af); }
+    .conf-bar-fill.sell { background: linear-gradient(90deg, #ef4444, #f87171); }
+    .conf-threshold-line { position: absolute; top: -2px; bottom: -2px; width: 1px; background: #fbbf24; }
+    #policy-histogram { width: 100%; height: 140px; }
   </style>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
@@ -177,6 +190,35 @@
       </div>
     </div>
 
+    <!-- Phase 13: Confidence-gated policy decisions -->
+    <div class="panel">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-lg font-semibold">Confidence-Gated Policy (last 50 decisions)</h2>
+        <div class="text-xs text-gray-400" id="policy-meta">Loading...</div>
+      </div>
+      <p class="text-xs text-gray-500 mb-3">
+        Discrete BUY/HOLD/SELL policy that abstains when composite confidence falls in the
+        HOLD zone. Composite blends candidate confidence (40%), HMM regime (20%),
+        Reddit trust+corroboration (20%), and ensemble alignment (20%).
+        Runs in parallel with the ensemble strategy for apples-to-apples comparison.
+      </p>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div>
+          <div class="text-xs text-gray-400 uppercase tracking-wide mb-2">Confidence histogram</div>
+          <canvas id="policy-histogram"></canvas>
+          <div class="text-xs text-gray-500 mt-1" id="policy-hist-meta">
+            Yellow lines mark the BUY / SELL thresholds.
+          </div>
+        </div>
+        <div>
+          <div class="text-xs text-gray-400 uppercase tracking-wide mb-2">Recent decisions</div>
+          <div id="policy-decisions" style="max-height: 320px; overflow-y: auto;">
+            <div class="empty">Loading...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Predicted vs Actual -->
     <div class="panel">
       <h2 class="text-lg font-semibold mb-3">Predicted vs Actual</h2>
@@ -267,6 +309,160 @@
         document.getElementById("decisions-container").innerHTML =
           '<div class="empty">Error loading: ' + escapeHtml(e.message) + '</div>';
       }
+    }
+
+    async function loadPolicy() {
+      try {
+        const p = await Cockpit.api.get("/api/shadow/policy?limit=50");
+        renderPolicy(p);
+      } catch (e) {
+        document.getElementById("policy-decisions").innerHTML =
+          '<div class="empty">Error loading: ' + escapeHtml(e.message) + '</div>';
+        document.getElementById("policy-meta").textContent = "error";
+      }
+    }
+
+    function renderPolicy(p) {
+      const decisions = p.decisions || [];
+      const buckets = p.buckets || {};
+      const thr = p.thresholds || { buy: 0.65, sell: 0.35 };
+      const meta = document.getElementById("policy-meta");
+      const buyCount = decisions.filter(d => d.action === "buy").length;
+      const holdCount = decisions.filter(d => d.action === "hold").length;
+      const sellCount = decisions.filter(d => d.action === "sell").length;
+      meta.textContent = `${decisions.length} decision(s) \u00B7 ${buyCount} buy \u00B7 ${holdCount} hold \u00B7 ${sellCount} sell`;
+
+      renderPolicyHistogram(buckets, thr);
+      renderPolicyDecisions(decisions, thr);
+    }
+
+    function renderPolicyHistogram(buckets, thr) {
+      const canvas = document.getElementById("policy-histogram");
+      const ctx = canvas.getContext("2d");
+      const dpr = window.devicePixelRatio || 1;
+      const cssW = canvas.clientWidth || 400;
+      const cssH = 140;
+      canvas.width = cssW * dpr;
+      canvas.height = cssH * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cssW, cssH);
+
+      // 10 buckets: 0.0, 0.1, ..., 0.9
+      const labels = ["0.0", "0.1", "0.2", "0.3", "0.4", "0.5", "0.6", "0.7", "0.8", "0.9"];
+      const data = labels.map(l => {
+        const b = buckets[l] || { buy: 0, hold: 0, sell: 0 };
+        return { label: l, buy: b.buy || 0, hold: b.hold || 0, sell: b.sell || 0 };
+      });
+      const totals = data.map(d => d.buy + d.hold + d.sell);
+      const maxTotal = Math.max(1, ...totals);
+
+      const padL = 24, padR = 8, padT = 8, padB = 22;
+      const plotW = cssW - padL - padR;
+      const plotH = cssH - padT - padB;
+      const barW = plotW / labels.length;
+
+      // y-axis grid
+      ctx.strokeStyle = "#1f2937";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padL, padT + plotH);
+      ctx.lineTo(padL + plotW, padT + plotH);
+      ctx.stroke();
+
+      // stacked bars: sell (bottom red), hold (middle gray), buy (top green)
+      data.forEach((d, i) => {
+        const x = padL + i * barW + 2;
+        const w = barW - 4;
+        let yCursor = padT + plotH;
+        const total = d.buy + d.hold + d.sell;
+        if (total === 0) return;
+        const segs = [
+          { v: d.sell, color: "#ef4444" },
+          { v: d.hold, color: "#6b7280" },
+          { v: d.buy, color: "#10b981" },
+        ];
+        for (const s of segs) {
+          if (s.v <= 0) continue;
+          const h = (s.v / maxTotal) * plotH;
+          ctx.fillStyle = s.color;
+          ctx.fillRect(x, yCursor - h, w, h);
+          yCursor -= h;
+        }
+      });
+
+      // threshold lines
+      ctx.strokeStyle = "#fbbf24";
+      ctx.setLineDash([3, 3]);
+      ctx.lineWidth = 1;
+      const sellX = padL + thr.sell * plotW;
+      const buyX = padL + thr.buy * plotW;
+      ctx.beginPath();
+      ctx.moveTo(sellX, padT);
+      ctx.lineTo(sellX, padT + plotH);
+      ctx.moveTo(buyX, padT);
+      ctx.lineTo(buyX, padT + plotH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // x-axis labels
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "9px ui-monospace, monospace";
+      ctx.textAlign = "center";
+      data.forEach((d, i) => {
+        const x = padL + i * barW + barW / 2;
+        ctx.fillText(d.label, x, padT + plotH + 12);
+      });
+      // threshold value labels
+      ctx.fillStyle = "#fbbf24";
+      ctx.font = "9px ui-monospace, monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(`sell ${thr.sell.toFixed(2)}`, sellX, padT + 8);
+      ctx.fillText(`buy ${thr.buy.toFixed(2)}`, buyX, padT + 8);
+
+      // y-axis max label
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "9px ui-monospace, monospace";
+      ctx.textAlign = "right";
+      ctx.fillText(String(maxTotal), padL - 2, padT + 8);
+
+      document.getElementById("policy-hist-meta").textContent =
+        `BUY \u2265 ${thr.buy.toFixed(2)} \u00B7 SELL \u2264 ${thr.sell.toFixed(2)} \u00B7 dashed lines mark thresholds`;
+    }
+
+    function renderPolicyDecisions(rows, thr) {
+      const wrap = document.getElementById("policy-decisions");
+      if (!rows.length) {
+        wrap.innerHTML = '<div class="empty">No policy decisions logged yet. Run a cycle with --strategy policy.</div>';
+        return;
+      }
+      let html = '<table class="dense"><thead><tr>';
+      html += '<th>Symbol</th><th>Action</th><th style="width:120px">Confidence</th><th>Regime</th><th>Time</th>';
+      html += '</tr></thead><tbody>';
+      for (const r of rows) {
+        const action = String(r.action || "hold").toLowerCase();
+        const conf = Number(r.confidence || 0);
+        const confPct = Math.max(0, Math.min(100, conf * 100));
+        const buyPct = Math.max(0, Math.min(100, (thr.buy || 0.65) * 100));
+        const sellPct = Math.max(0, Math.min(100, (thr.sell || 0.35) * 100));
+        const ts = (r.cycle_ts || "").replace("T", " ").slice(11, 16);
+        const regime = r.cycle_regime || r.regime || "\u2014";
+        html += `<tr>`;
+        html += `<td><span class="font-mono">${escapeHtml(r.symbol || "")}</span></td>`;
+        html += `<td><span class="policy-chip ${action}">${escapeHtml(action)}</span></td>`;
+        html += `<td>`;
+        html += `  <div class="conf-bar-bg">`;
+        html += `    <div class="conf-bar-fill ${action}" style="width:${confPct.toFixed(1)}%"></div>`;
+        html += `    <div class="conf-threshold-line" style="left:${sellPct.toFixed(1)}%"></div>`;
+        html += `    <div class="conf-threshold-line" style="left:${buyPct.toFixed(1)}%"></div>`;
+        html += `  </div>`;
+        html += `  <div class="text-xs text-gray-500 mt-0.5" style="text-align:left;">${conf.toFixed(2)}</div>`;
+        html += `</td>`;
+        html += `<td>${escapeHtml(regime)}</td>`;
+        html += `<td>${escapeHtml(ts)}</td>`;
+        html += `</tr>`;
+      }
+      html += '</tbody></table>';
+      wrap.innerHTML = html;
     }
 
     function renderWindow(w) {
@@ -483,6 +679,7 @@
       loadWindow();
       loadPipeline();
       loadDecisions();
+      loadPolicy();
     }
 
     // Force-cycle button: triggers one paper-trade cycle synchronously,

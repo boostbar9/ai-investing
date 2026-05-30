@@ -576,6 +576,60 @@ def api_shadow_window() -> dict[str, Any]:
     return window_status(target_days=14)
 
 
+@app.get("/api/shadow/policy")
+def api_shadow_policy(limit: int = 50) -> dict[str, Any]:
+    """Phase 13: confidence-gated policy decisions from recent cycles.
+
+    Pulls the last ``limit`` cycles that ran the 'policy' strategy and
+    flattens their per-symbol decisions into a single newest-first list.
+    The /shadow page renders this as the 'Confidence-gated decisions'
+    panel with action chips + a confidence histogram.
+
+    Returns a calibration breakdown too: how many BUY/HOLD/SELL
+    decisions in each confidence bucket. Once we have enough trade
+    outcomes attached we'll layer the realised win-rate on top.
+    """
+    from packages.paper.decisions import load_recent
+
+    capped = max(1, min(int(limit), 500))
+    rows = load_recent(limit=capped)
+    decisions: list[dict[str, Any]] = []
+    for row in rows:
+        for d in row.get("policy_decisions") or []:
+            # Attach cycle ts so the dashboard can group / sort.
+            d2 = dict(d)
+            d2["cycle_ts"] = row.get("ts")
+            d2["cycle_regime"] = row.get("regime")
+            decisions.append(d2)
+
+    # Bucket by 0.1-wide confidence band x action -> count. Cheap to
+    # compute, lets the dashboard render a stacked bar without doing
+    # math in JS.
+    buckets: dict[str, dict[str, int]] = {}
+    for d in decisions:
+        try:
+            conf = float(d.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        # Bucket lower-bound to one decimal, clamped to [0, 1).
+        lb = max(0.0, min(0.9, round(conf - (conf % 0.1), 1)))
+        key = f"{lb:.1f}"
+        b = buckets.setdefault(key, {"buy": 0, "hold": 0, "sell": 0})
+        action = str(d.get("action", "hold"))
+        if action in b:
+            b[action] += 1
+
+    return {
+        "decisions": decisions,
+        "count": len(decisions),
+        "buckets": buckets,
+        "thresholds": {
+            "buy": float(__import__("os").environ.get("POLICY_BUY_THRESHOLD", "0.65")),
+            "sell": float(__import__("os").environ.get("POLICY_SELL_THRESHOLD", "0.35")),
+        },
+    }
+
+
 # Phase 12: manual one-shot cycle trigger. Lets the user click a button
 # on /shadow and immediately see a new decision row appear in the table.
 # Default strategy = 'ensemble' (the same one tools/boot.py drives in the

@@ -79,6 +79,11 @@ class DecisionRecord:
     account_equity: float
     regime: str
     decision_id: str
+    # Phase 13: optional confidence-gated policy decisions. List of dicts
+    # of shape {symbol, action, confidence, components, reason}. Defaults
+    # to empty so existing readers (and pre-Phase-13 cycles) keep working.
+    # When the active strategy is not 'policy' this stays empty.
+    policy_decisions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_row(self) -> dict[str, Any]:
         out = asdict(self)
@@ -120,6 +125,7 @@ def build_record(
     account_equity: float,
     regime: str,
     decision_id: str,
+    policy_decisions: list[dict[str, Any]] | None = None,
 ) -> DecisionRecord:
     """Compose a DecisionRecord from the paper_trade loop's locals.
 
@@ -174,6 +180,7 @@ def build_record(
         account_equity=float(account_equity or 0.0),
         regime=str(regime or "unknown"),
         decision_id=str(decision_id or ""),
+        policy_decisions=list(policy_decisions or []),
     )
 
 
