@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pre-flight - ai-investing</title>
+  {% include "_head_icons.html" %}
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/cockpit.css" />
+  <script src="/static/cockpit.js"></script>
+  <style>
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .pf-row { display: grid; grid-template-columns: 28px 1fr auto; gap: 12px; align-items: center; padding: 10px 12px; border-bottom: 1px solid #1f2937; }
+    .pf-row:last-child { border-bottom: none; }
+    .pf-dot { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; }
+    .pf-dot.ok { background: #10b981; box-shadow: 0 0 8px #10b98155; }
+    .pf-dot.warn { background: #f59e0b; box-shadow: 0 0 8px #f59e0b55; }
+    .pf-dot.fail { background: #ef4444; box-shadow: 0 0 8px #ef444455; }
+    .pf-dot.info { background: #3b82f6; box-shadow: 0 0 8px #3b82f655; }
+    .pf-message { font-size: 13px; }
+    .pf-message-fail { color: #fca5a5; }
+    .pf-message-warn { color: #fcd34d; }
+    .pf-message-ok { color: #d1d5db; }
+    .pf-message-info { color: #93c5fd; }
+    .pf-name { font-weight: 500; color: #e5e7eb; }
+    .pf-section { background: #0b1220; border: 1px solid #1f2937; border-radius: 8px; }
+    .pf-section-head { padding: 12px 16px; border-bottom: 1px solid #1f2937; }
+    .pf-counter { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; padding: 2px 8px; border-radius: 999px; }
+    .pf-counter.ok { background: #064e3b; color: #6ee7b7; }
+    .pf-counter.warn { background: #78350f; color: #fcd34d; }
+    .pf-counter.fail { background: #7f1d1d; color: #fca5a5; }
+    .pf-counter.info { background: #1e3a8a; color: #93c5fd; }
+    .pf-big-btn { font-size: 18px; padding: 16px 24px; font-weight: 600; border-radius: 10px; transition: all 0.2s; }
+    .pf-big-btn-ok { background: linear-gradient(180deg, #059669 0%, #047857 100%); color: white; border: 1px solid #10b981; cursor: pointer; }
+    .pf-big-btn-ok:hover { background: linear-gradient(180deg, #10b981 0%, #059669 100%); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4); }
+    .pf-big-btn-disabled { background: #1f2937; color: #6b7280; border: 1px solid #374151; cursor: not-allowed; }
+    .verdict-card { background: linear-gradient(180deg, #0f172a 0%, #0b1220 100%); border: 1px solid #1f2937; border-radius: 10px; }
+    .verdict-card.ready { border-color: #10b981; box-shadow: 0 0 24px rgba(16, 185, 129, 0.2); }
+    .verdict-card.blocked { border-color: #ef4444; box-shadow: 0 0 24px rgba(239, 68, 68, 0.15); }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="topbar"><div class="topbar-inner">
+    <a href="/" class="topbar-brand">
+      <span id="cockpit-conn-dot" class="topbar-brand-dot idle"></span>
+      <span>ai-investing</span>
+    </a>
+    <div id="cockpit-topbar"></div>
+  </div></div>
+
+  <div class="max-w-5xl mx-auto p-6">
+    <nav class="nav flex items-center gap-1 mb-4 text-sm">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/trading" class="nav-link">Trading</a>
+      <a href="/autopilot" class="nav-link">Autopilot</a>
+      <a href="/preflight" class="nav-link nav-active">Pre-flight</a>
+      <a href="/promote" class="nav-link">Promote</a>
+      <a href="/shadow" class="nav-link">Shadow</a>
+      <a href="/agents" class="nav-link">Agents</a>
+      <a href="/models" class="nav-link">Models</a>
+      <a href="/settings" class="nav-link">Settings</a>
+      <a href="/health" class="nav-link">Health</a>
+      <a href="/errors" class="nav-link">Errors<span id="nav-err-badge" class="nav-badge" data-err-badge style="display:none">0</span></a>
+      <button id="shortcuts-btn" class="btn btn-ghost btn-sm ml-auto" data-tt="Keyboard shortcuts (press ?)">?</button>
+    </nav>
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold">Pre-flight Checklist</h1>
+      <p class="text-sm text-gray-400 mt-1">
+        Every precondition for going live in one place. Green across the board lights the
+        Arm Live button at the bottom.
+      </p>
+    </header>
+
+    <!-- Verdict card -->
+    <div id="verdict-card" class="verdict-card p-5 mb-5">
+      <div class="flex items-center justify-between">
+        <div>
+          <div id="verdict-title" class="text-xl font-semibold">Running checks...</div>
+          <div id="verdict-summary" class="text-sm text-gray-400 mt-1">&nbsp;</div>
+        </div>
+        <div class="flex items-center gap-2" id="verdict-counts">
+          <span class="pf-counter ok" id="cnt-ok">0 ok</span>
+          <span class="pf-counter warn" id="cnt-warn">0 warn</span>
+          <span class="pf-counter fail" id="cnt-fail">0 fail</span>
+          <span class="pf-counter info" id="cnt-info">0 info</span>
+        </div>
+      </div>
+      <div id="blocking-list" class="mt-4 hidden">
+        <div class="text-sm font-semibold text-red-300 mb-2">Blocking failures</div>
+        <ul id="blocking-ul" class="text-sm text-red-200 space-y-1 mono"></ul>
+      </div>
+    </div>
+
+    <!-- Sections -->
+    <div id="sections" class="space-y-4 mb-6">
+      <div class="pf-section p-5"><span class="skel" style="display:inline-block;width:200px;height:14px">&nbsp;</span></div>
+    </div>
+
+    <!-- One big button -->
+    <div class="flex items-center justify-between gap-4 mt-8 mb-12">
+      <div class="text-xs text-gray-500">
+        <div>Last refreshed: <span id="refreshed-at" class="mono text-gray-400">never</span></div>
+        <div>Auto-refresh every 10s</div>
+      </div>
+      <button id="arm-btn" class="pf-big-btn pf-big-btn-disabled" disabled>
+        Run checks first
+      </button>
+    </div>
+  </div>
+
+  <script>
+    // ---------------------------------------------------------------------
+    // Phase 16: pre-flight page
+    // ---------------------------------------------------------------------
+
+    function statusClass(status) {
+      return ({ ok: 'ok', warn: 'warn', fail: 'fail', info: 'info' })[status] || 'info';
+    }
+
+    function renderSection(section) {
+      const checks = section.checks || [];
+      const byStatus = { ok: 0, warn: 0, fail: 0, info: 0 };
+      for (const c of checks) byStatus[c.status] = (byStatus[c.status] || 0) + 1;
+      const counterPills = ['fail','warn','info','ok']
+        .filter(s => byStatus[s] > 0)
+        .map(s => `<span class="pf-counter ${s}">${byStatus[s]} ${s}</span>`)
+        .join(' ');
+      const rows = checks.map(c => {
+        const cls = statusClass(c.status);
+        return `
+          <div class="pf-row">
+            <span class="pf-dot ${cls}"></span>
+            <div>
+              <div class="pf-name">${c.name}</div>
+              <div class="pf-message pf-message-${cls} mono">${c.message}</div>
+            </div>
+            <div class="text-xs text-gray-500 mono">${c.key}</div>
+          </div>`;
+      }).join('');
+      return `
+        <div class="pf-section">
+          <div class="pf-section-head flex items-center justify-between">
+            <div>
+              <div class="font-semibold">${section.label}</div>
+              <div class="text-xs text-gray-400">${section.description || ''}</div>
+            </div>
+            <div class="flex items-center gap-2">${counterPills}</div>
+          </div>
+          <div>${rows}</div>
+        </div>`;
+    }
+
+    function renderVerdict(summary) {
+      const card = document.getElementById('verdict-card');
+      const title = document.getElementById('verdict-title');
+      const sub = document.getElementById('verdict-summary');
+      card.classList.remove('ready', 'blocked');
+      if (summary.ready) {
+        card.classList.add('ready');
+        title.innerHTML = '<span class="text-green-400">\u2713 READY TO ARM LIVE</span>';
+        sub.textContent = 'Every gate is green. Click "Arm Live" below to go live.';
+      } else if (summary.counts.fail > 0) {
+        card.classList.add('blocked');
+        title.innerHTML = '<span class="text-red-300">\u2717 BLOCKED</span>';
+        sub.textContent = `${summary.counts.fail} hard failure(s) below must be resolved.`;
+      } else {
+        title.innerHTML = '<span class="text-yellow-300">\u26a0 NOT READY</span>';
+        sub.textContent = 'No failures, but the live gate is not green yet.';
+      }
+      document.getElementById('cnt-ok').textContent = `${summary.counts.ok} ok`;
+      document.getElementById('cnt-warn').textContent = `${summary.counts.warn} warn`;
+      document.getElementById('cnt-fail').textContent = `${summary.counts.fail} fail`;
+      document.getElementById('cnt-info').textContent = `${summary.counts.info} info`;
+
+      const blist = document.getElementById('blocking-list');
+      const bul = document.getElementById('blocking-ul');
+      if (summary.blocking_reasons && summary.blocking_reasons.length > 0) {
+        blist.classList.remove('hidden');
+        bul.innerHTML = summary.blocking_reasons.map(r => `<li>\u2022 ${r}</li>`).join('');
+      } else {
+        blist.classList.add('hidden');
+      }
+    }
+
+    function renderArmButton(summary) {
+      const btn = document.getElementById('arm-btn');
+      if (summary.ready) {
+        btn.disabled = false;
+        btn.className = 'pf-big-btn pf-big-btn-ok';
+        btn.textContent = '\u2192 Arm Live Trading';
+      } else {
+        btn.disabled = true;
+        btn.className = 'pf-big-btn pf-big-btn-disabled';
+        if (summary.counts.fail > 0) {
+          btn.textContent = `Fix ${summary.counts.fail} failure(s) to enable`;
+        } else {
+          btn.textContent = 'Waiting for live gate to turn green';
+        }
+      }
+    }
+
+    async function refreshPreflight() {
+      try {
+        const summary = await Cockpit.api.get('/api/preflight');
+        const wrap = document.getElementById('sections');
+        wrap.innerHTML = (summary.sections || []).map(renderSection).join('');
+        renderVerdict(summary);
+        renderArmButton(summary);
+        const ts = new Date(summary.generated_at);
+        document.getElementById('refreshed-at').textContent = isNaN(ts) ? summary.generated_at : ts.toLocaleTimeString();
+      } catch (e) {
+        document.getElementById('verdict-title').innerHTML = '<span class="text-red-300">Pre-flight fetch failed</span>';
+        document.getElementById('verdict-summary').textContent = e.message;
+      }
+    }
+
+    async function armLive() {
+      const btn = document.getElementById('arm-btn');
+      btn.disabled = true;
+      btn.textContent = 'Arming...';
+      try {
+        const res = await Cockpit.api.post('/api/arm-live', { note: 'armed from /preflight' });
+        if (res && res.ok && res.action === 'armed') {
+          Cockpit.toastSuccess('Live trading armed. Capital fraction begins at canary.');
+        } else if (res && res.ok && res.action === 'noop') {
+          Cockpit.toastSuccess('Already armed.');
+        } else {
+          const reasons = (res && res.reasons || []).join('; ') || 'unknown';
+          Cockpit.toastError(`Arm refused: ${reasons}`);
+        }
+      } catch (e) {
+        Cockpit.toastError('Arm failed: ' + e.message);
+      }
+      await refreshPreflight();
+    }
+
+    function refreshTopbar() {
+      if (typeof Cockpit !== 'undefined' && Cockpit.refreshTopbar) Cockpit.refreshTopbar();
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
+      document.getElementById('arm-btn').addEventListener('click', armLive);
+      refreshPreflight();
+      Cockpit.poll(refreshPreflight, 10000, { name: 'preflight' });
+      Cockpit.poll(refreshTopbar, 5000, { name: 'preflight-topbar' });
+    });
+  </script>
+</body>
+</html>

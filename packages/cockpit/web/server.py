@@ -458,6 +458,17 @@ def index() -> HTMLResponse:
     return _render("index.html")
 
 
+@app.get("/preflight", response_class=HTMLResponse)
+def preflight_page() -> HTMLResponse:
+    """Phase 16: aggregated readiness checklist.
+
+    One URL that lights up green/yellow/red across every precondition
+    for going live, with a single 'Arm Live' button at the bottom that
+    is only enabled when every gate is green.
+    """
+    return _render("preflight.html")
+
+
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page() -> HTMLResponse:
     return _render("settings.html")
@@ -3681,6 +3692,25 @@ def api_sizing_audit(limit: int = 50) -> dict[str, Any]:
     capped = max(1, min(int(limit), 500))
     rows = read_audit(limit=capped)
     return {"events": rows, "count": len(rows)}
+
+
+# --------------------------------------------------------------------------
+# Phase 16: aggregated pre-flight readiness checklist
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/preflight")
+def api_preflight() -> dict[str, Any]:
+    """Run every readiness check and return the aggregated verdict.
+
+    The page poller hits this every few seconds. Checks are best-effort
+    (any individual check that raises is downgraded to a failure row
+    rather than killing the whole snapshot), so this endpoint should
+    never return a 5xx in practice.
+    """
+    from packages.cockpit.web.preflight import compute_preflight
+
+    return compute_preflight().to_dict()
 
 
 # --------------------------------------------------------------------------
