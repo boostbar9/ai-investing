@@ -356,17 +356,26 @@ class ConfidenceGatedPolicy:
         return decisions
 
     def to_target_weights(
-        self, decisions: list[PolicyDecision]
+        self,
+        decisions: list[PolicyDecision],
+        *,
+        sizer: Any = None,
+        equity: float = 0.0,
+        peak_equity: float = 0.0,
+        realised_vols: dict[str, float] | None = None,
     ) -> dict[str, float]:
         """Convert discrete decisions to the weight dict paper_trade expects.
 
-        BUY -> equal weight (subject to MAX_POSITIONS cap and CASH_FLOOR).
+        BUY -> sized weight (subject to MAX_POSITIONS cap and CASH_FLOOR).
         HOLD -> not in dict (rebalancer treats absence as "keep current").
         SELL -> 0.0 (rebalancer interprets as flat-the-position).
 
-        Equal-weighting BUYs is the simplest sound starting point. Once
-        we have calibration data we can re-weight proportional to
-        composite confidence (`weight ~ (composite - buy_threshold)`).
+        Phase 15: an optional ``sizer`` (any ``packages.agents.sizing.RiskSizer``
+        instance) takes over BUY weight computation. When provided, it
+        sees the BUYs + the current equity/peak/vol context and applies
+        confidence-proportional or fractional-Kelly sizing with an
+        optional drawdown taper. Missing sizer -> Phase 13 equal-weight
+        behaviour (full back-compat).
         """
         # Sort BUYs by composite descending so the cap keeps the best names.
         buys = sorted(
@@ -375,22 +384,51 @@ class ConfidenceGatedPolicy:
         )
         sells = [d for d in decisions if d.action == "sell"]
 
+        weights: dict[str, float] = {}
+        if sizer is not None and buys:
+            # Delegate BUY sizing to the risk-adaptive sizer. It owns the
+            # max_positions cap + cash_floor internally so we don't
+            # double-apply either constraint here.
+            try:
+                result = sizer.size(
+                    buy_decisions=buys,
+                    max_positions=self.max_positions,
+                    equity=equity,
+                    peak_equity=peak_equity,
+                    realised_vols=realised_vols,
+                )
+                for sym, w in result.weights.items():
+                    weights[sym] = round(float(w), 6)
+                if result.notes:
+                    logger.info("policy sizer notes: %s", "; ".join(result.notes))
+            except Exception as exc:  # never let sizing crash the cycle
+                logger.warning(
+                    "policy sizer failed (%s); falling back to equal-weight", exc
+                )
+                weights = self._equal_weight_buys(buys)
+        else:
+            weights = self._equal_weight_buys(buys)
+
+        # Emit explicit zero for SELLs so the rebalancer knows to flatten.
+        for d in sells:
+            weights[d.symbol] = 0.0
+        return weights
+
+    def _equal_weight_buys(self, buys: list[PolicyDecision]) -> dict[str, float]:
+        """Phase 13 equal-weight sizing, kept as the fallback path so any
+        sizer failure degrades gracefully instead of submitting zero-size
+        orders into a hot cycle."""
         kept_buys = buys[: self.max_positions]
         if buys[self.max_positions :]:
             logger.info(
                 "policy capped %d additional BUY candidates (max_positions=%d)",
                 len(buys) - self.max_positions, self.max_positions,
             )
-
         weights: dict[str, float] = {}
         if kept_buys:
-            # Equal-weight across kept BUYs, leaving CASH_FLOOR uninvested.
             per = (1.0 - self.cash_floor) / len(kept_buys)
             for d in kept_buys:
                 weights[d.symbol] = round(per, 6)
-        # Emit explicit zero for SELLs so the rebalancer knows to flatten.
-        for d in sells:
-            weights[d.symbol] = 0.0
         return weights
 
 

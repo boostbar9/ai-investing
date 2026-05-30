@@ -34,10 +34,14 @@ def test_compute_target_weights_routes_policy_to_policy_function(
     """compute_target_weights('policy') must dispatch to compute_policy_weights,
     not fall through to the ensemble/single-strategy branches."""
     sentinel = {"SENTINEL": 0.5}
-    called: dict[str, bool] = {"policy": False}
+    called: dict[str, Any] = {"policy": False, "equity": None}
 
-    def fake_policy() -> dict[str, float]:
+    # Phase 15: the router now threads ``equity`` through as a keyword
+    # so the policy branch's risk-adaptive sizer can compute DD taper
+    # and Kelly sizing. The fake must accept that kwarg.
+    def fake_policy(*, equity: float = 0.0) -> dict[str, float]:
         called["policy"] = True
+        called["equity"] = equity
         return sentinel
 
     # Seed stale state -- it must be cleared by the routing function's
@@ -45,16 +49,18 @@ def test_compute_target_weights_routes_policy_to_policy_function(
     pt._LAST_POLICY_DECISIONS = [
         {"symbol": "STALE", "action": "buy", "confidence": 0.9}
     ]
+    pt._LAST_SIZING_RESULT = {"stale": True}
 
     monkeypatch.setattr(pt, "compute_policy_weights", fake_policy)
-    out = pt.compute_target_weights("policy")
+    out = pt.compute_target_weights("policy", equity=12345.0)
 
     assert called["policy"] is True
+    assert called["equity"] == 12345.0
     assert out == sentinel
-    # The routing function clears _LAST_POLICY_DECISIONS at the top. Our
-    # fake policy doesn't repopulate it, so the cleared state is what
-    # leaks through here.
+    # The routing function clears both holders at the top. Our fake policy
+    # doesn't repopulate them, so the cleared state is what leaks through.
     assert pt._LAST_POLICY_DECISIONS == []
+    assert pt._LAST_SIZING_RESULT == {}
 
 
 def test_compute_policy_weights_populates_decisions_and_drops_zeros(

@@ -754,6 +754,63 @@ def api_shadow_calibration(
     }
 
 
+@app.get("/api/shadow/sizing")
+def api_shadow_sizing(limit: int = 50) -> dict[str, Any]:
+    """Phase 15: risk-adaptive sizing diagnostics from the most recent
+    'policy' cycle.
+
+    Walks the decision log newest-first and returns the first row whose
+    ``sizing`` block is non-empty (i.e. a cycle that actually ran the
+    confidence-gated policy with a sizer attached). Also returns a small
+    history list of the per-cycle gross_target + dd_multiplier so the
+    dashboard can sparkline how aggressively the sizer is exposing the
+    book over time.
+
+    Empty-data shape: ``{"latest": {}, "history": [], "count": 0}`` so
+    the dashboard renders a "no sizing data yet" placeholder instead of
+    erroring on first boot.
+    """
+    from packages.paper.decisions import load_recent
+
+    capped = max(1, min(int(limit), 500))
+    rows = load_recent(limit=capped)
+
+    latest: dict[str, Any] = {}
+    history: list[dict[str, Any]] = []
+    for row in rows:
+        sizing = row.get("sizing") or {}
+        # Skip pre-Phase-15 rows and cycles where the sizer didn't run
+        # (no per-symbol diagnostics -- nothing to plot).
+        if not isinstance(sizing, dict) or not sizing.get("diagnostics"):
+            continue
+        history.append(
+            {
+                "ts": row.get("ts"),
+                "mode": sizing.get("mode"),
+                "equity": sizing.get("equity"),
+                "peak_equity": sizing.get("peak_equity"),
+                "dd_observed": sizing.get("dd_observed"),
+                "dd_exposure_multiplier": sizing.get("dd_exposure_multiplier"),
+                "gross_target": sizing.get("gross_target"),
+                "gross_actual": sizing.get("gross_actual"),
+                "n_positions": len(sizing.get("diagnostics") or []),
+            }
+        )
+        if not latest:
+            # First non-empty row is the newest, since load_recent returns
+            # newest-first. Attach the cycle's ts/regime so the panel can
+            # show when this snapshot was taken.
+            latest = dict(sizing)
+            latest["cycle_ts"] = row.get("ts")
+            latest["cycle_regime"] = row.get("regime")
+
+    return {
+        "latest": latest,
+        "history": history,
+        "count": len(history),
+    }
+
+
 # Phase 12: manual one-shot cycle trigger. Lets the user click a button
 # on /shadow and immediately see a new decision row appear in the table.
 # Default strategy = 'ensemble' (the same one tools/boot.py drives in the

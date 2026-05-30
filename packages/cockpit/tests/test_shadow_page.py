@@ -741,3 +741,177 @@ def test_shadow_page_includes_calibration_panel_hooks() -> None:
     assert "/api/shadow/calibration" in body
     assert "calibration-chart" in body or "reliability" in body.lower()
     assert "Policy Calibration" in body or "Reliability" in body
+
+
+# ---------------------------------------------------------------------------
+# Phase 15 — risk-adaptive sizing endpoint + dashboard panel
+# ---------------------------------------------------------------------------
+
+
+def _sizing_row(
+    *,
+    ts: str = "2026-05-29T20:00:00+00:00",
+    mode: str = "fractional_kelly",
+    equity: float = 100_000.0,
+    peak_equity: float = 100_000.0,
+    dd_observed: float = 0.02,
+    dd_exposure_multiplier: float = 1.0,
+    gross_target: float = 0.95,
+    gross_actual: float = 0.93,
+    diagnostics: list[dict] | None = None,
+    notes: list[str] | None = None,
+) -> dict:
+    """Build a decision-log row that includes a populated sizing block."""
+    base = _decision_row(ts=ts, submitted=1)
+    base["sizing"] = {
+        "weights": {"SPY": 0.45, "QQQ": 0.30, "NVDA": 0.18},
+        "diagnostics": diagnostics
+        or [
+            {
+                "symbol": "SPY",
+                "raw_weight": 0.40,
+                "confidence": 0.85,
+                "edge": 0.20,
+                "kelly_weight": 0.42,
+                "vol_scalar": 1.10,
+                "final_weight": 0.45,
+            },
+            {
+                "symbol": "QQQ",
+                "raw_weight": 0.30,
+                "confidence": 0.78,
+                "edge": 0.13,
+                "kelly_weight": 0.28,
+                "vol_scalar": 0.95,
+                "final_weight": 0.30,
+            },
+            {
+                "symbol": "NVDA",
+                "raw_weight": 0.25,
+                "confidence": 0.72,
+                "edge": 0.07,
+                "kelly_weight": 0.18,
+                "vol_scalar": 0.80,
+                "final_weight": 0.18,
+            },
+        ],
+        "dd_observed": dd_observed,
+        "dd_exposure_multiplier": dd_exposure_multiplier,
+        "gross_target": gross_target,
+        "gross_actual": gross_actual,
+        "mode": mode,
+        "equity": equity,
+        "peak_equity": peak_equity,
+        "notes": notes or [],
+    }
+    return base
+
+
+def test_api_shadow_sizing_empty_returns_skeleton(isolated_decisions: Path) -> None:
+    """No decisions logged yet -> empty skeleton, not an error. The
+    dashboard's loadSizing() relies on this shape."""
+    client = TestClient(srv.app)
+    r = client.get("/api/shadow/sizing")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload == {"latest": {}, "history": [], "count": 0}
+
+
+def test_api_shadow_sizing_skips_rows_without_diagnostics(
+    isolated_decisions: Path,
+) -> None:
+    """Pre-Phase-15 rows (no sizing field) and policy-equal-weight rows
+    (sizing present but empty diagnostics) must be skipped -- they have
+    nothing to plot."""
+    # Row 1: pre-Phase-15, no sizing field at all.
+    # Row 2: sizing present but no diagnostics (equal-weight cycle).
+    rows = [
+        _decision_row(ts="2026-05-29T19:00:00+00:00"),
+        {**_decision_row(ts="2026-05-29T19:30:00+00:00"), "sizing": {"mode": "equal_weight", "diagnostics": []}},
+    ]
+    _write_decisions(isolated_decisions, rows)
+
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/sizing").json()
+    assert payload["latest"] == {}
+    assert payload["count"] == 0
+
+
+def test_api_shadow_sizing_returns_newest_first(isolated_decisions: Path) -> None:
+    """Multiple sizing rows -> latest = newest, history newest-first."""
+    rows = [
+        _sizing_row(ts="2026-05-29T18:00:00+00:00", dd_observed=0.01),
+        _sizing_row(ts="2026-05-29T19:00:00+00:00", dd_observed=0.02),
+        _sizing_row(ts="2026-05-29T20:00:00+00:00", dd_observed=0.04),
+    ]
+    _write_decisions(isolated_decisions, rows)
+
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/sizing").json()
+    # Newest row wins for latest.
+    assert payload["latest"]["dd_observed"] == 0.04
+    assert payload["latest"]["cycle_ts"] == "2026-05-29T20:00:00+00:00"
+    # History is newest-first.
+    assert [h["dd_observed"] for h in payload["history"]] == [0.04, 0.02, 0.01]
+    assert payload["count"] == 3
+
+
+def test_api_shadow_sizing_history_carries_summary_fields(
+    isolated_decisions: Path,
+) -> None:
+    """History entries should expose the headline numbers the dashboard
+    needs to sparkline gross exposure over time, without dragging the
+    full per-symbol diagnostics along."""
+    rows = [
+        _sizing_row(
+            ts="2026-05-29T20:00:00+00:00",
+            mode="fractional_kelly",
+            equity=99_500.0,
+            peak_equity=100_000.0,
+            dd_observed=0.005,
+            dd_exposure_multiplier=1.0,
+            gross_target=0.95,
+            gross_actual=0.93,
+        ),
+    ]
+    _write_decisions(isolated_decisions, rows)
+
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/sizing").json()
+    h = payload["history"][0]
+    assert h["mode"] == "fractional_kelly"
+    assert h["equity"] == 99_500.0
+    assert h["peak_equity"] == 100_000.0
+    assert h["dd_observed"] == 0.005
+    assert h["dd_exposure_multiplier"] == 1.0
+    assert h["gross_target"] == 0.95
+    assert h["gross_actual"] == 0.93
+    assert h["n_positions"] == 3
+
+
+def test_api_shadow_sizing_latest_includes_diagnostics(
+    isolated_decisions: Path,
+) -> None:
+    """Latest must keep per-symbol diagnostics so the panel can render
+    the per-name bar chart."""
+    _write_decisions(isolated_decisions, [_sizing_row()])
+    client = TestClient(srv.app)
+    payload = client.get("/api/shadow/sizing").json()
+    diag = payload["latest"]["diagnostics"]
+    assert len(diag) == 3
+    syms = {d["symbol"] for d in diag}
+    assert syms == {"SPY", "QQQ", "NVDA"}
+    # Each diagnostic carries the audit fields the dashboard reads.
+    for d in diag:
+        assert {"symbol", "final_weight", "confidence", "vol_scalar"} <= set(d.keys())
+
+
+def test_shadow_page_includes_phase15_sizing_panel() -> None:
+    """The /shadow template must reference the sizing endpoint + panel id
+    so the JS poller actually fetches and renders the new panel."""
+    client = TestClient(srv.app)
+    body = client.get("/shadow").text
+    assert "/api/shadow/sizing" in body
+    assert "Risk-Adaptive Sizing" in body
+    # The panel's table container that loadSizing() writes into.
+    assert "sizing-table-wrap" in body

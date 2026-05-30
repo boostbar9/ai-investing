@@ -84,6 +84,12 @@ class DecisionRecord:
     # to empty so existing readers (and pre-Phase-13 cycles) keep working.
     # When the active strategy is not 'policy' this stays empty.
     policy_decisions: list[dict[str, Any]] = field(default_factory=list)
+    # Phase 15: optional risk-adaptive sizing diagnostics. Dict of shape
+    # {mode, equity, peak_equity, drawdown, dd_multiplier, cash_floor,
+    # gross_target, per_symbol: [{symbol, confidence, raw_weight,
+    # vol_scalar, kelly_cap, final_weight, capped}], notes}. Empty when
+    # the strategy is not 'policy' or the sizer ran in equal-weight mode.
+    sizing: dict[str, Any] = field(default_factory=dict)
 
     def to_row(self) -> dict[str, Any]:
         out = asdict(self)
@@ -126,6 +132,7 @@ def build_record(
     regime: str,
     decision_id: str,
     policy_decisions: list[dict[str, Any]] | None = None,
+    sizing: dict[str, Any] | None = None,
 ) -> DecisionRecord:
     """Compose a DecisionRecord from the paper_trade loop's locals.
 
@@ -181,6 +188,7 @@ def build_record(
         regime=str(regime or "unknown"),
         decision_id=str(decision_id or ""),
         policy_decisions=list(policy_decisions or []),
+        sizing=dict(sizing or {}),
     )
 
 

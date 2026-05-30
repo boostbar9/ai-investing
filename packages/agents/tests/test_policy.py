@@ -480,3 +480,101 @@ def test_policy_decision_to_dict_includes_raw_confidence_when_set() -> None:
     )
     out_without = d_without.to_dict()
     assert "raw_confidence" not in out_without
+
+
+# ---------------------------------------------------------------------------
+# Phase 15: to_target_weights + risk-adaptive sizer integration
+# ---------------------------------------------------------------------------
+
+
+def test_to_target_weights_no_sizer_keeps_phase13_behaviour() -> None:
+    """The default call path (no sizer) must match Phase 13 exactly so
+    upgrading the sizer module never silently changes live weights.
+    """
+    p = _policy(cash_floor=0.05)
+    w = p.to_target_weights([_buy("A", conf=0.9), _buy("B", conf=0.8)])
+    # Equal-weight split of (1 - cash_floor).
+    assert w["A"] == pytest.approx(0.475, abs=1e-5)
+    assert w["B"] == pytest.approx(0.475, abs=1e-5)
+
+
+def test_to_target_weights_with_sizer_uses_sizer_output() -> None:
+    """When a sizer is provided, BUY weights come from RiskSizer.size and
+    the SELL flatten signals (explicit zero) still get appended."""
+    from packages.agents.sizing import RiskSizer, RiskSizerConfig
+
+    p = _policy()
+    sizer = RiskSizer(
+        RiskSizerConfig(
+            mode="confidence_proportional",
+            buy_threshold=0.65,
+            max_position_weight=1.0,
+            cash_floor=0.0,
+        )
+    )
+    w = p.to_target_weights(
+        [_buy("HI", conf=0.95), _buy("LO", conf=0.70), _sell("OLD")],
+        sizer=sizer,
+        equity=100_000.0,
+        peak_equity=100_000.0,
+        realised_vols=None,
+    )
+    # HI/LO edge ratio = 0.30 / 0.05 = 6:1.
+    assert w["HI"] > w["LO"]
+    assert pytest.approx(w["HI"] / w["LO"], rel=1e-3) == 6.0
+    # SELL still surfaces as a flatten signal.
+    assert w["OLD"] == 0.0
+
+
+def test_to_target_weights_sizer_exception_falls_back_to_equal_weight() -> None:
+    """A buggy / crashing sizer must never take the cycle down -- the
+    policy degrades to Phase 13 equal-weight and logs a warning."""
+    p = _policy(cash_floor=0.05)
+
+    class CrashingSizer:
+        def size(self, **_kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("intentional sizer failure")
+
+    w = p.to_target_weights(
+        [_buy("A", conf=0.9), _buy("B", conf=0.8)],
+        sizer=CrashingSizer(),
+        equity=100_000.0,
+        peak_equity=100_000.0,
+    )
+    # Equal-weight fallback identical to the no-sizer path.
+    assert w["A"] == pytest.approx(0.475, abs=1e-5)
+    assert w["B"] == pytest.approx(0.475, abs=1e-5)
+
+
+def test_to_target_weights_sizer_with_drawdown_shrinks_gross() -> None:
+    """The sizer's DD taper must reduce total BUY exposure when the
+    portfolio is in drawdown -- this is the whole point of the sizer."""
+    from packages.agents.sizing import RiskSizer, RiskSizerConfig
+
+    p = _policy(cash_floor=0.0)
+    sizer = RiskSizer(
+        RiskSizerConfig(
+            mode="equal_weight",
+            max_position_weight=1.0,
+            cash_floor=0.0,
+            dd_taper_start=0.03,
+            dd_taper_floor=0.30,
+            dd_hard_limit=0.08,
+        )
+    )
+    # Baseline: no DD.
+    w_flat = p.to_target_weights(
+        [_buy("A", conf=0.9), _buy("B", conf=0.9)],
+        sizer=sizer,
+        equity=100_000.0,
+        peak_equity=100_000.0,
+    )
+    # Deep DD: 6% drawdown -> partway down the taper.
+    w_dd = p.to_target_weights(
+        [_buy("A", conf=0.9), _buy("B", conf=0.9)],
+        sizer=sizer,
+        equity=94_000.0,
+        peak_equity=100_000.0,
+    )
+    # Total gross under drawdown should be strictly smaller.
+    assert sum(w_dd.values()) < sum(w_flat.values())

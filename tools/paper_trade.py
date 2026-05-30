@@ -202,16 +202,33 @@ def check_kill_switches(account: dict[str, Any]) -> KillSwitchResult:
 # through every signature.
 _LAST_POLICY_DECISIONS: list[dict[str, Any]] = []
 
+# Phase 15: holder for the most recent risk-adaptive sizing result
+# from compute_policy_weights(). Read by _log_decision_record so the
+# /shadow/sizing endpoint can render per-symbol size + DD taper +
+# Kelly cap diagnostics. Reset at the top of each cycle alongside
+# _LAST_POLICY_DECISIONS. Stored as a dict (SizingResult.to_dict())
+# rather than the dataclass so the value is JSON-serialisable.
+_LAST_SIZING_RESULT: dict[str, Any] = {}
 
-def compute_target_weights(strategy_name: str) -> dict[str, float]:
-    """Run the strategy on real data; return last-bar weights as a dict."""
-    # Reset policy decisions; only the 'policy' branch repopulates this.
-    global _LAST_POLICY_DECISIONS
+
+def compute_target_weights(
+    strategy_name: str, *, equity: float = 0.0
+) -> dict[str, float]:
+    """Run the strategy on real data; return last-bar weights as a dict.
+
+    ``equity`` (Phase 15) is the account's current equity, used by the
+    policy branch's risk-adaptive sizer to compute drawdown taper +
+    fractional-Kelly position sizes. Defaults to 0.0; when 0 the sizer
+    is constructed in equal-weight mode (Phase 13 behaviour).
+    """
+    # Reset policy + sizing instrumentation; only the 'policy' branch repopulates.
+    global _LAST_POLICY_DECISIONS, _LAST_SIZING_RESULT
     _LAST_POLICY_DECISIONS = []
+    _LAST_SIZING_RESULT = {}
     if strategy_name == "ensemble":
         return compute_ensemble_weights()
     if strategy_name == "policy":
-        return compute_policy_weights()
+        return compute_policy_weights(equity=equity)
     symbols = STRATEGY_UNIVERSE[strategy_name]
     panel = load_panel(symbols)
     if panel.empty:
@@ -258,8 +275,8 @@ def compute_ensemble_weights() -> dict[str, float]:
     return {k: float(v) for k, v in last_row.items() if not pd.isna(v) and float(v) > 0}
 
 
-def compute_policy_weights() -> dict[str, float]:
-    """Phase 13: run the confidence-gated policy and return target weights.
+def compute_policy_weights(*, equity: float = 0.0) -> dict[str, float]:
+    """Phase 13/15: confidence-gated policy with risk-adaptive sizing.
 
     The policy reads the *same* inputs as the ensemble (regime, panel,
     research sweep) so the two strategies can be A/B-compared during the
@@ -268,12 +285,21 @@ def compute_policy_weights() -> dict[str, float]:
     explicit zeros for symbols whose confidence dropped below the SELL
     threshold (so the rebalancer flattens them).
 
-    Side effect: populates ``_LAST_POLICY_DECISIONS`` with the per-symbol
-    decision detail so the cycle's decision log can record calibration
-    pairs (confidence -> action -> later realised outcome).
+    Side effects:
+      * Populates ``_LAST_POLICY_DECISIONS`` with the per-symbol
+        decision detail so the cycle's decision log can record
+        calibration pairs (confidence -> action -> realised outcome).
+      * Populates ``_LAST_SIZING_RESULT`` with per-symbol diagnostics
+        (raw weight, vol scalar, final weight, DD multiplier, Kelly
+        cap) so /shadow/sizing can render the sizing panel.
+
+    Phase 15: ``equity`` enables the risk-adaptive sizer's drawdown
+    taper + fractional-Kelly modes. When 0.0 (default), sizing falls
+    back to equal-weight (Phase 13 behaviour).
     """
-    global _LAST_POLICY_DECISIONS
+    global _LAST_POLICY_DECISIONS, _LAST_SIZING_RESULT
     from packages.agents.policy import ConfidenceGatedPolicy
+    from packages.agents.sizing import RiskSizer, RiskSizerConfig, load_peak_equity
     from packages.regime.hmm import detect_regime
 
     symbols = STRATEGY_UNIVERSE["policy"]
@@ -331,7 +357,68 @@ def compute_policy_weights() -> dict[str, float]:
     )
     _LAST_POLICY_DECISIONS = [d.to_dict() for d in decisions]
 
-    weights = policy.to_target_weights(decisions)
+    # Phase 15: realised-vol lookup (per-symbol annualised stdev of
+    # daily returns over the trailing 30 bars). Used by the sizer's
+    # vol-target scalar so a name with twice the vol gets ~half the
+    # raw weight. Computed from the same panel the policy already
+    # loaded -- no extra I/O.
+    realised_vols: dict[str, float] = {}
+    try:
+        rets = panel.pct_change().dropna(how="all")
+        if not rets.empty:
+            # min_periods=10 so we don't blow up on freshly-listed names;
+            # missing entries fall through to the sizer's default scalar.
+            vols = rets.rolling(30, min_periods=10).std().iloc[-1] * np.sqrt(252)
+            for sym, v in vols.items():
+                if pd.notna(v) and float(v) > 0:
+                    realised_vols[str(sym)] = float(v)
+    except Exception as exc:  # pragma: no cover - defensive only
+        log.warning("policy: realised-vol lookup failed: %s", exc)
+
+    # Phase 15: peak equity for the drawdown taper. Reads the same
+    # JSON file that check_kill_switches updates each cycle so the
+    # taper and the hard kill switch see consistent DD numbers.
+    try:
+        peak_equity = load_peak_equity(EQUITY_PEAK_FILE)
+    except Exception as exc:  # pragma: no cover - defensive only
+        log.warning("policy: peak-equity load failed: %s", exc)
+        peak_equity = 0.0
+
+    # Build the sizer from env (POLICY_SIZING_MODE etc). Default mode
+    # is equal_weight so behaviour is identical to Phase 13 unless the
+    # user opts in.
+    try:
+        sizer = RiskSizer(RiskSizerConfig())
+    except Exception as exc:  # pragma: no cover - defensive only
+        log.warning("policy: sizer construction failed: %s; equal-weight", exc)
+        sizer = None
+
+    weights = policy.to_target_weights(
+        decisions,
+        sizer=sizer,
+        equity=float(equity or 0.0),
+        peak_equity=float(peak_equity or 0.0),
+        realised_vols=realised_vols,
+    )
+
+    # Snapshot the sizer's diagnostics for /shadow/sizing. Best-effort.
+    if sizer is not None:
+        try:
+            buys = [d for d in decisions if str(d.action).upper() == "BUY"]
+            sizing_result = sizer.size(
+                buy_decisions=buys,
+                max_positions=policy.max_positions,
+                equity=float(equity or 0.0),
+                peak_equity=float(peak_equity or 0.0),
+                realised_vols=realised_vols,
+            )
+            _LAST_SIZING_RESULT = sizing_result.to_dict()
+        except Exception as exc:  # pragma: no cover - defensive only
+            log.warning("policy: sizing diagnostics capture failed: %s", exc)
+            _LAST_SIZING_RESULT = {}
+    else:
+        _LAST_SIZING_RESULT = {}
+
     # Drop the explicit zeros from the return value -- the rebalancer
     # treats an absent symbol as "flatten if held" anyway, and zero
     # weights confuse downstream sentiment-overlay code that multiplies
@@ -505,6 +592,11 @@ def _log_decision_record(record: dict[str, Any]) -> None:
         # always present (defaults to []) so dashboards can rely on it.
         policy_decisions = list(_LAST_POLICY_DECISIONS or [])
 
+        # Phase 15: capture the risk-adaptive sizer's diagnostics from
+        # the same cycle. Empty dict when the strategy was not 'policy'
+        # or the sizer ran in equal-weight mode (no DD taper, no Kelly).
+        sizing_diag = dict(_LAST_SIZING_RESULT or {})
+
         rec = build_record(
             ts=str(record.get("ts") or datetime.now(UTC).isoformat()),
             strategy=str(record.get("strategy") or ""),
@@ -521,6 +613,7 @@ def _log_decision_record(record: dict[str, Any]) -> None:
             regime=str(record.get("agent_regime") or ""),
             decision_id=str(record.get("agent_decision_id") or ""),
             policy_decisions=policy_decisions,
+            sizing=sizing_diag,
         )
         append_decision(rec)
     except Exception as exc:  # pragma: no cover - defensive only
@@ -594,7 +687,10 @@ async def run(
         if use_sentiment and strategy_name in STRATEGIES:
             target = compute_target_weights_with_sentiment(strategy_name, sentiment_scores)
         else:
-            target = compute_target_weights(strategy_name)
+            # Phase 15: thread account equity through so the policy
+            # branch's risk-adaptive sizer can compute DD taper and
+            # Kelly sizing against the actual portfolio size.
+            target = compute_target_weights(strategy_name, equity=equity)
         log.info("target weights for %s: %s", strategy_name, target)
 
         # ------------------------------------------------------------------

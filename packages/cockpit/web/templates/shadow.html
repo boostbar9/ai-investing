@@ -72,6 +72,21 @@
     .conf-bar-fill.sell { background: linear-gradient(90deg, #ef4444, #f87171); }
     .conf-threshold-line { position: absolute; top: -2px; bottom: -2px; width: 1px; background: #fbbf24; }
     #policy-histogram { width: 100%; height: 140px; }
+
+    /* Phase 15: risk-adaptive sizing panel */
+    .sizing-metric { display: inline-block; padding: 4px 10px; border-radius: 4px; background: #1f2937; margin-right: 6px; margin-bottom: 4px; font-variant-numeric: tabular-nums; }
+    .sizing-metric .label { color: #94a3b8; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; margin-right: 4px; }
+    .sizing-metric .value { color: #e5e7eb; font-weight: 600; font-family: ui-monospace, monospace; }
+    .sizing-metric.warn .value { color: #fcd34d; }
+    .sizing-metric.bad .value { color: #fca5a5; }
+    .sizing-metric.good .value { color: #6ee7b7; }
+    .sizing-bar-bg { background: #1f2937; height: 8px; border-radius: 4px; overflow: hidden; position: relative; }
+    .sizing-bar-fill { height: 100%; background: linear-gradient(90deg, #10b981, #34d399); transition: width .3s ease; }
+    .sizing-bar-cap { position: absolute; top: -2px; bottom: -2px; width: 1px; background: #fbbf24; }
+    .sizing-row td { padding: 4px 8px; border-bottom: 1px solid #1f2937; }
+    .sizing-row .sym { font-weight: 600; color: #e5e7eb; font-family: ui-monospace, monospace; }
+    .sizing-row .pct { color: #cbd5e1; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+    .sizing-row .muted { color: #6b7280; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; font-size: 11px; }
   </style>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
@@ -224,6 +239,37 @@
             <div class="empty">Loading...</div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- Phase 15: Risk-adaptive position sizing -->
+    <div class="panel">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-lg font-semibold">Risk-Adaptive Sizing</h2>
+        <div class="text-xs text-gray-400" id="sizing-meta">Loading...</div>
+      </div>
+      <p class="text-xs text-gray-500 mb-3">
+        Per-symbol position sizes from the most recent policy cycle. Modes:
+        <span class="font-mono">equal_weight</span>,
+        <span class="font-mono">confidence_proportional</span>,
+        <span class="font-mono">fractional_kelly</span> (env
+        <span class="font-mono">POLICY_SIZING_MODE</span>). A drawdown taper
+        shrinks gross exposure before the hard kill switch trips; vol scaling
+        rebalances raw weights so doubling a name's vol roughly halves its size.
+      </p>
+      <div class="flex flex-wrap gap-2 mb-3" id="sizing-metrics">
+        <div class="sizing-metric"><span class="label">Mode</span><span class="value" id="sizing-mode">—</span></div>
+        <div class="sizing-metric"><span class="label">Positions</span><span class="value" id="sizing-n">—</span></div>
+        <div class="sizing-metric"><span class="label">Gross target</span><span class="value" id="sizing-gross">—</span></div>
+        <div class="sizing-metric"><span class="label">DD observed</span><span class="value" id="sizing-dd">—</span></div>
+        <div class="sizing-metric"><span class="label">DD multiplier</span><span class="value" id="sizing-ddmul">—</span></div>
+        <div class="sizing-metric"><span class="label">Equity</span><span class="value" id="sizing-equity">—</span></div>
+      </div>
+      <div id="sizing-table-wrap">
+        <div class="empty">Loading...</div>
+      </div>
+      <div class="text-xs text-gray-500 mt-2" id="sizing-notes">
+        Yellow tick on each bar marks the per-position cap.
       </div>
     </div>
 
@@ -836,6 +882,98 @@
       wrap.innerHTML = html;
     }
 
+    // Phase 15: risk-adaptive sizing panel. Pulls the newest cycle's
+    // per-symbol sizing diagnostics and renders them as a compact table
+    // with a horizontal bar that shows the position relative to the cap.
+    async function loadSizing() {
+      const meta = document.getElementById("sizing-meta");
+      const wrap = document.getElementById("sizing-table-wrap");
+      try {
+        const s = await Cockpit.api.get("/api/shadow/sizing?limit=50");
+        const latest = s.latest || {};
+        const diags = latest.diagnostics || [];
+        const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+
+        if (!diags.length) {
+          meta.textContent = "no data yet";
+          setText("sizing-mode", "\u2014");
+          setText("sizing-n", "0");
+          setText("sizing-gross", "\u2014");
+          setText("sizing-dd", "\u2014");
+          setText("sizing-ddmul", "\u2014");
+          setText("sizing-equity", "\u2014");
+          wrap.innerHTML = '<div class="empty">Sizer hasn\'t run yet -- waiting for the next \'policy\' cycle.</div>';
+          return;
+        }
+
+        const ts = latest.cycle_ts ? new Date(latest.cycle_ts).toLocaleString() : "unknown";
+        meta.textContent = `last cycle ${ts}`;
+        setText("sizing-mode", latest.mode || "\u2014");
+        setText("sizing-n", String(diags.length));
+        setText("sizing-gross", (latest.gross_target != null ? (latest.gross_target * 100).toFixed(1) + "%" : "\u2014"));
+        const ddPct = latest.dd_observed != null ? (latest.dd_observed * 100).toFixed(2) + "%" : "\u2014";
+        setText("sizing-dd", ddPct);
+        const ddmul = latest.dd_exposure_multiplier != null ? latest.dd_exposure_multiplier.toFixed(2) + "x" : "\u2014";
+        setText("sizing-ddmul", ddmul);
+        const eq = latest.equity || 0;
+        setText("sizing-equity", eq > 0 ? fmtMoney(eq) : "\u2014");
+
+        // Colour the DD metrics based on severity.
+        const ddEl = document.getElementById("sizing-dd").parentElement;
+        const ddMulEl = document.getElementById("sizing-ddmul").parentElement;
+        ddEl.classList.remove("good", "warn", "bad");
+        ddMulEl.classList.remove("good", "warn", "bad");
+        const dd = latest.dd_observed || 0;
+        if (dd >= 0.06) { ddEl.classList.add("bad"); ddMulEl.classList.add("bad"); }
+        else if (dd >= 0.03) { ddEl.classList.add("warn"); ddMulEl.classList.add("warn"); }
+        else { ddEl.classList.add("good"); ddMulEl.classList.add("good"); }
+
+        // Sort by final weight descending so the biggest positions float
+        // to the top of the table.
+        const sorted = diags.slice().sort((a, b) => (b.final_weight || 0) - (a.final_weight || 0));
+        const maxWeight = Math.max(...sorted.map((d) => d.final_weight || 0), 0.01);
+        // Per-position cap line. Read from the diagnostics if any name got
+        // capped; otherwise fall back to the default 20%.
+        let cap = 0.20;
+        for (const n of (latest.notes || [])) {
+          // notes look like 'SPY capped: 0.2500 -> 0.2000'; we read the
+          // right-hand side once for the visual indicator.
+          const m = /->\s*([0-9.]+)/.exec(String(n));
+          if (m) { cap = parseFloat(m[1]); break; }
+        }
+
+        let html = '<table class="dense" style="width:100%"><thead><tr>';
+        html += '<th style="width:60px;text-align:left">Symbol</th>';
+        html += '<th style="width:80px;text-align:right">Conf</th>';
+        html += '<th style="width:80px;text-align:right">Vol scalar</th>';
+        html += '<th style="width:90px;text-align:right">Final</th>';
+        html += '<th>vs cap</th>';
+        html += "</tr></thead><tbody>";
+        for (const d of sorted) {
+          const w = d.final_weight || 0;
+          const wPct = (w * 100).toFixed(2) + "%";
+          const conf = (d.confidence || 0).toFixed(3);
+          const vs = (d.vol_scalar || 1).toFixed(2) + "x";
+          // Bar width = final / max(weight, cap). Cap line stays at cap/max.
+          const barMax = Math.max(maxWeight, cap);
+          const barPct = Math.max(0, Math.min(100, (w / barMax) * 100));
+          const capPct = Math.max(0, Math.min(100, (cap / barMax) * 100));
+          html += '<tr class="sizing-row">';
+          html += `<td class="sym">${escapeHtml(d.symbol)}</td>`;
+          html += `<td class="pct" style="text-align:right">${conf}</td>`;
+          html += `<td class="muted" style="text-align:right">${vs}</td>`;
+          html += `<td class="pct" style="text-align:right">${wPct}</td>`;
+          html += `<td><div class="sizing-bar-bg"><div class="sizing-bar-fill" style="width:${barPct}%"></div><div class="sizing-bar-cap" style="left:${capPct}%"></div></div></td>`;
+          html += "</tr>";
+        }
+        html += "</tbody></table>";
+        wrap.innerHTML = html;
+      } catch (e) {
+        meta.textContent = "error";
+        wrap.innerHTML = `<div class="empty text-red-400">${escapeHtml(e.message || String(e))}</div>`;
+      }
+    }
+
     function refresh() {
       loadShadow();
       loadWindow();
@@ -843,6 +981,7 @@
       loadDecisions();
       loadPolicy();
       loadCalibration();
+      loadSizing();
     }
 
     // Force-cycle button: triggers one paper-trade cycle synchronously,
