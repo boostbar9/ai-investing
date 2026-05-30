@@ -641,3 +641,103 @@ def test_shadow_page_includes_policy_panel_hooks() -> None:
     assert "policy-histogram" in body
     assert "policy-decisions" in body
     assert "Confidence-Gated Policy" in body
+
+
+# ---------------------------------------------------------------------------
+# Phase 14: /api/shadow/calibration endpoint + reliability panel hooks
+# ---------------------------------------------------------------------------
+
+
+def test_api_shadow_calibration_empty(isolated_decisions: Path) -> None:
+    """No decisions logged yet -> empty curve, no calibrator fitted.
+
+    The dashboard should still get a well-formed response so it can render
+    the "not enough data yet" placeholder cleanly."""
+    client = TestClient(srv.app)
+    r = client.get("/api/shadow/calibration")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["n_samples"] == 0
+    assert payload["raw"]["buckets"] == []
+    assert payload["calibrated"] is None
+    assert payload["calibrator"]["is_fitted"] is False
+    assert payload["horizon_days"] == 5
+
+
+def test_api_shadow_calibration_horizon_days_clamped(
+    isolated_decisions: Path,
+) -> None:
+    """Bogus horizons get clamped into [1, 30] -- the endpoint should never
+    accept a 1000-day horizon that would blow out the price-panel lookup."""
+    client = TestClient(srv.app)
+    assert client.get("/api/shadow/calibration?horizon_days=0").json()["horizon_days"] == 1
+    assert client.get("/api/shadow/calibration?horizon_days=1000").json()["horizon_days"] == 30
+
+
+def test_api_shadow_calibration_with_fitted_calibrator(
+    isolated_decisions: Path, monkeypatch, tmp_path: Path
+) -> None:
+    """A pre-fitted calibrator file should populate the calibrator block
+    (breakpoints + diagnostic metrics) even when the live decision log
+    has no realised returns yet."""
+    from packages.agents import calibration as cal_mod
+
+    fitted = cal_mod.IsotonicCalibrator(
+        x_breakpoints=[0.0, 0.5, 1.0],
+        y_breakpoints=[0.05, 0.4, 0.95],
+        n_samples_fit=150,
+        raw_ece=0.20,
+        calibrated_ece=0.05,
+        raw_brier=0.30,
+        calibrated_brier=0.18,
+    )
+    cal_path = tmp_path / "policy_isotonic.json"
+    fitted.save(cal_path)
+    # Point the loader at the test file (avoid touching the user's real one).
+    monkeypatch.setattr(cal_mod, "DEFAULT_CALIBRATOR_PATH", cal_path)
+
+    client = TestClient(srv.app)
+    r = client.get("/api/shadow/calibration")
+    assert r.status_code == 200
+    cal_block = r.json()["calibrator"]
+    assert cal_block["is_fitted"] is True
+    assert cal_block["n_samples_fit"] == 150
+    assert cal_block["raw_ece"] == pytest.approx(0.20)
+    assert cal_block["calibrated_ece"] == pytest.approx(0.05)
+    # Breakpoints should be ordered (x, y) pairs.
+    assert len(cal_block["breakpoints"]) == 3
+    assert cal_block["breakpoints"][0]["x"] == 0.0
+    assert cal_block["breakpoints"][-1]["x"] == 1.0
+
+
+def test_api_shadow_calibration_survives_missing_price_panel(
+    isolated_decisions: Path,
+) -> None:
+    """If the price-panel loader explodes (network down / data missing), the
+    endpoint must still return a successful empty-curve response. The whole
+    panel is best-effort instrumentation; a failure here cannot break /shadow."""
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    row = _policy_decision_row(
+        ts=now,
+        decisions=[{"symbol": "NVDA", "action": "buy", "confidence": 0.8}],
+    )
+    _write_decisions(isolated_decisions, [row])
+
+    client = TestClient(srv.app)
+    r = client.get("/api/shadow/calibration")
+    assert r.status_code == 200
+    # Whether or not the panel resolved, the endpoint shape must be stable.
+    payload = r.json()
+    assert "raw" in payload and "calibrator" in payload and "calibrated" in payload
+
+
+def test_shadow_page_includes_calibration_panel_hooks() -> None:
+    """The /shadow template must reference the calibration endpoint + the
+    canvas / metric DOM nodes the JS reaches for."""
+    client = TestClient(srv.app)
+    body = client.get("/shadow").text
+    assert "/api/shadow/calibration" in body
+    assert "calibration-chart" in body or "reliability" in body.lower()
+    assert "Policy Calibration" in body or "Reliability" in body

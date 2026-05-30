@@ -307,7 +307,21 @@ def compute_policy_weights() -> dict[str, float]:
     # correct BUY decisions; SELLs for names we hold get handled the
     # next cycle once positions are visible. (Acceptable: the existing
     # rebalancer flattens dropped names anyway via weight=0 absence.)
-    policy = ConfidenceGatedPolicy()
+    #
+    # Phase 14: load the persisted isotonic calibrator if present. When
+    # missing or unfitted the policy uses raw composite confidence
+    # (identical to Phase 13 behaviour). The calibrator is rebuilt
+    # offline by tools/fit_policy_calibrator.py from the decision log.
+    try:
+        from packages.agents.calibration import IsotonicCalibrator
+
+        cal = IsotonicCalibrator.load()
+        calibrator = cal if cal.is_fitted else None
+    except Exception as exc:  # pragma: no cover - defensive only
+        log.warning("policy: calibrator load failed: %s; using raw", exc)
+        calibrator = None
+
+    policy = ConfidenceGatedPolicy(calibrator=calibrator)
     decisions = policy.decide(
         sweep_candidates=sweep_cands,
         ensemble_weights=ensemble_weights,

@@ -375,3 +375,108 @@ def test_policy_decision_to_dict_shape() -> None:
     assert out["confidence"] == 0.8123  # rounded to 4dp
     assert set(out["components"]) == {"candidate", "regime", "trust", "ensemble_alignment"}
     assert out["reason"] == "strong signal"
+
+
+# ---------------------------------------------------------------------------
+# Phase 14: optional calibrator wiring
+# ---------------------------------------------------------------------------
+
+
+def test_decide_uses_calibrator_when_provided() -> None:
+    """A calibrator that halves every input should reduce composite_confidence
+    in the resulting PolicyDecision -- and raw_confidence should hold the
+    pre-calibration value so we can see what changed."""
+    p = _policy(buy_threshold=0.65)
+    # Halving calibrator: 0.9 raw -> 0.45 calibrated.
+    p.calibrator = lambda x: x * 0.5  # type: ignore[method-assign]
+    decisions = p.decide(
+        sweep_candidates=[
+            {"symbol": "NVDA", "confidence": 1.0, "reddit_trust": 1.0, "corroborated": True}
+        ],
+        ensemble_weights={"NVDA": 0.10},
+        current_holdings=set(),
+        regime="bull",
+        regime_confidence=0.95,
+    )
+    d = next(x for x in decisions if x.symbol == "NVDA")
+    # Raw composite would be ~1.0; calibrated should be ~0.5 -- below the 0.65
+    # buy threshold even though the raw signal screams BUY. That's the whole
+    # point: thresholds now speak in true-probability space.
+    assert d.raw_confidence is not None
+    assert d.raw_confidence >= 0.9
+    assert d.composite_confidence == pytest.approx(d.raw_confidence * 0.5, abs=1e-9)
+    assert d.action == "hold"  # calibration killed the BUY trigger
+
+
+def test_decide_no_calibrator_leaves_raw_confidence_none() -> None:
+    """Without a calibrator (Phase 13 default), raw_confidence stays None.
+    This keeps the decision log lean and lets us distinguish unfitted
+    runs from runs where calibration was active."""
+    p = _policy()
+    decisions = p.decide(
+        sweep_candidates=[{"symbol": "NVDA", "confidence": 0.9}],
+        ensemble_weights={"NVDA": 0.10},
+        current_holdings=set(),
+        regime="bull",
+        regime_confidence=0.9,
+    )
+    for d in decisions:
+        assert d.raw_confidence is None
+
+
+def test_decide_calibrator_failure_falls_back_to_raw() -> None:
+    """A buggy calibrator must not crash a paper-trade cycle; the policy
+    should log + fall back to raw composite for the affected symbol."""
+    p = _policy(buy_threshold=0.65)
+
+    def boom(x: float) -> float:
+        raise RuntimeError("intentionally broken calibrator")
+
+    p.calibrator = boom  # type: ignore[method-assign]
+    decisions = p.decide(
+        sweep_candidates=[
+            {"symbol": "NVDA", "confidence": 1.0, "reddit_trust": 1.0, "corroborated": True}
+        ],
+        ensemble_weights={"NVDA": 0.10},
+        current_holdings=set(),
+        regime="bull",
+        regime_confidence=0.95,
+    )
+    d = next(x for x in decisions if x.symbol == "NVDA")
+    # Composite falls back to raw, which clears the threshold -> BUY.
+    assert d.action == "buy"
+    assert d.composite_confidence >= 0.65
+
+
+def test_decide_calibrator_output_clipped_to_unit_interval() -> None:
+    """A pathological calibrator returning >1 should be clipped at 1.0,
+    not pollute downstream code that assumes composite is in [0, 1]."""
+    p = _policy()
+    p.calibrator = lambda x: x + 5.0  # type: ignore[method-assign]
+    decisions = p.decide(
+        sweep_candidates=[{"symbol": "NVDA", "confidence": 0.5}],
+        ensemble_weights={"NVDA": 0.10},
+        current_holdings=set(),
+        regime="bull",
+        regime_confidence=0.5,
+    )
+    for d in decisions:
+        assert 0.0 <= d.composite_confidence <= 1.0
+
+
+def test_policy_decision_to_dict_includes_raw_confidence_when_set() -> None:
+    """raw_confidence should appear in to_dict ONLY when populated (additive
+    schema -- Phase 13 readers don't see a new field)."""
+    d_with = PolicyDecision(
+        symbol="NVDA", action="buy", composite_confidence=0.7,
+        components={}, reason="ok", raw_confidence=0.9,
+    )
+    out_with = d_with.to_dict()
+    assert out_with["raw_confidence"] == 0.9
+
+    d_without = PolicyDecision(
+        symbol="NVDA", action="buy", composite_confidence=0.7,
+        components={}, reason="ok",
+    )
+    out_without = d_without.to_dict()
+    assert "raw_confidence" not in out_without

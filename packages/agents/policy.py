@@ -100,22 +100,33 @@ class PolicyDecision:
 
     Persisted into the decision log so we can plot a calibration curve
     after enough trades (predicted-confidence vs. realised-win-rate).
+
+    Phase 14 adds ``raw_confidence``: when a calibrator is active,
+    ``composite_confidence`` is the *calibrated* score used for threshold
+    gating, and ``raw_confidence`` keeps the uncalibrated composite for
+    diagnostics. When no calibrator is fitted the two are equal.
     """
 
     symbol: str
     action: Action
-    composite_confidence: float  # in [0, 1]
+    composite_confidence: float  # in [0, 1] -- post-calibration
     components: dict[str, float] = field(default_factory=dict)
     reason: str = ""
+    # Phase 14: uncalibrated composite (additive; identical to
+    # composite_confidence when no calibrator is fitted).
+    raw_confidence: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "symbol": self.symbol,
             "action": self.action,
             "confidence": round(float(self.composite_confidence), 4),
             "components": {k: round(float(v), 4) for k, v in self.components.items()},
             "reason": self.reason,
         }
+        if self.raw_confidence is not None:
+            out["raw_confidence"] = round(float(self.raw_confidence), 4)
+        return out
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -215,12 +226,22 @@ class ConfidenceGatedPolicy:
 
     Construction takes overrides so tests can pin thresholds. Defaults
     pull from the module constants (which themselves pull from env).
+
+    Phase 14: optional ``calibrator`` (any callable mapping a float to a
+    float in [0, 1]). When provided, raw composite confidence is mapped
+    through the calibrator BEFORE threshold gating. This means the
+    BUY/SELL thresholds always speak in true-probability space, not in
+    whatever-units the raw composite happens to drift into.
     """
 
     buy_threshold: float = BUY_THRESHOLD
     sell_threshold: float = SELL_THRESHOLD
     max_positions: int = MAX_POSITIONS
     cash_floor: float = CASH_FLOOR
+    # Optional calibration map. Typing is intentionally loose (any callable
+    # taking and returning a float) so this module doesn't import
+    # calibration.py -- keeps the dep graph one-way to avoid cycles.
+    calibrator: Any = None
 
     def __post_init__(self) -> None:
         # Sanity: SELL must be strictly below BUY, or every name in the
@@ -267,12 +288,28 @@ class ConfidenceGatedPolicy:
 
         decisions: list[PolicyDecision] = []
         for sym in sorted(universe):
-            composite, components = composite_confidence(
+            raw_composite, components = composite_confidence(
                 candidate=sweep_by_symbol.get(sym),
                 regime=regime,
                 regime_confidence=regime_confidence,
                 ensemble_weight=ensemble_by_symbol.get(sym, 0.0),
             )
+
+            # Phase 14: pipe through calibrator if one is fitted. The
+            # calibrator is monotone so action ordering is preserved, but
+            # the absolute confidence level may shift -- which is the
+            # whole point: thresholds now mean true probability.
+            if self.calibrator is not None:
+                try:
+                    composite = _clip01(float(self.calibrator(raw_composite)))
+                except Exception as exc:  # never let calibration crash a cycle
+                    logger.warning(
+                        "calibrator failed on %.3f for %s: %s; using raw",
+                        raw_composite, sym, exc,
+                    )
+                    composite = raw_composite
+            else:
+                composite = raw_composite
 
             is_held = sym in held
 
@@ -310,6 +347,9 @@ class ConfidenceGatedPolicy:
                     composite_confidence=composite,
                     components=components,
                     reason=reason,
+                    raw_confidence=(
+                        raw_composite if self.calibrator is not None else None
+                    ),
                 )
             )
 

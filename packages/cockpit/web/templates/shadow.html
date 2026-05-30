@@ -52,6 +52,14 @@
     /* equity curve */
     #equity-chart { width: 100%; height: 200px; }
 
+    /* Phase 14: calibration reliability panel */
+    #reliability-chart { width: 100%; height: 240px; }
+    .calib-metric { display: inline-block; padding: 4px 10px; border-radius: 4px; background: #1f2937; margin-right: 6px; font-variant-numeric: tabular-nums; }
+    .calib-metric .label { color: #94a3b8; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; margin-right: 4px; }
+    .calib-metric .value { color: #e5e7eb; font-weight: 600; font-family: ui-monospace, monospace; }
+    .calib-metric.good .value { color: #6ee7b7; }
+    .calib-metric.bad .value { color: #fca5a5; }
+
     /* Phase 13: confidence-gated policy panel */
     .policy-chip { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; font-variant-numeric: tabular-nums; }
     .policy-chip.buy { background: #064e3b; color: #6ee7b7; border: 1px solid #10b981; }
@@ -219,6 +227,32 @@
       </div>
     </div>
 
+    <!-- Phase 14: Calibration reliability diagram -->
+    <div class="panel">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-lg font-semibold">Policy Calibration Reliability</h2>
+        <div class="text-xs text-gray-400" id="calib-meta">Loading...</div>
+      </div>
+      <p class="text-xs text-gray-500 mb-3">
+        How well does predicted confidence match realised win-rate? A
+        perfectly calibrated model lands on the diagonal: a 0.70 prediction
+        wins ~70% of the time. Points above the diagonal mean the model
+        is under-confident; below means over-confident. Brier score and
+        Expected Calibration Error (ECE) summarise miscalibration --
+        lower is better.
+      </p>
+      <div class="flex flex-wrap gap-2 mb-3" id="calib-metrics">
+        <div class="calib-metric"><span class="label">Samples</span><span class="value" id="calib-n">—</span></div>
+        <div class="calib-metric"><span class="label">Raw ECE</span><span class="value" id="calib-raw-ece">—</span></div>
+        <div class="calib-metric"><span class="label">Raw Brier</span><span class="value" id="calib-raw-brier">—</span></div>
+        <div class="calib-metric"><span class="label">Calibrator</span><span class="value" id="calib-status">—</span></div>
+      </div>
+      <canvas id="reliability-chart"></canvas>
+      <div class="text-xs text-gray-500 mt-2" id="calib-hint">
+        Diagonal = perfect calibration. Yellow dots = raw composite; green dots = calibrated (when active). Dot size = sample count.
+      </div>
+    </div>
+
     <!-- Predicted vs Actual -->
     <div class="panel">
       <h2 class="text-lg font-semibold mb-3">Predicted vs Actual</h2>
@@ -308,6 +342,134 @@
       } catch (e) {
         document.getElementById("decisions-container").innerHTML =
           '<div class="empty">Error loading: ' + escapeHtml(e.message) + '</div>';
+      }
+    }
+
+    async function loadCalibration() {
+      try {
+        const c = await Cockpit.api.get("/api/shadow/calibration?horizon_days=5");
+        renderCalibration(c);
+      } catch (e) {
+        document.getElementById("calib-meta").textContent = "error";
+        document.getElementById("calib-hint").textContent =
+          'Error loading: ' + escapeHtml(e.message);
+      }
+    }
+
+    function renderCalibration(c) {
+      const raw = c.raw || { buckets: [], n_samples: 0, brier_score: 0, ece: 0 };
+      const cal = c.calibrated;
+      const calMeta = c.calibrator || {};
+      const meta = document.getElementById("calib-meta");
+      meta.textContent = `horizon ${c.horizon_days}d \u00B7 ${raw.n_samples} BUY samples joined to forward return`;
+
+      document.getElementById("calib-n").textContent = String(raw.n_samples);
+      document.getElementById("calib-raw-ece").textContent = (raw.ece || 0).toFixed(3);
+      document.getElementById("calib-raw-brier").textContent = (raw.brier_score || 0).toFixed(3);
+      const statusEl = document.getElementById("calib-status");
+      if (calMeta.is_fitted) {
+        statusEl.textContent = `fitted (n=${calMeta.n_samples_fit}, ECE ${calMeta.raw_ece.toFixed(3)} \u2192 ${calMeta.calibrated_ece.toFixed(3)})`;
+        statusEl.parentElement.classList.add("good");
+        statusEl.parentElement.classList.remove("bad");
+      } else {
+        statusEl.textContent = "not fitted (using raw composite)";
+        statusEl.parentElement.classList.add("bad");
+        statusEl.parentElement.classList.remove("good");
+      }
+
+      renderReliabilityChart(raw.buckets || [], cal ? cal.buckets : null);
+    }
+
+    function renderReliabilityChart(rawBuckets, calBuckets) {
+      const canvas = document.getElementById("reliability-chart");
+      const ctx = canvas.getContext("2d");
+      const dpr = window.devicePixelRatio || 1;
+      const cssW = canvas.clientWidth || 600;
+      const cssH = 240;
+      canvas.width = cssW * dpr;
+      canvas.height = cssH * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cssW, cssH);
+
+      const padL = 40, padR = 12, padT = 12, padB = 30;
+      const plotW = cssW - padL - padR;
+      const plotH = cssH - padT - padB;
+
+      // Background grid: 0.1 spacing on both axes.
+      ctx.strokeStyle = "#1f2937";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let i = 0; i <= 10; i++) {
+        const x = padL + (i / 10) * plotW;
+        const y = padT + (i / 10) * plotH;
+        ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH);
+        ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y);
+      }
+      ctx.stroke();
+
+      // Perfect-calibration diagonal.
+      ctx.strokeStyle = "#475569";
+      ctx.setLineDash([4, 4]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padL, padT + plotH);
+      ctx.lineTo(padL + plotW, padT);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Axis labels.
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "10px ui-monospace, monospace";
+      ctx.textAlign = "center";
+      for (let i = 0; i <= 10; i += 2) {
+        const v = (i / 10).toFixed(1);
+        ctx.fillText(v, padL + (i / 10) * plotW, padT + plotH + 14);
+      }
+      ctx.textAlign = "right";
+      for (let i = 0; i <= 10; i += 2) {
+        const v = (i / 10).toFixed(1);
+        ctx.fillText(v, padL - 4, padT + plotH - (i / 10) * plotH + 3);
+      }
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#64748b";
+      ctx.fillText("predicted confidence", padL + plotW / 2, padT + plotH + 26);
+      ctx.save();
+      ctx.translate(12, padT + plotH / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillText("realised win rate", 0, 0);
+      ctx.restore();
+
+      function drawDots(buckets, fillColor, edgeColor) {
+        if (!buckets || !buckets.length) return;
+        const maxCount = Math.max(1, ...buckets.map(b => b.count || 0));
+        for (const b of buckets) {
+          const x = padL + (b.mean_predicted || 0) * plotW;
+          const y = padT + plotH - (b.mean_realised || 0) * plotH;
+          // Radius scales with count, capped 3-12 px.
+          const r = 3 + 9 * Math.sqrt((b.count || 0) / maxCount);
+          ctx.beginPath();
+          ctx.fillStyle = fillColor;
+          ctx.strokeStyle = edgeColor;
+          ctx.lineWidth = 1.5;
+          ctx.arc(x, y, r, 0, 2 * Math.PI);
+          ctx.fill();
+          ctx.stroke();
+        }
+      }
+
+      // Raw composite: amber dots.
+      drawDots(rawBuckets, "rgba(251, 191, 36, 0.7)", "#f59e0b");
+      // Calibrated: green dots, drawn on top.
+      if (calBuckets) drawDots(calBuckets, "rgba(16, 185, 129, 0.7)", "#10b981");
+
+      if (!rawBuckets.length) {
+        ctx.fillStyle = "#64748b";
+        ctx.font = "12px ui-sans-serif, system-ui";
+        ctx.textAlign = "center";
+        ctx.fillText(
+          "Not enough decisions yet \u2014 need ~30 BUYs with 5d realised return",
+          padL + plotW / 2, padT + plotH / 2
+        );
       }
     }
 
@@ -680,6 +842,7 @@
       loadPipeline();
       loadDecisions();
       loadPolicy();
+      loadCalibration();
     }
 
     // Force-cycle button: triggers one paper-trade cycle synchronously,

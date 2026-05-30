@@ -630,6 +630,130 @@ def api_shadow_policy(limit: int = 50) -> dict[str, Any]:
     }
 
 
+@app.get("/api/shadow/calibration")
+def api_shadow_calibration(
+    horizon_days: int = 5, win_threshold: float = 0.0
+) -> dict[str, Any]:
+    """Phase 14: reliability curve for the confidence-gated policy.
+
+    Joins BUY decisions from the JSONL log with realised forward returns
+    over ``horizon_days`` (close-to-close on whatever price data we can
+    reach), bins by 0.1-wide predicted-confidence band, and returns the
+    reliability table + Brier score + ECE for the dashboard to plot.
+
+    Also reports whether a fitted calibrator is currently active in the
+    live policy and includes its diagnostics (raw vs calibrated ECE).
+
+    Best-effort: if price data isn't reachable (offline / yfinance flaky)
+    the endpoint returns an empty curve with ``n_samples=0`` rather than
+    erroring -- the panel renders a "not enough data yet" placeholder.
+    """
+    from datetime import UTC, datetime
+
+    from packages.agents.calibration import (
+        IsotonicCalibrator,
+        ReliabilityCurve,
+        extract_calibration_pairs,
+    )
+    from packages.paper.decisions import iter_decisions
+
+    horizon = max(1, min(int(horizon_days), 30))
+
+    # Pull all decision rows (full history -- typically only a few hundred).
+    rows = list(iter_decisions())
+
+    # Collect the symbols + decision timestamps we need forward returns for.
+    needed: dict[str, list[str]] = {}
+    for row in rows:
+        ts = row.get("ts")
+        if not ts:
+            continue
+        for pd_ in row.get("policy_decisions") or []:
+            if pd_.get("action") != "buy":
+                continue
+            sym = pd_.get("symbol")
+            if not sym:
+                continue
+            needed.setdefault(str(sym).upper(), []).append(ts)
+
+    realised: dict[str, dict[str, float]] = {}
+    if needed:
+        try:
+            from tools.paper_trade import load_panel
+
+            panel = load_panel(sorted(needed.keys()))
+        except Exception as exc:  # pragma: no cover - network/data dependent
+            log.warning("calibration: price panel unavailable: %s", exc)
+            panel = None
+
+        if panel is not None and not panel.empty:
+            for sym, ts_list in needed.items():
+                if sym not in panel.columns:
+                    continue
+                series = panel[sym].dropna()
+                if len(series) < horizon + 1:
+                    continue
+                for ts in ts_list:
+                    try:
+                        decision_day = datetime.fromisoformat(
+                            str(ts).replace("Z", "+00:00")
+                        ).date()
+                    except (TypeError, ValueError):
+                        continue
+                    # Find the first trading day >= decision_day. The
+                    # entry price is that day's close; the exit price is
+                    # horizon trading days later.
+                    idx_dates = [d.date() for d in series.index]
+                    entry_i = None
+                    for i, d in enumerate(idx_dates):
+                        if d >= decision_day:
+                            entry_i = i
+                            break
+                    if entry_i is None or entry_i + horizon >= len(series):
+                        continue
+                    entry = float(series.iloc[entry_i])
+                    exit_ = float(series.iloc[entry_i + horizon])
+                    if entry <= 0:
+                        continue
+                    realised.setdefault(sym, {})[ts] = (exit_ / entry) - 1.0
+
+    pairs = extract_calibration_pairs(
+        rows,
+        realised,
+        horizon_days=horizon,
+        win_threshold=float(win_threshold),
+    )
+    raw_curve = ReliabilityCurve.from_pairs(pairs)
+
+    # If a fitted calibrator exists, also build the post-calibration curve.
+    cal = IsotonicCalibrator.load()
+    calibrated_curve = None
+    if cal.is_fitted and pairs:
+        cal_pairs = [(cal(p), y) for p, y in pairs]
+        calibrated_curve = ReliabilityCurve.from_pairs(cal_pairs)
+
+    return {
+        "horizon_days": horizon,
+        "win_threshold": float(win_threshold),
+        "n_samples": raw_curve.n_samples,
+        "raw": raw_curve.to_dict(),
+        "calibrated": calibrated_curve.to_dict() if calibrated_curve else None,
+        "calibrator": {
+            "is_fitted": cal.is_fitted,
+            "n_samples_fit": cal.n_samples_fit,
+            "raw_ece": round(cal.raw_ece, 4),
+            "calibrated_ece": round(cal.calibrated_ece, 4),
+            "raw_brier": round(cal.raw_brier, 4),
+            "calibrated_brier": round(cal.calibrated_brier, 4),
+            "breakpoints": [
+                {"x": round(x, 4), "y": round(y, 4)}
+                for x, y in zip(cal.x_breakpoints, cal.y_breakpoints, strict=False)
+            ],
+        },
+        "now": datetime.now(UTC).isoformat(),
+    }
+
+
 # Phase 12: manual one-shot cycle trigger. Lets the user click a button
 # on /shadow and immediately see a new decision row appear in the table.
 # Default strategy = 'ensemble' (the same one tools/boot.py drives in the
