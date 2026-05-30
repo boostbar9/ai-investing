@@ -49,6 +49,30 @@
       </div>
     </header>
 
+    <!-- Phase 15a: one-click risk-adaptive sizing activation -->
+    <div id="sizing-card" class="card p-5 mb-4" data-tt="Phase 15 risk-adaptive position sizing">
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <h2 class="text-lg font-semibold">Risk-Adaptive Sizing</h2>
+          <p class="text-xs text-gray-400 mt-1">
+            One-click activation of Phase 15 sizing. Picks a preset and writes the
+            <span class="mono text-gray-300">POLICY_*</span> env vars atomically. The next
+            cycle picks them up automatically &mdash; no worker restart.
+          </p>
+        </div>
+        <div id="sizing-mode-badge" class="text-xs px-2 py-1 rounded bg-gray-800 text-gray-300 mono">loading...</div>
+      </div>
+      <div id="sizing-presets" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-3">
+        <!-- preset buttons rendered by JS -->
+      </div>
+      <details class="text-xs text-gray-400">
+        <summary class="cursor-pointer hover:text-gray-200">Active env values</summary>
+        <table class="mt-2 w-full text-xs mono">
+          <tbody id="sizing-active-tbody"></tbody>
+        </table>
+      </details>
+    </div>
+
     <div id="providers" class="space-y-4">
       <div class="card p-5"><span class="skel" style="display:inline-block;width:160px;height:14px">&nbsp;</span></div>
     </div>
@@ -188,9 +212,88 @@
       }
     }
 
+    // -----------------------------------------------------------------
+    // Phase 15a: risk-adaptive sizing preset card
+    // -----------------------------------------------------------------
+    async function loadSizing() {
+      try {
+        const cfg = await Cockpit.api.get('/api/sizing/config');
+        renderSizing(cfg);
+      } catch (e) {
+        const badge = document.getElementById('sizing-mode-badge');
+        if (badge) { badge.textContent = 'load failed'; badge.classList.add('text-red-300'); }
+      }
+    }
+
+    function renderSizing(cfg) {
+      const badge = document.getElementById('sizing-mode-badge');
+      const matched = cfg.matched_preset;
+      const mode = cfg.effective_mode || 'equal_weight';
+      if (badge) {
+        badge.textContent = matched ? `${matched.toUpperCase()} \u00b7 ${mode}` : `custom \u00b7 ${mode}`;
+        badge.className = 'text-xs px-2 py-1 rounded mono ' + (
+          matched === 'off' ? 'bg-gray-800 text-gray-400'
+          : matched === 'conservative' ? 'bg-blue-900 text-blue-200'
+          : matched === 'balanced' ? 'bg-green-900 text-green-200'
+          : matched === 'aggressive' ? 'bg-yellow-900 text-yellow-200'
+          : 'bg-purple-900 text-purple-200'
+        );
+      }
+      const presets = cfg.presets || {};
+      const order = ['off', 'conservative', 'balanced', 'aggressive'];
+      const wrap = document.getElementById('sizing-presets');
+      if (wrap) {
+        wrap.innerHTML = '';
+        for (const name of order) {
+          if (!presets[name]) continue;
+          const isActive = matched === name;
+          const btn = document.createElement('button');
+          btn.className = 'text-left p-3 rounded border transition ' + (
+            isActive
+              ? 'border-green-500 bg-green-950/40'
+              : 'border-gray-700 bg-gray-900 hover:border-blue-500 hover:bg-gray-800'
+          );
+          btn.innerHTML = `
+            <div class="flex items-center justify-between mb-1">
+              <span class="font-semibold capitalize">${name}</span>
+              ${isActive ? '<span class="text-xs text-green-400">active</span>' : ''}
+            </div>
+            <div class="text-xs text-gray-400">${presets[name].description || ''}</div>
+          `;
+          btn.addEventListener('click', () => applySizingPreset(name));
+          wrap.appendChild(btn);
+        }
+      }
+      const tbody = document.getElementById('sizing-active-tbody');
+      if (tbody) {
+        tbody.innerHTML = '';
+        for (const [k, v] of Object.entries(cfg.active || {})) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td class="py-0.5 pr-3 text-gray-500">${k}</td><td class="py-0.5 text-gray-300">${v || '<em class="text-gray-600">(unset)</em>'}</td>`;
+          tbody.appendChild(tr);
+        }
+      }
+    }
+
+    async function applySizingPreset(preset) {
+      try {
+        const res = await Cockpit.api.post('/api/sizing/configure', { preset });
+        if (res && res.ok) {
+          Cockpit.toastSuccess(`Sizing set to \"${preset}\". Next cycle picks it up automatically.`);
+          await loadSizing();
+        } else {
+          const why = (res && res.reasons || []).join('; ') || 'unknown';
+          Cockpit.toastError(`Could not apply preset: ${why}`);
+        }
+      } catch (e) {
+        Cockpit.toastError('Apply failed: ' + e.message);
+      }
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
       document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
       load();
+      loadSizing();
       Cockpit.poll(refreshTopbar, 5000, { name: 'settings-topbar' });
     });
   </script>

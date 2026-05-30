@@ -3591,6 +3591,69 @@ def api_arm_live_audit(limit: int = 50) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Phase 15a: one-click risk-adaptive sizing activation
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/sizing/config")
+def api_sizing_config() -> dict[str, Any]:
+    """Return the active sizing config + available presets.
+
+    Used by the Settings page to render preset buttons and a current-mode
+    badge.
+    """
+    from packages.cockpit.web.sizing_control import current_config
+
+    return current_config()
+
+
+@app.post("/api/sizing/configure")
+def api_sizing_configure(body: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Apply a sizing preset (and optional per-key overrides) atomically.
+
+    Writes the configured ``POLICY_*`` env vars to ``.env`` and mirrors
+    them to ``os.environ`` so the next paper_trade cycle picks them up
+    without a worker restart. Empty string values delete the key, which
+    is how the "Off" preset reverts to Phase 13 equal-weight.
+    """
+    from packages.cockpit.web.sizing_control import configure
+
+    preset: str | None = None
+    overrides: dict[str, str] | None = None
+    note: str | None = None
+    if isinstance(body, dict):
+        raw_preset = body.get("preset")
+        if isinstance(raw_preset, str):
+            preset = raw_preset.strip() or None
+        raw_overrides = body.get("overrides")
+        if isinstance(raw_overrides, dict):
+            overrides = {
+                str(k): str(v) for k, v in raw_overrides.items() if isinstance(k, str)
+            }
+        raw_note = body.get("note")
+        if isinstance(raw_note, str):
+            note = raw_note.strip()[:500] or None
+
+    result = configure(
+        preset=preset,
+        overrides=overrides,
+        actor="operator",
+        note=note,
+    )
+    return result.to_response()
+
+
+@app.get("/api/sizing/audit")
+def api_sizing_audit(limit: int = 50) -> dict[str, Any]:
+    """Tail the sizing-config audit log."""
+    from packages.cockpit.web.sizing_control import read_audit
+
+    capped = max(1, min(int(limit), 500))
+    rows = read_audit(limit=capped)
+    return {"events": rows, "count": len(rows)}
+
+
+# --------------------------------------------------------------------------
 # Self-improvement: outcome attribution + promotion candidates
 # --------------------------------------------------------------------------
 
