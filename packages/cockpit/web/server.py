@@ -3178,6 +3178,36 @@ def autopilot_page() -> HTMLResponse:
 
 
 @app.on_event("startup")
+async def _cleanup_stale_tmp_files() -> None:  # pragma: no cover
+    """Phase 15b: sweep orphan tmp*.tmp files left by crashed atomic writes.
+
+    Stale temps accumulate when a worker crashes between
+    ``NamedTemporaryFile.close()`` and ``os.replace()``. They are harmless
+    but make ``data/cockpit/`` noisy over time. Anything older than the
+    default age threshold (1 hour) is definitionally stale -- atomic
+    writes complete in milliseconds.
+    """
+    try:
+        from packages.shared.atomic_io import cleanup_stale_tmp_files
+
+        for sweep_dir in (
+            REPO_ROOT / "data" / "cockpit",
+            REPO_ROOT / "data" / "paper_log",
+            REPO_ROOT / "data" / "calibration",
+            REPO_ROOT / "data" / "params",
+        ):
+            removed = cleanup_stale_tmp_files(sweep_dir)
+            if removed:
+                log.info(
+                    "startup tmp-sweep: removed %d stale temp(s) from %s",
+                    len(removed),
+                    sweep_dir,
+                )
+    except Exception as e:
+        log.warning("startup tmp-sweep failed: %s", e)
+
+
+@app.on_event("startup")
 async def _autopilot_startup() -> None:  # pragma: no cover
     # Auto-resume autopilot if the user had it enabled before shutdown.
     # Mirrors the paper-loop auto-resume contract: intent persisted in

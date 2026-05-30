@@ -337,7 +337,16 @@ class IsotonicCalibrator:
         return self
 
     def save(self, path: Path | None = None) -> Path:
-        """Persist as JSON. Returns the path written."""
+        """Persist as JSON atomically. Returns the path written.
+
+        Uses the shared :func:`write_json_atomic` helper so a crash
+        mid-write cannot corrupt the live calibration model. The loader
+        already handles a missing file by falling back to identity, so
+        a half-written file is the only real failure mode -- and this
+        eliminates it.
+        """
+        from packages.shared.atomic_io import write_json_atomic
+
         target = path if path is not None else DEFAULT_CALIBRATOR_PATH
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -349,7 +358,7 @@ class IsotonicCalibrator:
             "calibrated_brier": self.calibrated_brier,
             "calibrated_ece": self.calibrated_ece,
         }
-        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        write_json_atomic(target, payload)
         return target
 
     @classmethod

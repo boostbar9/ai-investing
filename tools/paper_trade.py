@@ -140,6 +140,8 @@ class KillSwitchResult:
 
 
 def update_session_peak(equity: float) -> float:
+    from packages.shared.atomic_io import write_json_atomic
+
     PAPER_LOG_DIR.mkdir(parents=True, exist_ok=True)
     peak = equity
     if EQUITY_PEAK_FILE.exists():
@@ -148,7 +150,10 @@ def update_session_peak(equity: float) -> float:
             peak = max(float(data.get("peak", 0.0)), equity)
         except (json.JSONDecodeError, ValueError, OSError):
             pass
-    EQUITY_PEAK_FILE.write_text(json.dumps({"peak": peak, "updated_at": datetime.now(UTC).isoformat()}))
+    write_json_atomic(
+        EQUITY_PEAK_FILE,
+        {"peak": peak, "updated_at": datetime.now(UTC).isoformat()},
+    )
     return peak
 
 
