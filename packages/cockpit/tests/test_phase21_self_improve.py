@@ -93,9 +93,10 @@ def test_judge_picks_marks_hit_miss_and_flat(tmp_paths: dict[str, Path]) -> None
         # Manually back-date by rewriting the file.
         import json
 
-        data = json.loads(tmp_paths["mem"].read_text())
-        data["picks"][-1]["ts"] = base_ts
-        tmp_paths["mem"].write_text(json.dumps(data))
+        raw = json.loads(tmp_paths["mem"].read_text())
+        picks = (raw.get("data") or raw).setdefault("picks", [])
+        picks[-1]["ts"] = base_ts
+        tmp_paths["mem"].write_text(json.dumps(raw))
 
     _write("WIN", 100.0)
     _write("LOSE", 100.0)
@@ -114,9 +115,10 @@ def test_judge_picks_handles_missing_price(tmp_paths: dict[str, Path]) -> None:
     )
     import json
 
-    data = json.loads(tmp_paths["mem"].read_text())
-    data["picks"][-1]["ts"] = base_ts
-    tmp_paths["mem"].write_text(json.dumps(data))
+    raw = json.loads(tmp_paths["mem"].read_text())
+    picks = (raw.get("data") or raw).setdefault("picks", [])
+    picks[-1]["ts"] = base_ts
+    tmp_paths["mem"].write_text(json.dumps(raw))
 
     judged = brain_memory.judge_picks(lambda s: None)
     # Old enough to give up on -> no_price.

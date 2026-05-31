@@ -32,17 +32,15 @@ phase), the data shapes already match what the LLM will need.
 
 from __future__ import annotations
 
-import contextlib
-import json
 import logging
-import os
-import tempfile
 import threading
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from packages.cockpit.web.memory_store import AppendLog
 
 log = logging.getLogger("reflection")
 
@@ -222,53 +220,29 @@ def compose(
 # ---------------------------------------------------------------------------
 
 
+def _log(path: Path) -> AppendLog:
+    return AppendLog(path=path, max_lines=MAX_ENTRIES, archive_max_lines=5_000)
+
+
 def append(reflection: Reflection, path: Path | None = None) -> None:
-    """Append one reflection as a JSON line. Caps file at MAX_ENTRIES."""
+    """Append one reflection as a JSON line. Caps file at MAX_ENTRIES;
+    older entries are archived to ``<path>.archive.jsonl`` for posterity.
+    """
+
     if path is None:
         path = DEFAULT_PATH
-
-    path.parent.mkdir(parents=True, exist_ok=True)
     with LOCK:
-        existing: list[str] = []
-        if path.exists():
-            try:
-                with path.open(encoding="utf-8") as fh:
-                    existing = [line for line in fh.read().splitlines() if line.strip()]
-            except OSError:
-                existing = []
-        existing.append(json.dumps(asdict(reflection), sort_keys=True))
-        existing = existing[-MAX_ENTRIES:]
-        fd, tmp = tempfile.mkstemp(prefix=".refl_", dir=str(path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write("\n".join(existing) + "\n")
-            os.replace(tmp, path)
-        except Exception:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(tmp)
-            raise
+        _log(path).append(asdict(reflection))
 
 
 def recent(limit: int = 10, path: Path | None = None) -> list[dict[str, Any]]:
     """Return the most recent ``limit`` reflections, newest first."""
+
     if path is None:
         path = DEFAULT_PATH
-
-    if not path.exists():
-        return []
     with LOCK:
-        try:
-            with path.open(encoding="utf-8") as fh:
-                lines = [line for line in fh.read().splitlines() if line.strip()]
-        except OSError:
-            return []
-    out: list[dict[str, Any]] = []
-    for line in reversed(lines[-limit:]):
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out
+        tail = _log(path).tail(limit=limit)
+    return list(reversed(tail))
 
 
 def latest(path: Path | None = None) -> dict[str, Any] | None:
@@ -280,13 +254,19 @@ def latest(path: Path | None = None) -> dict[str, Any] | None:
     return items[0] if items else None
 
 
+def store_info(path: Path | None = None) -> dict[str, Any]:
+    """Return health info (size, mtime, line count, archive) for the dashboard."""
+    if path is None:
+        path = DEFAULT_PATH
+    return _log(path).health()
+
+
 def reset_for_tests(path: Path | None = None) -> None:  # pragma: no cover — test util
     """Wipe state. ONLY for tests."""
     if path is None:
         path = DEFAULT_PATH
     with LOCK:
-        if path.exists():
-            path.unlink()
+        _log(path).reset()
 
 
 # Re-export Iterable so tests can introspect without importing module guts.

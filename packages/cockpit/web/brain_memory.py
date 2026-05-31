@@ -14,31 +14,19 @@ Three downstream consumers read this ledger:
   * **Dashboard** surfaces an accuracy trendline so the user can see
     the brain getting smarter.
 
-Storage is JSON at ``data/cockpit/brain_memory.json`` — a single dict
-with ``picks: list[Pick]`` and ``meta``. Concurrent writes are
-serialized via a module lock; ``_atomic_write`` ensures we never
-half-write the file.
+Phase 22 refactor: storage now lives on top of :mod:`memory_store`'s
+:class:`KVStore`, giving us schema versioning, rolling backups, and a
+single atomic-write primitive shared with the rest of the cockpit.
+The public function signatures are unchanged so callers don't notice.
 
-Design notes:
-
-  * We deliberately do *not* depend on a database. JSON keeps the
-    blast radius small and lets the user inspect or wipe state with
-    plain tools.
-  * Outcome judgment uses Alpaca's last-trade price when reachable
-    and silently degrades when not (paper soak environments). When
-    a price is unavailable we re-queue the pick for later judgment.
-  * Picks older than ``MAX_AGE_DAYS`` are pruned to keep the file
-    sub-megabyte; the bandit's weight state is what carries the
-    long-term learning, not the raw ledger.
+We also expose :func:`query` for indexed lookup (by feature / regime /
+status / symbol) so the reflection narrator and dashboard can pull
+slices in O(1) without re-scanning the full ledger.
 """
 
 from __future__ import annotations
 
-import contextlib
-import json
 import logging
-import os
-import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -46,99 +34,113 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-log = logging.getLogger("brain_memory")
+from packages.cockpit.web.memory_store import FeatureIndex, KVStore
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Constants & paths
+# Tunables
 # ---------------------------------------------------------------------------
 
 DEFAULT_PATH = Path("data/cockpit/brain_memory.json")
-MAX_PICKS = 500
-MAX_AGE_DAYS = 60
-# How long after a pick before we judge it. 24h captures one full
-# trading session including overnight gaps — long enough for catalysts
-# to play out but short enough that the bandit gets feedback quickly.
+
+SCHEMA_VERSION = 2
+"""Bumped from v1 (legacy top-level layout) to v2 (envelope managed
+by ``memory_store``). The migration handler simply rewraps."""
+
+MAX_PICKS = 5_000
+"""Hard cap on retained picks. Older ones are pruned by :func:`prune`
+(daily) and never re-judged."""
+
+MAX_AGE_DAYS = 90
+"""Default retention horizon when :func:`prune` is called without an
+explicit ``max_age_days``."""
+
 JUDGMENT_HORIZON_HOURS = 24
-# A pick "hits" when the abs return exceeds this threshold (in the
-# direction the score implied — currently always long). 0.5% is below
-# typical noise but above bid-ask, so we get a usable signal density.
+"""Holding period before a pick gets judged."""
+
 HIT_THRESHOLD = 0.005
+"""Return required (in absolute terms) to classify as hit vs flat.
+0.5% = "the brain was directionally right within a day"."""
 
 _LOCK = threading.RLock()
+"""Module-local lock for the in-memory index cache; the store itself
+is already serialised by :mod:`memory_store`."""
+
+_INDEX_CACHE: dict[Path, tuple[int, FeatureIndex]] = {}
+"""Cache of (picks_count, index) per store path. Rebuilt when the
+ledger size changes — cheap because picks lists are bounded."""
 
 
 # ---------------------------------------------------------------------------
-# Data shapes
+# Data shape
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class Pick:
-    """A single Curiosity focus decision the brain made."""
+    """A single Curiosity pick + later outcome."""
 
     symbol: str
-    ts: str  # ISO timestamp (UTC)
+    ts: str
     score: float
     reasons: list[str] = field(default_factory=list)
-    # Features that actually fired, used by the bandit to credit/blame
-    # specific signal arms. Stored as a list[str] so we can extend the
-    # vocabulary without migration.
     features: list[str] = field(default_factory=list)
     entry_price: float | None = None
-    # Set when judgment runs. status ∈ {pending, hit, miss, expired,
-    # no_price}.
-    status: str = "pending"
+    regime: str | None = None
+    status: str = "pending"  # pending | hit | miss | flat | no_price
     exit_price: float | None = None
     return_pct: float | None = None
     judged_at: str | None = None
-    # Free-form context the reflection agent may want.
-    regime: str | None = None
     notes: str = ""
 
 
 # ---------------------------------------------------------------------------
-# Disk I/O
+# Store helpers
 # ---------------------------------------------------------------------------
 
 
-def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
-    if path is None:
-        path = DEFAULT_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".bm_", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, sort_keys=True)
-        os.replace(tmp, path)
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(tmp)
-        raise
+def _migrate(data: dict[str, Any], on_disk_version: int) -> dict[str, Any]:
+    """Migrate older payloads forward.
 
+    v1 stored ``{"picks": [...], "meta": {...}}`` at the top level.
+    v2 nests user data under ``"data"`` (handled by ``KVStore``) but
+    keeps the ``picks`` key inside it. So v1 -> v2 is effectively a
+    no-op once ``KVStore._unwrap`` has done its thing.
+    """
 
-def _load_raw(path: Path) -> dict[str, Any]:
-    if path is None:
-        path = DEFAULT_PATH
-    if not path.exists():
-        return {"picks": [], "meta": {"created": datetime.now(UTC).isoformat()}}
-    try:
-        with path.open(encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("brain_memory: corrupt file %s (%s) — starting fresh", path, exc)
-        return {"picks": [], "meta": {"created": datetime.now(UTC).isoformat()}}
-    if not isinstance(data, dict):
-        return {"picks": [], "meta": {"created": datetime.now(UTC).isoformat()}}
-    data.setdefault("picks", [])
-    data.setdefault("meta", {})
+    if on_disk_version < 2:
+        data.setdefault("picks", [])
     return data
 
 
-def _save_raw(path: Path, data: dict[str, Any]) -> None:
-    if path is None:
-        path = DEFAULT_PATH
-    data.setdefault("meta", {})["updated"] = datetime.now(UTC).isoformat()
-    _atomic_write(path, data)
+def _store(path: Path) -> KVStore:
+    return KVStore(
+        path=path,
+        schema_version=SCHEMA_VERSION,
+        default={"picks": []},
+        migrate=_migrate,
+    )
+
+
+def _invalidate_index(path: Path) -> None:
+    with _LOCK:
+        _INDEX_CACHE.pop(path.resolve() if path.exists() else path.absolute(), None)
+
+
+def _get_index(path: Path, picks: list[dict[str, Any]]) -> FeatureIndex:
+    """Return a cached :class:`FeatureIndex` for ``picks``. Rebuilt iff
+    the pick count changed since the last call.
+    """
+
+    key = path.resolve() if path.exists() else path.absolute()
+    with _LOCK:
+        cached = _INDEX_CACHE.get(key)
+        if cached and cached[0] == len(picks):
+            return cached[1]
+        idx = FeatureIndex.build(picks)
+        _INDEX_CACHE[key] = (len(picks), idx)
+        return idx
 
 
 # ---------------------------------------------------------------------------
@@ -157,9 +159,9 @@ def record_pick(
     path: Path | None = None,
 ) -> Pick:
     """Append a new pick to the ledger."""
+
     if path is None:
         path = DEFAULT_PATH
-
     sym = (symbol or "").upper().strip()
     if not sym:
         raise ValueError("symbol required")
@@ -172,13 +174,18 @@ def record_pick(
         entry_price=float(entry_price) if entry_price is not None else None,
         regime=regime,
     )
-    with _LOCK:
-        data = _load_raw(path)
-        data["picks"].append(asdict(pick))
-        # Keep file bounded.
-        if len(data["picks"]) > MAX_PICKS:
-            data["picks"] = data["picks"][-MAX_PICKS:]
-        _save_raw(path, data)
+    store = _store(path)
+
+    def _mut(data: dict[str, Any]) -> dict[str, Any]:
+        picks = list(data.get("picks") or [])
+        picks.append(asdict(pick))
+        if len(picks) > MAX_PICKS:
+            picks = picks[-MAX_PICKS:]
+        data["picks"] = picks
+        return data
+
+    store.update(_mut)
+    _invalidate_index(path)
     log.info("brain_memory: recorded pick %s @ %.2f score=%.3f", sym, entry_price or 0, score)
     return pick
 
@@ -190,14 +197,13 @@ def pending_picks(
     path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Return picks ripe for judgment (older than horizon, status=pending)."""
+
     if path is None:
         path = DEFAULT_PATH
-
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(hours=horizon_hours)
+    data = _store(path).read()
     out: list[dict[str, Any]] = []
-    with _LOCK:
-        data = _load_raw(path)
     for p in data.get("picks") or []:
         if p.get("status") != "pending":
             continue
@@ -220,20 +226,15 @@ def judge_picks(
     hit_threshold: float = HIT_THRESHOLD,
     path: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Resolve outcomes for ripe picks. Returns list of judged dicts.
+    """Resolve outcomes for ripe picks. Returns list of judged dicts."""
 
-    ``price_lookup`` is called with a symbol; it should return the
-    *current* last-trade price (or None when unavailable). Picks with
-    no entry price or no current price are marked ``no_price`` and
-    excluded from accuracy stats.
-    """
     if path is None:
         path = DEFAULT_PATH
-
     now = now or datetime.now(UTC)
     judged: list[dict[str, Any]] = []
-    with _LOCK:
-        data = _load_raw(path)
+    store = _store(path)
+
+    def _mut(data: dict[str, Any]) -> dict[str, Any]:
         cutoff = now - timedelta(hours=horizon_hours)
         for p in data.get("picks") or []:
             if p.get("status") != "pending":
@@ -258,7 +259,6 @@ def judge_picks(
                 log.warning("price_lookup error %s: %s", p.get("symbol"), exc)
                 current = None
             if current is None or float(entry) == 0:
-                # Re-queue: only mark expired if it's been *very* late.
                 if ts < now - timedelta(hours=horizon_hours * 4):
                     p["status"] = "no_price"
                     p["judged_at"] = now.isoformat(timespec="seconds")
@@ -268,10 +268,6 @@ def judge_picks(
             p["exit_price"] = float(current)
             p["return_pct"] = round(ret, 5)
             p["judged_at"] = now.isoformat(timespec="seconds")
-            # Picks are scored long-bias. A hit = positive return
-            # above threshold. Miss = negative below threshold.
-            # In between is "flat" and counted as a small miss to
-            # discourage low-conviction picks.
             if ret >= hit_threshold:
                 p["status"] = "hit"
             elif ret <= -hit_threshold:
@@ -279,7 +275,10 @@ def judge_picks(
             else:
                 p["status"] = "flat"
             judged.append(p)
-        _save_raw(path, data)
+        return data
+
+    store.update(_mut)
+    _invalidate_index(path)
     return judged
 
 
@@ -290,15 +289,17 @@ def prune(
     path: Path | None = None,
 ) -> int:
     """Drop picks older than ``max_age_days``. Returns count removed."""
+
     if path is None:
         path = DEFAULT_PATH
-
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(days=max_age_days)
-    removed = 0
-    with _LOCK:
-        data = _load_raw(path)
-        kept = []
+    removed_count = 0
+    store = _store(path)
+
+    def _mut(data: dict[str, Any]) -> dict[str, Any]:
+        nonlocal removed_count
+        kept: list[dict[str, Any]] = []
         for p in data.get("picks") or []:
             try:
                 ts = datetime.fromisoformat(p["ts"])
@@ -309,10 +310,13 @@ def prune(
             if ts >= cutoff:
                 kept.append(p)
             else:
-                removed += 1
+                removed_count += 1
         data["picks"] = kept
-        _save_raw(path, data)
-    return removed
+        return data
+
+    store.update(_mut)
+    _invalidate_index(path)
+    return removed_count
 
 
 def accuracy_stats(
@@ -320,18 +324,11 @@ def accuracy_stats(
     window: int = 50,
     path: Path | None = None,
 ) -> dict[str, Any]:
-    """Compute hit-rate and recent return over judged picks.
+    """Compute hit-rate and recent return over judged picks."""
 
-    Looks at the most recent ``window`` *judged* picks (status in
-    {hit, miss, flat}). ``no_price`` and ``pending`` picks are
-    excluded from accuracy but counted in totals so the dashboard
-    can show "12 pending judgments".
-    """
     if path is None:
         path = DEFAULT_PATH
-
-    with _LOCK:
-        data = _load_raw(path)
+    data = _store(path).read()
     picks = data.get("picks") or []
     pending = sum(1 for p in picks if p.get("status") == "pending")
     no_price = sum(1 for p in picks if p.get("status") == "no_price")
@@ -346,9 +343,6 @@ def accuracy_stats(
     avg_return = (
         sum(float(p.get("return_pct") or 0.0) for p in recent) / n if n else 0.0
     )
-    # Per-feature credit: count how often each feature appeared in
-    # hits vs misses. Useful for the reflection narrator and to
-    # validate the bandit weights are pointed the right direction.
     feature_stats: dict[str, dict[str, int]] = {}
     for p in recent:
         status = p.get("status")
@@ -367,7 +361,7 @@ def accuracy_stats(
         "flats": flats,
         "hit_rate": round(hit_rate, 4),
         "edge_rate": round(edge_rate, 4),
-        "avg_return_pct": round(avg_return, 5),
+        "avg_return": round(avg_return, 5),
         "feature_stats": feature_stats,
     }
 
@@ -378,20 +372,52 @@ def recent_picks(
     path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Return the most recent ``limit`` picks, newest first."""
+
     if path is None:
         path = DEFAULT_PATH
-
-    with _LOCK:
-        data = _load_raw(path)
+    data = _store(path).read()
     picks = list(data.get("picks") or [])
     picks.sort(key=lambda p: p.get("ts") or "", reverse=True)
     return picks[:limit]
 
 
-def reset_for_tests(path: Path | None = None) -> None:  # pragma: no cover — test util
-    """Wipe state. ONLY for tests."""
+def query(
+    *,
+    feature: str | None = None,
+    regime: str | None = None,
+    status: str | None = None,
+    symbol: str | None = None,
+    path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Indexed lookup over the ledger.
+
+    Returns picks matching **all** non-None filters. Backed by a
+    rebuild-on-change :class:`FeatureIndex`, so repeated calls on a
+    stable ledger are O(matching).
+    """
+
     if path is None:
         path = DEFAULT_PATH
-    with _LOCK:
-        if path.exists():
-            path.unlink()
+    data = _store(path).read()
+    picks = list(data.get("picks") or [])
+    idx = _get_index(path, picks)
+    return idx.lookup(
+        picks, feature=feature, regime=regime, status=status, symbol=symbol
+    )
+
+
+def store_info(path: Path | None = None) -> dict[str, Any]:
+    """Return health info (size, mtime, backups) for the dashboard."""
+
+    if path is None:
+        path = DEFAULT_PATH
+    return _store(path).health()
+
+
+def reset_for_tests(path: Path | None = None) -> None:  # pragma: no cover — test util
+    """Wipe state. ONLY for tests."""
+
+    if path is None:
+        path = DEFAULT_PATH
+    _store(path).reset()
+    _invalidate_index(path)

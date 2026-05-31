@@ -44,6 +44,7 @@ from zoneinfo import ZoneInfo
 from packages.cockpit.web import bandit as agent_bandit
 from packages.cockpit.web import brain_memory
 from packages.cockpit.web import chatter as agent_chatter
+from packages.cockpit.web import knowledge_base as agent_knowledge
 from packages.cockpit.web import reflection as agent_reflection
 from packages.cockpit.web import regime as regime_module
 
@@ -488,6 +489,13 @@ async def run_one_tick(
                 feats = jp.get("features") or []
                 if feats:
                     agent_bandit.update_with_outcome(feats, reward)
+            # Fold judged picks into the durable knowledge base so
+            # learnings survive ledger compaction.
+            try:
+                if judged:
+                    agent_knowledge.apply_judged(judged)
+            except Exception as kb_exc:  # pragma: no cover — defensive
+                log.warning("knowledge_base apply_judged failed: %s", kb_exc)
             if judged_count:
                 hits = sum(1 for j in judged if j.get("status") == "hit")
                 misses = sum(1 for j in judged if j.get("status") == "miss")

@@ -61,6 +61,7 @@ from packages.cockpit.web import autonomy as autonomy_brain
 from packages.cockpit.web import bandit as autonomy_bandit
 from packages.cockpit.web import brain_memory as autonomy_memory
 from packages.cockpit.web import chatter as agent_chatter
+from packages.cockpit.web import knowledge_base as autonomy_knowledge
 from packages.cockpit.web import reflection as autonomy_reflection
 from packages.cockpit.web import regime as autonomy_regime
 from packages.execution.broker import AlpacaPaperBroker, BrokerError, OrderRequest
@@ -3220,6 +3221,8 @@ def api_brain() -> dict[str, Any]:
         "reflection": None,
         "recent_picks": [],
         "recent_reflections": [],
+        "knowledge": {},
+        "storage": {},
     }
     try:
         out["memory"] = autonomy_memory.accuracy_stats()
@@ -3241,6 +3244,20 @@ def api_brain() -> dict[str, Any]:
         out["recent_reflections"] = autonomy_reflection.recent(limit=8)
     except Exception:
         out["recent_reflections"] = []
+    # Phase 22: knowledge base + storage health for the Memory Health card.
+    try:
+        out["knowledge"] = autonomy_knowledge.snapshot()
+    except Exception as exc:
+        out["knowledge"] = {"error": str(exc)[:200]}
+    try:
+        out["storage"] = {
+            "brain_memory": autonomy_memory.store_info(),
+            "bandit": autonomy_bandit.store_info(),
+            "reflections": autonomy_reflection.store_info(),
+            "knowledge_base": autonomy_knowledge.store_info(),
+        }
+    except Exception as exc:
+        out["storage"] = {"error": str(exc)[:200]}
     snap = autonomy_brain.snapshot()
     out["regime"] = snap.get("last_regime")
     return out
@@ -3268,6 +3285,11 @@ def api_brain_reset() -> dict[str, Any]:
         removed["reflections"] = True
     except Exception as exc:
         removed["reflections_error"] = str(exc)[:200]
+    try:
+        autonomy_knowledge.reset_for_tests()
+        removed["knowledge"] = True
+    except Exception as exc:
+        removed["knowledge_error"] = str(exc)[:200]
     return {"ok": True, **removed}
 
 

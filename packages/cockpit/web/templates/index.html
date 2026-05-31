@@ -307,6 +307,32 @@
       </div>
     </section>
 
+    <!-- Memory Health: durable learnings + storage stats -->
+    <section class="card p-5 mb-5" id="memory-card">
+      <div class="flex items-center justify-between mb-3" style="flex-wrap:wrap;gap:8px;">
+        <h2 class="section-h mb-0" data-tt="Long-term memory: durable learnings that survive ledger compaction, plus storage health for every brain file.">Memory Health</h2>
+        <div class="flex items-center gap-2" style="flex-wrap:wrap;">
+          <span class="pill pill-muted" id="mem-entries-pill" data-tt="Distinct (feature, regime) combinations the brain has observed.">entries —</span>
+          <span class="pill pill-muted" id="mem-totals-pill" data-tt="Cumulative judged outcomes across all picks (hits / misses / flats).">judged —</span>
+          <span class="pill pill-muted" id="mem-storage-pill" data-tt="Total bytes used by all brain storage files (memory + bandit + reflections + knowledge base).">storage —</span>
+        </div>
+      </div>
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div>
+          <div class="eyebrow mb-2">Top learnings <span class="muted">(durable)</span></div>
+          <div id="mem-top" class="flex flex-col gap-1 text-xs mono"></div>
+        </div>
+        <div>
+          <div class="eyebrow mb-2">Worst learnings</div>
+          <div id="mem-worst" class="flex flex-col gap-1 text-xs mono"></div>
+        </div>
+        <div>
+          <div class="eyebrow mb-2">Storage health</div>
+          <div id="mem-storage" class="flex flex-col gap-1 text-xs mono"></div>
+        </div>
+      </div>
+    </section>
+
     <!-- Middle: streak + equity chart -->
     <section class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-5">
       <div class="card p-5">
@@ -1075,6 +1101,99 @@
               pEl.appendChild(row);
             });
           }
+        }
+        // Memory Health card (Phase 22).
+        const k = j.knowledge || {};
+        const totals = k.totals || {};
+        const memEntriesPill = document.getElementById('mem-entries-pill');
+        if (memEntriesPill) memEntriesPill.textContent = 'entries ' + (k.entry_count || 0);
+        const memTotalsPill = document.getElementById('mem-totals-pill');
+        if (memTotalsPill) {
+          const h = totals.hits || 0, m = totals.misses || 0, f = totals.flats || 0;
+          memTotalsPill.textContent = 'judged ' + (h + m + f) + ' (' + h + 'H / ' + m + 'M / ' + f + 'F)';
+          memTotalsPill.classList.remove('pill-muted', 'pill-accent', 'pill-warn');
+          if (h + m === 0) memTotalsPill.classList.add('pill-muted');
+          else memTotalsPill.classList.add(h >= m ? 'pill-accent' : 'pill-warn');
+        }
+        // Storage size pill.
+        const storage = j.storage || {};
+        const totalBytes = Object.values(storage).reduce((acc, v) => acc + (v && v.size_bytes ? v.size_bytes : 0), 0);
+        const storagePill = document.getElementById('mem-storage-pill');
+        if (storagePill) {
+          const fmtKB = totalBytes < 1024 ? totalBytes + 'B' : (totalBytes / 1024).toFixed(1) + 'KB';
+          storagePill.textContent = 'storage ' + fmtKB;
+        }
+        // Top / Worst lists.
+        function _renderLearnings(elId, rows, positive) {
+          const el = document.getElementById(elId);
+          if (!el) return;
+          el.innerHTML = '';
+          if (!rows || rows.length === 0) {
+            el.innerHTML = '<span class="muted">Not enough judged picks yet (need ≥3 per signal/regime).</span>';
+            return;
+          }
+          rows.forEach(row => {
+            const r = document.createElement('div');
+            r.style.display = 'grid';
+            r.style.gridTemplateColumns = '1fr 60px 50px';
+            r.style.gap = '6px';
+            r.style.alignItems = 'center';
+            const name = document.createElement('span');
+            name.style.color = 'var(--text-secondary)';
+            name.textContent = row.feature + ' · ' + row.regime;
+            const score = document.createElement('span');
+            score.style.textAlign = 'right';
+            score.style.color = positive ? 'var(--accent, #4ade80)' : 'var(--text-tertiary, #888)';
+            score.style.fontVariantNumeric = 'tabular-nums';
+            score.textContent = Math.round(row.score * 100) + '%';
+            const samples = document.createElement('span');
+            samples.style.textAlign = 'right';
+            samples.style.color = 'var(--text-tertiary, #888)';
+            samples.textContent = 'n=' + Math.round(row.samples);
+            r.appendChild(name);
+            r.appendChild(score);
+            r.appendChild(samples);
+            el.appendChild(r);
+          });
+        }
+        _renderLearnings('mem-top', k.top, true);
+        _renderLearnings('mem-worst', k.worst, false);
+        // Storage rows.
+        const sEl = document.getElementById('mem-storage');
+        if (sEl) {
+          sEl.innerHTML = '';
+          const labels = {
+            brain_memory: 'picks ledger',
+            bandit: 'bandit weights',
+            reflections: 'reflections log',
+            knowledge_base: 'knowledge base'
+          };
+          Object.entries(labels).forEach(([key, label]) => {
+            const info = storage[key] || {};
+            const row = document.createElement('div');
+            row.style.display = 'grid';
+            row.style.gridTemplateColumns = '1fr 70px 50px';
+            row.style.gap = '6px';
+            row.style.alignItems = 'center';
+            const name = document.createElement('span');
+            name.style.color = 'var(--text-secondary)';
+            name.textContent = label;
+            const size = document.createElement('span');
+            size.style.textAlign = 'right';
+            size.style.color = 'var(--text-primary)';
+            size.style.fontVariantNumeric = 'tabular-nums';
+            const bytes = info.size_bytes || 0;
+            size.textContent = bytes < 1024 ? bytes + 'B' : (bytes / 1024).toFixed(1) + 'KB';
+            const baks = document.createElement('span');
+            baks.style.textAlign = 'right';
+            baks.style.color = 'var(--text-tertiary, #888)';
+            const bcount = (info.backups || []).length;
+            baks.textContent = bcount > 0 ? bcount + 'b' : '—';
+            row.appendChild(name);
+            row.appendChild(size);
+            row.appendChild(baks);
+            sEl.appendChild(row);
+          });
         }
       } catch (e) { /* ignore */ }
     }

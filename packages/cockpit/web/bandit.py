@@ -40,18 +40,16 @@ Design notes:
 
 from __future__ import annotations
 
-import contextlib
-import json
 import logging
 import math
-import os
-import tempfile
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from packages.cockpit.web.memory_store import KVStore
 
 log = logging.getLogger("bandit")
 
@@ -101,41 +99,31 @@ class BanditState:
 
 
 # ---------------------------------------------------------------------------
-# Disk I/O
+# Disk I/O — backed by memory_store.KVStore
 # ---------------------------------------------------------------------------
 
+SCHEMA_VERSION = 2
 
-def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
-    if path is None:
-        path = DEFAULT_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".bnd_", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, sort_keys=True)
-        os.replace(tmp, path)
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(tmp)
-        raise
+
+def _migrate(data: dict[str, Any], on_disk_version: int) -> dict[str, Any]:
+    """v1 -> v2: identical key layout, just rewraps under ``data``."""
+    return data
+
+
+def _store(path: Path) -> KVStore:
+    return KVStore(
+        path=path,
+        schema_version=SCHEMA_VERSION,
+        default={"arms": list(DEFAULT_ARMS), "g": {}, "n": {}, "history": []},
+        migrate=_migrate,
+    )
 
 
 def load_state(path: Path | None = None) -> BanditState:
     if path is None:
         path = DEFAULT_PATH
     with LOCK:
-        if not path.exists():
-            s = BanditState()
-            s.ensure_arms()
-            return s
-        try:
-            with path.open(encoding="utf-8") as fh:
-                raw = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            log.warning("bandit: corrupt %s — starting fresh", path)
-            s = BanditState()
-            s.ensure_arms()
-            return s
+        raw = _store(path).read()
         s = BanditState(
             arms=list(raw.get("arms") or DEFAULT_ARMS),
             g={k: float(v) for k, v in (raw.get("g") or {}).items()},
@@ -159,7 +147,7 @@ def save_state(state: BanditState, path: Path | None = None) -> None:
             "updated": state.updated,
             "history": state.history[-200:],
         }
-        _atomic_write(path, payload)
+        _store(path).write(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -286,10 +274,17 @@ def snapshot(path: Path | None = None) -> dict[str, Any]:
     }
 
 
+def store_info(path: Path | None = None) -> dict[str, Any]:
+    """Return health info (size, mtime, backups) for the dashboard."""
+
+    if path is None:
+        path = DEFAULT_PATH
+    return _store(path).health()
+
+
 def reset_for_tests(path: Path | None = None) -> None:  # pragma: no cover — test util
     """Wipe weights. ONLY for tests."""
     if path is None:
         path = DEFAULT_PATH
     with LOCK:
-        if path.exists():
-            path.unlink()
+        _store(path).reset()
