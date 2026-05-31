@@ -112,7 +112,10 @@ def client(fake_log: Path, fake_state: Path, fake_agent_log: Path) -> TestClient
 def test_index_serves_html(client: TestClient) -> None:
     r = client.get("/")
     assert r.status_code == 200
-    assert "ai-investing cockpit" in r.text.lower() or "cockpit" in r.text.lower()
+    body = r.text.lower()
+    # Phase 23 rebrand: "The Seer" wordmark must render. Fall back to
+    # "cockpit" since the internal JS namespace still uses that name.
+    assert "the seer" in body or "cockpit" in body
 
 
 def test_health_endpoint_shape(client: TestClient) -> None:

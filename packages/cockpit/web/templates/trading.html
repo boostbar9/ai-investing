@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Trading - ai-investing</title>
+  <title>Trading · The Seer</title>
   {% include "_head_icons.html" %}
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="/static/cockpit.css" />
@@ -24,9 +24,18 @@
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
   <div class="topbar"><div class="topbar-inner">
-    <a href="/" class="topbar-brand">
-      <span id="cockpit-conn-dot" class="topbar-brand-dot idle"></span>
-      <span>ai-investing</span>
+    <a href="/" class="topbar-brand" aria-label="The Seer — home">
+      <span class="topbar-brand-sigil" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2 12 C5 5, 19 5, 22 12 C19 19, 5 19, 2 12 Z"/>
+          <circle cx="12" cy="12" r="3.2" fill="currentColor" opacity="0.9"/>
+        </svg>
+      </span>
+      <span class="topbar-brand-text">
+        <span class="topbar-brand-name">The Seer</span>
+        <span class="topbar-brand-tag">Agent-driven investing</span>
+      </span>
+      <span id="cockpit-conn-dot" class="topbar-brand-dot idle" title="Connection status"></span>
     </a>
     <div id="cockpit-topbar"></div>
   </div></div>

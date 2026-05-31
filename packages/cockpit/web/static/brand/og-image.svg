@@ -1,58 +1,82 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Open Graph / social preview card. 1200x630 is the canonical size. -->
+<!-- The Seer — Open Graph / social preview card. 1200x630 canonical. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
   <defs>
     <linearGradient id="ogbg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#0b1220"/>
-      <stop offset="1" stop-color="#020617"/>
+      <stop offset="0" stop-color="#131A24"/>
+      <stop offset="1" stop-color="#070A0E"/>
     </linearGradient>
-    <linearGradient id="ogup" x1="0" y1="1" x2="0" y2="0">
-      <stop offset="0" stop-color="#059669"/>
-      <stop offset="1" stop-color="#34d399"/>
+    <linearGradient id="ogiris" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#00E5C4"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
     </linearGradient>
-    <radialGradient id="glow" cx="0.85" cy="0.18" r="0.55">
-      <stop offset="0" stop-color="#10b981" stop-opacity="0.22"/>
-      <stop offset="1" stop-color="#10b981" stop-opacity="0"/>
+    <linearGradient id="ogtext" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#F8FAFC"/>
+      <stop offset="0.6" stop-color="#00E5C4"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <radialGradient id="ogglow1" cx="0.18" cy="0.20" r="0.55">
+      <stop offset="0" stop-color="#00E5C4" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#00E5C4" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="ogglow2" cx="0.85" cy="0.85" r="0.55">
+      <stop offset="0" stop-color="#8B5CF6" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/>
     </radialGradient>
   </defs>
+
   <rect width="1200" height="630" fill="url(#ogbg)"/>
-  <rect width="1200" height="630" fill="url(#glow)"/>
+  <rect width="1200" height="630" fill="url(#ogglow1)"/>
+  <rect width="1200" height="630" fill="url(#ogglow2)"/>
 
-  <!-- decorative chart line in background -->
+  <!-- subtle grid -->
+  <g stroke="rgba(255,255,255,0.04)" stroke-width="1">
+    <line x1="0" y1="120" x2="1200" y2="120"/>
+    <line x1="0" y1="240" x2="1200" y2="240"/>
+    <line x1="0" y1="360" x2="1200" y2="360"/>
+    <line x1="0" y1="480" x2="1200" y2="480"/>
+  </g>
+
+  <!-- decorative chart line -->
   <path d="M 0 480 L 120 460 L 220 470 L 340 420 L 460 430 L 580 380 L 700 340 L 820 290 L 940 260 L 1060 200 L 1200 160"
-        stroke="#1f2937" stroke-width="2" fill="none"/>
+        stroke="rgba(0,229,196,0.45)" stroke-width="2.5" fill="none"/>
   <path d="M 0 480 L 120 460 L 220 470 L 340 420 L 460 430 L 580 380 L 700 340 L 820 290 L 940 260 L 1060 200 L 1200 160 L 1200 630 L 0 630 Z"
-        fill="#10b981" opacity="0.05"/>
+        fill="url(#ogiris)" opacity="0.06"/>
 
-  <!-- brand mark, large -->
+  <!-- big seer eye mark -->
   <g transform="translate(80,100)">
-    <rect width="180" height="180" rx="38" ry="38" fill="#111827"/>
-    <rect x="1" y="1" width="178" height="178" rx="37" ry="37" fill="none" stroke="#1f2937" stroke-width="2"/>
-    <line x1="45" y1="118" x2="45" y2="146" stroke="url(#ogup)" stroke-width="5" stroke-linecap="round"/>
-    <rect x="36.5" y="124" width="17" height="22" rx="4" fill="url(#ogup)"/>
-    <line x1="90" y1="78" x2="90" y2="134" stroke="url(#ogup)" stroke-width="5" stroke-linecap="round"/>
-    <rect x="81.5" y="90" width="17" height="39" rx="4" fill="url(#ogup)"/>
-    <line x1="135" y1="38" x2="135" y2="118" stroke="url(#ogup)" stroke-width="5" stroke-linecap="round"/>
-    <rect x="126.5" y="50" width="17" height="62" rx="4" fill="url(#ogup)"/>
-    <circle cx="135" cy="34" r="10" fill="#f59e0b"/>
-    <circle cx="135" cy="34" r="17" fill="none" stroke="#f59e0b" stroke-width="2" opacity="0.4"/>
+    <rect width="180" height="180" rx="38" fill="#0B0F14"/>
+    <rect x="1" y="1" width="178" height="178" rx="37" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="2"/>
+    <polygon points="90,18 152,52 152,128 90,162 28,128 28,52"
+             fill="none" stroke="url(#ogiris)" stroke-width="2.5" opacity="0.6"/>
+    <path d="M22 90 C42 50, 138 50, 158 90 C138 130, 42 130, 22 90 Z"
+          fill="none" stroke="url(#ogiris)" stroke-width="4"/>
+    <circle cx="90" cy="90" r="24" fill="none" stroke="url(#ogiris)" stroke-width="3"/>
+    <rect x="85.5" y="74" width="9" height="32" rx="2.4" fill="#00E5C4"/>
+    <line x1="90" y1="68" x2="90" y2="74" stroke="#00E5C4" stroke-width="3.6" stroke-linecap="round"/>
+    <line x1="90" y1="106" x2="90" y2="112" stroke="#00E5C4" stroke-width="3.6" stroke-linecap="round"/>
+    <circle cx="90" cy="60" r="5" fill="#F8FAFC"/>
+    <circle cx="90" cy="60" r="9" fill="none" stroke="#00E5C4" stroke-width="1.5" opacity="0.5"/>
   </g>
 
   <!-- wordmark + tagline -->
-  <text x="80" y="380" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,sans-serif" font-size="84" font-weight="700" letter-spacing="-2" fill="#f9fafb">ai-investing</text>
-  <text x="80" y="430" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,sans-serif" font-size="30" font-weight="400" fill="#9ca3af">Autonomous paper-trading cockpit</text>
+  <text x="310" y="200" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="96" font-weight="800" letter-spacing="-3" fill="url(#ogtext)">The Seer</text>
+  <text x="310" y="250" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="30" font-weight="500" fill="#CBD5E1">AI-powered, agent-driven investing platform</text>
 
   <!-- status pills -->
-  <g transform="translate(80,490)" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,sans-serif" font-size="20" font-weight="500">
-    <rect width="180" height="44" rx="22" fill="#064e3b"/>
-    <text x="90" y="29" text-anchor="middle" fill="#6ee7b7">Local-first</text>
-    <g transform="translate(200,0)">
-      <rect width="220" height="44" rx="22" fill="#0c4a6e"/>
-      <text x="110" y="29" text-anchor="middle" fill="#7dd3fc">Multi-agent LLM</text>
+  <g transform="translate(80,520)" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+     font-size="20" font-weight="600">
+    <rect width="200" height="44" rx="22" fill="rgba(0,229,196,0.14)" stroke="rgba(0,229,196,0.35)"/>
+    <text x="100" y="29" text-anchor="middle" fill="#00E5C4">Self-improving brain</text>
+    <g transform="translate(220,0)">
+      <rect width="220" height="44" rx="22" fill="rgba(139,92,246,0.14)" stroke="rgba(139,92,246,0.35)"/>
+      <text x="110" y="29" text-anchor="middle" fill="#A78BFA">Multi-agent autonomy</text>
     </g>
-    <g transform="translate(440,0)">
-      <rect width="200" height="44" rx="22" fill="#3f1d1d"/>
-      <text x="100" y="29" text-anchor="middle" fill="#fca5a5">60-day soak</text>
+    <g transform="translate(460,0)">
+      <rect width="180" height="44" rx="22" fill="rgba(248,250,252,0.06)" stroke="rgba(255,255,255,0.18)"/>
+      <text x="90" y="29" text-anchor="middle" fill="#F8FAFC">Durable memory</text>
     </g>
   </g>
 </svg>

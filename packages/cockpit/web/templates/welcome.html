@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Welcome — ai-investing</title>
+  <title>Welcome · The Seer</title>
   {% include "_head_icons.html" %}
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="/static/cockpit.css" />
@@ -40,9 +40,14 @@
 
     <!-- Brand -->
     <header class="mb-8 flex items-center gap-3">
-      <span class="inline-block w-3 h-3 rounded-full bg-blue-500"></span>
-      <span class="text-lg font-semibold">ai-investing</span>
-      <span class="text-xs text-gray-500 ml-2">First-boot setup</span>
+      <span class="topbar-brand-sigil" aria-hidden="true" style="width:34px;height:34px;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="width:20px;height:20px;">
+          <path d="M2 12 C5 5, 19 5, 22 12 C19 19, 5 19, 2 12 Z"/>
+          <circle cx="12" cy="12" r="3.2" fill="currentColor" opacity="0.9"/>
+        </svg>
+      </span>
+      <span class="topbar-brand-name text-lg">The Seer</span>
+      <span class="text-xs ml-2" style="color:var(--text-muted);">First-boot setup</span>
     </header>
 
     <!-- Progress dots -->
@@ -58,11 +63,11 @@
 
     <!-- Step 1: Welcome -->
     <section id="step-1" class="step active">
-      <h1 class="text-3xl font-semibold mb-3">Welcome to ai-investing.</h1>
+      <h1 class="text-3xl font-semibold mb-3">Welcome to <span class="gradient-text">The Seer</span>.</h1>
       <p class="text-gray-400 mb-6 text-base leading-relaxed">
-        This is a quick four-step setup. After this, every launch will be
-        one click — Ollama warms up, your agents start, and the cockpit
-        opens automatically.
+        Quick four-step setup. After this, every launch is one click —
+        Ollama warms up, your agents start, and Mission Control opens
+        automatically.
       </p>
 
       <div class="bg-gray-900 border border-gray-800 rounded-lg p-5 mb-6">
@@ -199,7 +204,7 @@
       <div class="flex justify-between">
         <button id="btn-prev-4" class="px-4 py-2 rounded-md bg-gray-800 hover:bg-gray-700 text-sm">← Back</button>
         <button id="btn-launch" class="px-5 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500 font-semibold">
-          Launch cockpit →
+          Launch The Seer →
         </button>
       </div>
     </section>
@@ -255,7 +260,7 @@
         const j = await r.json();
         setRhPill(j.outcome || "unknown", j.detail || "");
       } catch (e) {
-        setRhPill("offline", "couldn't reach the cockpit API");
+        setRhPill("offline", "couldn't reach The Seer API");
       }
     }
 
@@ -312,7 +317,7 @@
         }
         window.location.href = "/";
       } catch (e) {
-        btn.disabled = false; btn.textContent = "Launch cockpit →";
+        btn.disabled = false; btn.textContent = "Launch The Seer →";
         alert("Couldn't save setup: " + e.message);
       }
     });

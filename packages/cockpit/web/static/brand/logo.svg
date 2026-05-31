@@ -1,37 +1,54 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- ai-investing brand mark. Square, works at 16px through 1024px.
-     Motif: rising candle stack + spark = an autonomous trader watching the chart.
-     Palette matches cockpit.css: bg #0b1220, primary #10b981 (emerald), accent #f59e0b. -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="ai-investing">
+<!-- The Seer — brand mark. Square, works at 16px through 1024px.
+     Motif: a stylized seer's eye whose pupil is a candlestick + spark,
+     framed by a hexagonal sigil. Palette: Seer teal #00E5C4 and
+     violet #8B5CF6 on midnight #0B0F14. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="The Seer">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#111827"/>
-      <stop offset="1" stop-color="#0b1220"/>
+    <linearGradient id="seer-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#131A24"/>
+      <stop offset="1" stop-color="#0B0F14"/>
     </linearGradient>
-    <linearGradient id="up" x1="0" y1="1" x2="0" y2="0">
-      <stop offset="0" stop-color="#059669"/>
-      <stop offset="1" stop-color="#34d399"/>
+    <linearGradient id="seer-iris" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#00E5C4"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
     </linearGradient>
+    <linearGradient id="seer-ring" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#00E5C4" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0.95"/>
+    </linearGradient>
+    <radialGradient id="seer-glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#00E5C4" stop-opacity="0.55"/>
+      <stop offset="0.6" stop-color="#00E5C4" stop-opacity="0"/>
+    </radialGradient>
   </defs>
-  <!-- rounded-square background -->
-  <rect x="0" y="0" width="64" height="64" rx="14" ry="14" fill="url(#bg)"/>
-  <!-- subtle inner stroke for depth -->
-  <rect x="0.5" y="0.5" width="63" height="63" rx="13.5" ry="13.5" fill="none" stroke="#1f2937" stroke-width="1"/>
 
-  <!-- three rising candles -->
-  <!-- candle 1 (left, short, green) -->
-  <line x1="16" y1="42" x2="16" y2="52" stroke="url(#up)" stroke-width="2" stroke-linecap="round"/>
-  <rect x="13" y="44" width="6" height="8" rx="1.5" fill="url(#up)"/>
+  <!-- rounded-square plate -->
+  <rect x="0" y="0" width="64" height="64" rx="14" ry="14" fill="url(#seer-bg)"/>
+  <rect x="0.5" y="0.5" width="63" height="63" rx="13.5" ry="13.5" fill="none" stroke="rgba(255,255,255,0.07)"/>
 
-  <!-- candle 2 (middle, taller) -->
-  <line x1="32" y1="28" x2="32" y2="48" stroke="url(#up)" stroke-width="2" stroke-linecap="round"/>
-  <rect x="29" y="32" width="6" height="14" rx="1.5" fill="url(#up)"/>
+  <!-- soft inner glow -->
+  <circle cx="32" cy="32" r="22" fill="url(#seer-glow)" opacity="0.85"/>
 
-  <!-- candle 3 (right, tallest) -->
-  <line x1="48" y1="14" x2="48" y2="42" stroke="url(#up)" stroke-width="2" stroke-linecap="round"/>
-  <rect x="45" y="18" width="6" height="22" rx="1.5" fill="url(#up)"/>
+  <!-- outer hex sigil -->
+  <polygon points="32,8 53,20 53,44 32,56 11,44 11,20"
+           fill="none" stroke="url(#seer-ring)" stroke-width="1.4"
+           stroke-linejoin="round" opacity="0.7"/>
 
-  <!-- spark (AI signal) on top of tallest candle -->
-  <circle cx="48" cy="12" r="3.5" fill="#f59e0b"/>
-  <circle cx="48" cy="12" r="6" fill="none" stroke="#f59e0b" stroke-width="1" opacity="0.45"/>
+  <!-- almond eye shape -->
+  <path d="M9 32 C18 18, 46 18, 55 32 C46 46, 18 46, 9 32 Z"
+        fill="none" stroke="url(#seer-iris)" stroke-width="1.8"
+        stroke-linejoin="round"/>
+
+  <!-- iris -->
+  <circle cx="32" cy="32" r="8.5" fill="none" stroke="url(#seer-iris)" stroke-width="1.6"/>
+
+  <!-- pupil = mini up-candle -->
+  <rect x="30.4" y="26.5" width="3.2" height="11" rx="1" fill="#00E5C4"/>
+  <line x1="32" y1="24" x2="32" y2="26.5" stroke="#00E5C4" stroke-width="1.4" stroke-linecap="round"/>
+  <line x1="32" y1="37.5" x2="32" y2="40" stroke="#00E5C4" stroke-width="1.4" stroke-linecap="round"/>
+
+  <!-- spark (foresight) -->
+  <circle cx="32" cy="22" r="1.8" fill="#F8FAFC"/>
+  <circle cx="32" cy="22" r="3.2" fill="none" stroke="#00E5C4" stroke-width="0.8" opacity="0.55"/>
 </svg>

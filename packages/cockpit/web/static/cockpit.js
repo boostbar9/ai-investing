@@ -157,9 +157,9 @@
     const regPill = `<span class="pill ${_regimePill(eff)}">${Cockpit.fmt.escape(eff)}</span>`;
     slot.innerHTML = `
       <div class="topbar-stats">
-        <span class="text-xs text-gray-500">mode</span> ${modePill}
-        <span class="text-xs text-gray-500 ml-2">regime</span> ${regPill}
-        <span class="text-xs text-gray-500 ml-2">bot</span> ${statePill}
+        <span class="text-xs" style="color:var(--text-muted)">mode</span>${modePill}
+        <span class="text-xs ml-2" style="color:var(--text-muted)">regime</span>${regPill}
+        <span class="text-xs ml-2" style="color:var(--text-muted)">bot</span>${statePill}
       </div>
     `;
   };

@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="theme-color" content="#050810" />
-  <title>ai-investing cockpit</title>
+  <meta name="theme-color" content="#0B0F14" />
+  <title>The Seer — agent-driven investing</title>
   {% include "_head_icons.html" %}
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
@@ -16,9 +16,18 @@
   <!-- Global topbar -->
   <div class="topbar">
     <div class="topbar-inner">
-      <a href="/" class="topbar-brand">
-        <span id="cockpit-conn-dot" class="topbar-brand-dot idle"></span>
-        <span>ai-investing</span>
+      <a href="/" class="topbar-brand" aria-label="The Seer — home">
+        <span class="topbar-brand-sigil" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2 12 C5 5, 19 5, 22 12 C19 19, 5 19, 2 12 Z"/>
+            <circle cx="12" cy="12" r="3.2" fill="currentColor" opacity="0.9"/>
+          </svg>
+        </span>
+        <span class="topbar-brand-text">
+          <span class="topbar-brand-name">The Seer</span>
+          <span class="topbar-brand-tag">Agent-driven investing</span>
+        </span>
+        <span id="cockpit-conn-dot" class="topbar-brand-dot idle" title="Connection status"></span>
       </a>
       <div id="cockpit-topbar"></div>
     </div>
@@ -30,12 +39,13 @@
          polls /api/onboarding once on load and reveals it only when the
          wizard hasn't been completed. Idempotent: revisiting the
          dashboard after completion never shows the banner. #} -->
-    <div id="welcome-banner" class="hidden mb-4 rounded-lg border border-blue-700 bg-blue-900/30 p-4 flex items-center justify-between gap-4">
+    <div id="welcome-banner" class="hidden mb-4 rounded-lg p-4 flex items-center justify-between gap-4"
+         style="border:1px solid var(--border-strong); background:var(--accent-violet-soft); backdrop-filter:blur(8px);">
       <div>
-        <div class="font-semibold text-blue-200">Finish setting up ai-investing</div>
-        <div class="text-xs text-gray-400 mt-1">Four quick steps: name, Robinhood status, live-trading cap, disclaimer.</div>
+        <div class="font-semibold" style="color:var(--text-primary);">Finish setting up The Seer</div>
+        <div class="text-xs mt-1" style="color:var(--text-secondary);">Four quick steps: name, Robinhood status, live-trading cap, disclaimer.</div>
       </div>
-      <a href="/welcome" class="px-4 py-2 rounded-md bg-blue-600 hover:bg-blue-500 text-sm font-medium whitespace-nowrap">Open setup →</a>
+      <a href="/welcome" class="btn btn-primary btn-sm whitespace-nowrap">Open setup →</a>
     </div>
     <script>
       // {# Single shot probe of /api/onboarding. Errors silently -- the
@@ -56,21 +66,21 @@
     <!-- {# Research Candidates tile (Phase 1D). Renders a compact list of
          top candidates from the latest boot-time sweep. Polls /api/research-sweep
          once on load and again every 15s while a sweep is running. #} -->
-    <section id="research-tile" class="mb-4 rounded-lg border border-gray-800 bg-gray-900/50 p-4">
-      <div class="flex items-center justify-between mb-3">
+    <section id="research-tile" class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-3" style="flex-wrap:wrap;gap:8px;">
         <div>
-          <div class="font-semibold text-gray-100">Research candidates</div>
-          <div id="research-meta" class="text-xs text-gray-500 mt-1">loading…</div>
+          <h2 class="section-h mb-0">Research candidates</h2>
+          <div id="research-meta" class="text-xs mt-1" style="color:var(--text-muted);">loading…</div>
         </div>
         <div class="flex items-center gap-2">
           <span id="research-status-pill" class="pill pill-unknown" style="display:none"></span>
-          <button id="research-refresh" class="px-3 py-1.5 rounded-md bg-blue-600 hover:bg-blue-500 text-xs font-medium">
+          <button id="research-refresh" class="btn btn-primary btn-sm">
             Refresh
           </button>
         </div>
       </div>
-      <div id="research-list" class="divide-y divide-gray-800"></div>
-      <div id="research-empty" class="text-sm text-gray-500" style="display:none">
+      <div id="research-list" class="divide-y" style="border-color:var(--border-faint);"></div>
+      <div id="research-empty" class="text-sm" style="display:none;color:var(--text-muted);">
         No candidates yet. Click Refresh to run a sweep.
       </div>
     </section>
@@ -218,13 +228,23 @@
       <button onclick="Cockpit.showShortcuts()" class="ml-auto btn btn-ghost btn-sm" aria-label="Keyboard shortcuts">?</button>
     </nav>
 
-    <!-- Header -->
-    <header class="flex items-center justify-between mb-5 flex-wrap gap-2">
-      <div>
-        <h1 class="text-2xl font-semibold tracking-tight">Cockpit</h1>
-        <p class="text-sm text-gray-400">Local monitor and control for the paper trading bot</p>
+    <!-- Hero header -->
+    <header class="seer-hero mb-5">
+      <div class="seer-hero-left">
+        <div class="eyebrow" style="margin-bottom:6px;">The Seer · Mission Control</div>
+        <h1 class="seer-hero-title">Your <span class="gradient-text">agent-driven</span> trading floor</h1>
+        <p class="seer-hero-sub">A self-improving multi-agent brain runs research, judges its own picks, and tightens risk — you just steer.</p>
       </div>
-      <div class="text-xs text-gray-500" id="last-update">connecting…</div>
+      <div class="seer-hero-right">
+        <div class="seer-hero-meta">
+          <span class="eyebrow" style="color:var(--text-muted);">Last sync</span>
+          <span id="last-update" class="mono text-xs" style="color:var(--text-secondary);">connecting…</span>
+        </div>
+        <div class="seer-hero-cta">
+          <a href="/autopilot" class="btn btn-primary btn-sm">Open autopilot</a>
+          <a href="/agents" class="btn btn-ghost btn-sm">Run pipeline</a>
+        </div>
+      </div>
     </header>
 
     <!-- Top row: stat tiles -->
@@ -251,6 +271,13 @@
         <div class="stat-sub">From running peak</div>
       </div>
     </section>
+
+    <!-- ==== Agent intelligence row ==== -->
+    <div class="seer-row-head mb-3">
+      <span class="seer-row-eyebrow">Agent intelligence</span>
+      <span class="seer-row-rule"></span>
+      <span class="seer-row-hint">What the brain is thinking, learning, and remembering</span>
+    </div>
 
     <!-- Rolling agent chatter + Always-On Brain status. The autonomy
          loop runs research sweeps every 2h (market hours) / 6h
@@ -333,6 +360,13 @@
       </div>
     </section>
 
+    <!-- ==== Markets & risk row ==== -->
+    <div class="seer-row-head mb-3">
+      <span class="seer-row-eyebrow">Markets &amp; risk</span>
+      <span class="seer-row-rule"></span>
+      <span class="seer-row-hint">Promotion gate, equity curve, regime read</span>
+    </div>
+
     <!-- Middle: streak + equity chart -->
     <section class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-5">
       <div class="card p-5">
@@ -363,6 +397,13 @@
         </div>
       </div>
     </section>
+
+    <!-- ==== Operations row ==== -->
+    <div class="seer-row-head mb-3">
+      <span class="seer-row-eyebrow">Operations</span>
+      <span class="seer-row-rule"></span>
+      <span class="seer-row-hint">Trading controls, positions, recent activity, health</span>
+    </div>
 
     <!-- Controls -->
     <section class="card p-5 mb-5">
