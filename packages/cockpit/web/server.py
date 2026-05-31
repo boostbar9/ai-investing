@@ -57,6 +57,7 @@ from packages.cockpit.state import (
     record_action,
     save_state,
 )
+from packages.cockpit.web import chatter as agent_chatter
 from packages.execution.broker import AlpacaPaperBroker, BrokerError, OrderRequest
 from packages.paper.streak import compute_paper_streak
 from packages.shared import conn_checks, secrets
@@ -2852,6 +2853,12 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
     _LAST_AGENT_RUN.clear()
     _LAST_AGENT_RUN.update(payload)
     _append_agent_log(payload)
+    # Fan the run into the rolling chatter feed. Wrapped in a guard so a
+    # bug in the feed can never break the trading loop.
+    try:
+        agent_chatter.ingest_run(payload)
+    except Exception as _chatter_err:  # pragma: no cover — defensive
+        log.warning("chatter ingest failed (ignored): %s", _chatter_err)
     _progress_finish()
     return payload
 
@@ -3038,6 +3045,27 @@ def api_agents_history(limit: int = 50) -> dict[str, Any]:
     if limit > 0:
         rows = rows[:limit]
     return {"runs": rows, "total": len(rows)}
+
+
+@app.get("/api/chatter")
+def api_chatter(limit: int = 25) -> dict[str, Any]:
+    """Rolling feed of recent agent narrations.
+
+    Returns the most-recent ``limit`` entries (newest first), each
+    shaped like ``{ts, agent, status, message, decision_id, regime,
+    used_llm}``. Backed by an in-memory ring buffer
+    (``packages.cockpit.web.chatter``), so a process restart clears it
+    — the durable record is the agent log on disk.
+    """
+    # Clamp limit defensively so a hostile caller can't ask for a huge
+    # response. The ring buffer is bounded anyway, but be explicit.
+    safe = max(0, min(int(limit or 0), agent_chatter.CHATTER_MAX))
+    items = agent_chatter.recent(safe)
+    return {
+        "items": items,
+        "count": len(items),
+        "max": agent_chatter.CHATTER_MAX,
+    }
 
 
 @app.get("/api/agents/discoveries")

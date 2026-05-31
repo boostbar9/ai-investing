@@ -252,6 +252,21 @@
       </div>
     </section>
 
+    <!-- Rolling agent chatter — latest narrations from research / strategy /
+         risk / execution / discovery. Auto-refreshes every 8s. -->
+    <section class="card p-5 mb-5" id="chatter-card">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="section-h mb-0" data-tt="Live tail of the most-recent agent narrations. Each pipeline pass (manual or auto-scheduled) drops up to one line per agent here.">Agent Chatter</h2>
+        <div class="flex items-center gap-2">
+          <span class="pill pill-live pill-accent" id="chatter-live-pill">live</span>
+          <span class="text-xs muted" id="chatter-meta">—</span>
+        </div>
+      </div>
+      <ol id="chatter-feed" class="flex flex-col gap-2" aria-live="polite">
+        <li class="muted text-sm">Waiting for the first pipeline pass… Click <a href="/agents">Run pipeline</a> or enable the auto-scheduler on the Agents page.</li>
+      </ol>
+    </section>
+
     <!-- Middle: streak + equity chart -->
     <section class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-5">
       <div class="card p-5">
@@ -700,6 +715,91 @@
       } catch (e) { /* ignore */ }
     }
     Cockpit.poll(refreshAgents, 8000, { name: 'index-agents' });
+
+    // ----- rolling agent chatter -----
+    // Pulls /api/chatter every 8s and renders the newest entries as a
+    // compact feed. Each line is color-coded by agent so the user can
+    // visually track who is saying what. Safe even when the feed is
+    // empty — we keep the friendly placeholder until something lands.
+    const CHATTER_LIMIT = 12;
+    const AGENT_GRADIENT = {
+      research:  'linear-gradient(135deg,#5EE6FF,#60A5FA)',
+      strategy:  'linear-gradient(135deg,#A78BFA,#60A5FA)',
+      risk:      'linear-gradient(135deg,#FBBF24,#FB7185)',
+      execution: 'linear-gradient(135deg,#34D399,#5EE6FF)',
+      discovery: 'linear-gradient(135deg,#F472B6,#A78BFA)',
+    };
+    function _escapeHtml(s) {
+      return String(s || '').replace(/[&<>"']/g, c => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+      }[c]));
+    }
+    function _statusPill(status) {
+      const s = (status || 'info').toLowerCase();
+      if (s === 'halt' || s === 'halted' || s === 'fail' || s === 'error') return 'pill-bad';
+      if (s === 'warn' || s === 'warning') return 'pill-warn';
+      if (s === 'ok') return 'pill-good';
+      return 'pill-muted';
+    }
+    function _agentLabel(name) {
+      if (!name) return '?';
+      return name.charAt(0).toUpperCase() + name.slice(1);
+    }
+    function _fmtRelTs(iso) {
+      if (!iso) return '';
+      const t = Date.parse(iso);
+      if (isNaN(t)) return '';
+      const delta = Math.max(0, Date.now() - t);
+      if (delta < 45_000) return 'just now';
+      const m = Math.floor(delta / 60_000);
+      if (m < 60) return m + 'm ago';
+      const h = Math.floor(m / 60);
+      if (h < 24) return h + 'h ago';
+      const d = Math.floor(h / 24);
+      return d + 'd ago';
+    }
+    async function refreshChatter() {
+      try {
+        const j = await Cockpit.api.get('/api/chatter?limit=' + CHATTER_LIMIT);
+        const feed = document.getElementById('chatter-feed');
+        const meta = document.getElementById('chatter-meta');
+        if (!feed) return;
+        const items = (j && j.items) || [];
+        if (!items.length) {
+          // Keep the friendly placeholder; just update meta.
+          if (meta) meta.textContent = '0 entries';
+          return;
+        }
+        const html = items.map(it => {
+          const grad = AGENT_GRADIENT[it.agent] || 'linear-gradient(135deg,#5EE6FF,#A78BFA)';
+          const llm = it.used_llm ? '<span class="pill pill-muted" style="padding:1px 6px;font-size:0.62rem;">LLM</span>' : '';
+          const regime = it.regime ? '<span class="pill pill-muted" style="padding:1px 6px;font-size:0.62rem;">' + _escapeHtml(it.regime) + '</span>' : '';
+          return (
+            '<li class="flex items-start gap-3 py-2" style="border-bottom:1px solid var(--border-faint);">' +
+              '<span style="flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:999px;font-size:0.7rem;font-weight:700;color:#06121A;background:' + grad + ';box-shadow:0 0 14px rgba(94,230,255,0.25);">' +
+                _escapeHtml(it.agent[0].toUpperCase()) +
+              '</span>' +
+              '<div class="flex-1 min-w-0">' +
+                '<div class="flex items-center gap-2 text-xs muted mb-0.5" style="flex-wrap:wrap;">' +
+                  '<span class="accent" style="font-weight:600;">' + _escapeHtml(_agentLabel(it.agent)) + '</span>' +
+                  '<span class="pill ' + _statusPill(it.status) + '" style="padding:1px 6px;font-size:0.62rem;">' + _escapeHtml(it.status || 'info') + '</span>' +
+                  regime + llm +
+                  '<span class="dim" style="margin-left:auto;" title="' + _escapeHtml(it.ts || '') + '">' + _escapeHtml(_fmtRelTs(it.ts)) + '</span>' +
+                '</div>' +
+                '<div class="text-sm" style="color:var(--text-primary);word-wrap:break-word;">' + _escapeHtml(it.message) + '</div>' +
+              '</div>' +
+            '</li>'
+          );
+        }).join('');
+        feed.innerHTML = html;
+        if (meta) {
+          const total = (j && typeof j.count === 'number') ? j.count : items.length;
+          const newest = items[0] && items[0].ts ? _fmtRelTs(items[0].ts) : '';
+          meta.textContent = total + ' entr' + (total === 1 ? 'y' : 'ies') + (newest ? ' · newest ' + newest : '');
+        }
+      } catch (e) { /* ignore — server may be restarting */ }
+    }
+    Cockpit.poll(refreshChatter, 8000, { name: 'index-chatter' });
   </script>
 </body>
 </html>
