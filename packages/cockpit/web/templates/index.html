@@ -276,6 +276,37 @@
       </ol>
     </section>
 
+    <!-- Brain Health: self-improvement readout (Phase 21). Surfaces
+         accuracy trend, current regime, bandit weight evolution, and
+         the latest reflection narrative so the user can see the
+         system getting smarter. -->
+    <section class="card p-5 mb-5" id="brain-card">
+      <div class="flex items-center justify-between mb-3" style="flex-wrap:wrap;gap:8px;">
+        <h2 class="section-h mb-0" data-tt="Self-improving brain. Judges its own picks, re-weights signals via Exp3 bandit, classifies market regime, and writes a reflection each tick.">Brain Health</h2>
+        <div class="flex items-center gap-2" style="flex-wrap:wrap;">
+          <span class="pill pill-muted" id="regime-pill" data-tt="Current market regime classification: risk_on, neutral, risk_off, or volatile. The brain tilts scoring accordingly.">regime —</span>
+          <span class="pill pill-muted" id="hitrate-pill" data-tt="Hit rate over recent judged picks (price moved >0.5% within the holding horizon).">hit-rate —</span>
+          <span class="pill pill-muted" id="learning-pill" data-tt="How many picks have been judged so far. The brain needs ≥5 outcomes before reflections become decisive.">learning</span>
+        </div>
+      </div>
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div>
+          <div class="eyebrow mb-2">Latest reflection</div>
+          <div id="brain-reflection-headline" class="text-sm font-semibold" style="color:var(--text-primary);">—</div>
+          <div id="brain-reflection-body" class="text-xs mt-1" style="color:var(--text-secondary);line-height:1.5;">Waiting for first reflection…</div>
+          <ul id="brain-lessons" class="text-xs mt-2" style="color:var(--text-secondary);padding-left:18px;"></ul>
+        </div>
+        <div>
+          <div class="eyebrow mb-2">Signal weights <span class="muted">(bandit)</span></div>
+          <div id="brain-weights" class="flex flex-col gap-1 text-xs"></div>
+        </div>
+        <div>
+          <div class="eyebrow mb-2">Recent picks <span class="muted">(last 8)</span></div>
+          <div id="brain-recent-picks" class="flex flex-col gap-1 text-xs mono"></div>
+        </div>
+      </div>
+    </section>
+
     <!-- Middle: streak + equity chart -->
     <section class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-5">
       <div class="card p-5">
@@ -880,9 +911,10 @@
         btn.textContent = 'Thinking…';
         try {
           await Cockpit.api.post('/api/autonomy/tick');
-          // Pull fresh chatter + autonomy immediately.
+          // Pull fresh chatter + autonomy + brain immediately.
           await refreshChatter();
           await refreshAutonomy();
+          await refreshBrain();
         } catch (e) {
           // Surface via toast helper if available; otherwise no-op.
           if (window.Cockpit && Cockpit.toast) {
@@ -894,6 +926,159 @@
         }
       });
     })();
+
+    // ---------------------------------------------------------------
+    // Brain Health card (Phase 21) — self-improvement readout.
+    // Polls /api/brain every 12s and renders four sections:
+    //   * Regime pill + hit-rate pill + learning-progress pill
+    //   * Latest reflection headline/paragraph/lessons
+    //   * Signal weight bars (bandit Exp3 — mean=1.0x)
+    //   * Recent picks list with hit/miss/pending status dots
+    // ---------------------------------------------------------------
+    function _fmtPickStatus(s) {
+      switch (s) {
+        case 'hit':     return '● hit';
+        case 'miss':    return '● miss';
+        case 'flat':    return '○ flat';
+        case 'pending': return '· pending';
+        case 'no_price':return '– no price';
+        default:        return s || '—';
+      }
+    }
+    function _pickStatusColor(s) {
+      if (s === 'hit') return 'var(--accent, #4ade80)';
+      if (s === 'miss') return 'var(--error, #f87171)';
+      if (s === 'flat') return 'var(--text-secondary)';
+      return 'var(--text-tertiary, #888)';
+    }
+    async function refreshBrain() {
+      try {
+        const j = await Cockpit.api.get('/api/brain');
+        // Pills.
+        const regimePill = document.getElementById('regime-pill');
+        const regimeLabel = (j.regime && j.regime.label) || '—';
+        if (regimePill) {
+          regimePill.textContent = 'regime ' + regimeLabel;
+          regimePill.classList.remove('pill-accent', 'pill-warn', 'pill-muted');
+          if (regimeLabel === 'risk_on') regimePill.classList.add('pill-accent');
+          else if (regimeLabel === 'risk_off' || regimeLabel === 'volatile') regimePill.classList.add('pill-warn');
+          else regimePill.classList.add('pill-muted');
+        }
+        const mem = j.memory || {};
+        const hitPill = document.getElementById('hitrate-pill');
+        if (hitPill) {
+          if (mem.window && mem.window >= 5) {
+            hitPill.textContent = 'hit-rate ' + Math.round((mem.hit_rate || 0) * 100) + '% (' + mem.window + ')';
+            hitPill.classList.remove('pill-muted');
+            hitPill.classList.add((mem.hit_rate || 0) >= 0.5 ? 'pill-accent' : 'pill-warn');
+          } else {
+            hitPill.textContent = 'hit-rate —';
+          }
+        }
+        const learnPill = document.getElementById('learning-pill');
+        if (learnPill) {
+          const judged = mem.judged || 0;
+          const pending = mem.pending || 0;
+          learnPill.textContent = 'judged ' + judged + ' / pending ' + pending;
+        }
+        // Reflection.
+        const r = j.reflection || {};
+        const head = document.getElementById('brain-reflection-headline');
+        const body = document.getElementById('brain-reflection-body');
+        if (head) head.textContent = r.headline || 'Waiting for first reflection…';
+        if (body) body.textContent = r.paragraph || '';
+        const lessons = document.getElementById('brain-lessons');
+        if (lessons) {
+          lessons.innerHTML = '';
+          (r.lessons || []).forEach(l => {
+            const li = document.createElement('li');
+            li.textContent = l;
+            lessons.appendChild(li);
+          });
+        }
+        // Bandit weight bars.
+        const w = (j.bandit && j.bandit.weights) || {};
+        const ranked = (j.bandit && j.bandit.ranked) || [];
+        const wEl = document.getElementById('brain-weights');
+        if (wEl) {
+          wEl.innerHTML = '';
+          if (ranked.length === 0) {
+            wEl.innerHTML = '<span class="muted">No weight history yet — weights start at 1.0x for all signals.</span>';
+          } else {
+            ranked.slice(0, 8).forEach(([feat, weight]) => {
+              const row = document.createElement('div');
+              row.style.display = 'grid';
+              row.style.gridTemplateColumns = '110px 1fr 48px';
+              row.style.gap = '6px';
+              row.style.alignItems = 'center';
+              const name = document.createElement('span');
+              name.style.color = 'var(--text-secondary)';
+              name.textContent = feat;
+              const bar = document.createElement('div');
+              bar.style.height = '6px';
+              bar.style.borderRadius = '3px';
+              bar.style.background = 'var(--bg-subtle, #1f1f2e)';
+              bar.style.position = 'relative';
+              const fill = document.createElement('div');
+              const pct = Math.max(2, Math.min(100, (weight / 2.0) * 100));
+              fill.style.width = pct + '%';
+              fill.style.height = '100%';
+              fill.style.borderRadius = '3px';
+              fill.style.background = weight >= 1.0
+                ? 'linear-gradient(90deg, var(--accent, #4ade80), var(--accent-2, #22d3ee))'
+                : 'var(--text-tertiary, #555)';
+              bar.appendChild(fill);
+              const val = document.createElement('span');
+              val.style.textAlign = 'right';
+              val.style.color = 'var(--text-primary)';
+              val.style.fontVariantNumeric = 'tabular-nums';
+              val.textContent = weight.toFixed(2) + 'x';
+              row.appendChild(name);
+              row.appendChild(bar);
+              row.appendChild(val);
+              wEl.appendChild(row);
+            });
+          }
+        }
+        // Recent picks.
+        const picks = j.recent_picks || [];
+        const pEl = document.getElementById('brain-recent-picks');
+        if (pEl) {
+          pEl.innerHTML = '';
+          if (picks.length === 0) {
+            pEl.innerHTML = '<span class="muted">No picks yet — the brain will record its first focus after the next sweep.</span>';
+          } else {
+            picks.slice(0, 8).forEach(p => {
+              const row = document.createElement('div');
+              row.style.display = 'grid';
+              row.style.gridTemplateColumns = '60px 1fr 80px';
+              row.style.gap = '6px';
+              row.style.alignItems = 'center';
+              const sym = document.createElement('span');
+              sym.style.fontWeight = '600';
+              sym.textContent = p.symbol;
+              const ret = document.createElement('span');
+              ret.style.color = 'var(--text-secondary)';
+              if (p.return_pct != null) {
+                const pctv = (p.return_pct * 100);
+                ret.textContent = (pctv >= 0 ? '+' : '') + pctv.toFixed(2) + '%';
+              } else {
+                ret.textContent = '—';
+              }
+              const stat = document.createElement('span');
+              stat.style.textAlign = 'right';
+              stat.style.color = _pickStatusColor(p.status);
+              stat.textContent = _fmtPickStatus(p.status);
+              row.appendChild(sym);
+              row.appendChild(ret);
+              row.appendChild(stat);
+              pEl.appendChild(row);
+            });
+          }
+        }
+      } catch (e) { /* ignore */ }
+    }
+    Cockpit.poll(refreshBrain, 12000, { name: 'index-brain' });
   </script>
 </body>
 </html>

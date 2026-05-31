@@ -41,7 +41,11 @@ from datetime import time as dtime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from packages.cockpit.web import bandit as agent_bandit
+from packages.cockpit.web import brain_memory
 from packages.cockpit.web import chatter as agent_chatter
+from packages.cockpit.web import reflection as agent_reflection
+from packages.cockpit.web import regime as regime_module
 
 log = logging.getLogger("autonomy")
 
@@ -82,6 +86,20 @@ class AutonomyConfig:
     # Optional hook to fetch portfolio symbols so we always keep them
     # in the focus list (don't drop the user's actual holdings).
     portfolio_symbols_getter: Callable[[], list[str]] | None = None
+    # ---- Phase 21: self-improvement knobs --------------------------
+    # When True, the tick judges prior picks, updates the bandit, runs
+    # regime detection, and writes a reflection. Disable in tests that
+    # don't want side-effects.
+    self_improve_enabled: bool = True
+    # Holding horizon for outcome judgment. 24h is one full session.
+    judgment_horizon_hours: int = int(
+        os.environ.get("AUTONOMY_JUDGMENT_HOURS") or 24
+    )
+    # Price provider for outcome judgment + regime detection. Tests
+    # inject deterministic providers; the default uses yfinance.
+    price_lookup: Callable[[str], float | None] | None = None
+    regime_price_provider: Callable[[str], list[float] | None] | None = None
+    regime_vix_provider: Callable[[], float | None] | None = None
 
 
 @dataclass
@@ -97,6 +115,11 @@ class AutonomyState:
     last_curiosity_focus: list[str] = field(default_factory=list)
     last_curiosity_reason: str = ""
     last_error: str = ""
+    # Phase 21 — self-improvement state surfaced for /api/brain.
+    last_regime: dict[str, Any] | None = None
+    last_reflection: dict[str, Any] | None = None
+    last_judged_count: int = 0
+    last_bandit_weights: dict[str, float] = field(default_factory=dict)
     # Background asyncio task handles; managed by start()/stop().
     _sweep_task: asyncio.Task[Any] | None = None
     _config: AutonomyConfig = field(default_factory=AutonomyConfig)
@@ -151,66 +174,112 @@ def current_sweep_interval(now: datetime | None = None) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _score_candidate(c: dict[str, Any]) -> tuple[float, list[str]]:
+# Feature labels emitted by the scorer. Kept in sync with bandit
+# DEFAULT_ARMS and regime.SCORE_MULTIPLIERS — add a new label here when
+# you want the bandit + regime modifier to apply to a new signal.
+FEATURE_LABELS: tuple[str, ...] = (
+    "corroborated",
+    "reddit_trust",
+    "analyst_bullish",
+    "analyst_action",
+    "insider",
+    "stocktwits",
+    "yahoo_news",
+)
+
+
+def _score_candidate(
+    c: dict[str, Any],
+    *,
+    weights: dict[str, float] | None = None,
+    multipliers: dict[str, float] | None = None,
+) -> tuple[float, list[str], list[str]]:
     """Score a sweep candidate for "investigate-worthiness".
 
-    Returns ``(score, reasons)`` where ``score`` blends confidence with
-    corroboration and per-source enrichment. ``reasons`` is a short
-    list of human strings explaining which factors fired \u2014 they're
-    what the chatter line will read.
+    Returns ``(score, reasons, features)``. ``score`` blends
+    confidence with corroboration and per-source enrichment.
+    ``reasons`` is the human chatter copy. ``features`` is the list
+    of stable feature IDs that fired — the bandit credits/blames
+    these IDs after outcomes are judged.
+
+    Per-feature contributions are multiplied by:
+      * ``weights[feature]``  — the bandit's adapted weight (default 1.0)
+      * ``multipliers[feature]`` — the current regime's tilt (default 1.0)
+
+    When both are omitted the scorer behaves exactly like Phase 20.
     """
     if not isinstance(c, dict):
-        return (0.0, [])
+        return (0.0, [], [])
     reasons: list[str] = []
+    features: list[str] = []
+    weights = weights or {}
+    multipliers = multipliers or {}
+
+    def gain(label: str, base: float) -> float:
+        """Apply bandit weight * regime multiplier to a base bonus."""
+        w = float(weights.get(label, 1.0))
+        m = float(multipliers.get(label, 1.0))
+        return base * w * m
+
     # Base = confidence (already in [0, 1]).
     score = float(c.get("confidence") or 0.0)
 
     if c.get("corroborated"):
-        score += 0.20
+        score += gain("corroborated", 0.20)
         reasons.append("news-corroborated")
+        features.append("corroborated")
     cs = float(c.get("corroboration_score") or 0.0)
     if cs >= 0.5:
-        score += 0.10
+        score += gain("corroborated", 0.10)
         if "news-corroborated" not in reasons:
             reasons.append(f"corroboration {cs:.2f}")
+            if "corroborated" not in features:
+                features.append("corroborated")
 
     rt = float(c.get("reddit_trust") or 0.0)
     if rt >= 0.6:
-        score += 0.10
+        score += gain("reddit_trust", 0.10)
         reasons.append(f"reddit-trust {rt:.2f}")
+        features.append("reddit_trust")
 
     # Analyst rating: 1 = Strong Buy \u2026 5 = Strong Sell. Anything <2.5
     # is bullish, >3.5 bearish.
     amr = float(c.get("analyst_mean_rating") or 0.0)
     if amr and amr <= 2.2 and int(c.get("analyst_num") or 0) >= 5:
-        score += 0.08
+        score += gain("analyst_bullish", 0.08)
         reasons.append("analysts bullish")
+        features.append("analyst_bullish")
     elif amr and amr >= 3.8 and int(c.get("analyst_num") or 0) >= 5:
-        score += 0.08
+        score += gain("analyst_bullish", 0.08)
         reasons.append("analysts bearish")
+        features.append("analyst_bullish")
 
     action = (c.get("analyst_recent_action") or "").lower()
     if action in {"upgrade", "downgrade"}:
-        score += 0.06
+        score += gain("analyst_action", 0.06)
         reasons.append(f"analyst {action}")
+        features.append("analyst_action")
 
     # Insider Form 4 activity in the last 30 days.
     if int(c.get("insider_form4_30d") or 0) >= 3:
         net = float(c.get("insider_net_shares") or 0.0)
         side = "buying" if net > 0 else ("selling" if net < 0 else "rotation")
-        score += 0.08
+        score += gain("insider", 0.08)
         reasons.append(f"insider {side}")
+        features.append("insider")
 
     if c.get("stocktwits_trending"):
-        score += 0.04
+        score += gain("stocktwits", 0.04)
         reasons.append("stocktwits trending")
+        features.append("stocktwits")
 
     yc = int(c.get("yahoo_news_count") or 0)
     if yc >= 5:
-        score += 0.03
+        score += gain("yahoo_news", 0.03)
         reasons.append(f"{yc} fresh headlines")
+        features.append("yahoo_news")
 
-    return (round(score, 4), reasons)
+    return (round(score, 4), reasons, features)
 
 
 def pick_focus(
@@ -218,36 +287,52 @@ def pick_focus(
     *,
     top_n: int = 8,
     focus_count: int = 3,
+    weights: dict[str, float] | None = None,
+    multipliers: dict[str, float] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """Curiosity's decision: which symbols are worth a deep dive next?
 
     Looks at the ``top_n`` candidates, scores each, keeps the
     ``focus_count`` highest-scoring symbols. Deterministic for tests.
 
+    Optional ``weights`` (from the bandit) and ``multipliers`` (from
+    the regime detector) tilt the scoring. Without them this
+    behaves identically to the Phase 20 implementation.
+
     Returns ``(symbols, details)`` where each ``details`` entry is
-    ``{symbol, score, reasons}``.
+    ``{symbol, score, reasons, features, candidate}``. The raw
+    candidate dict is included so callers can capture ``last_price``
+    or other context for outcome judgment.
     """
     if not candidates:
         return ([], [])
-    scored: list[tuple[float, str, list[str]]] = []
+    scored: list[tuple[float, str, list[str], list[str], dict[str, Any]]] = []
     for c in candidates[:top_n]:
         sym = str(c.get("symbol") or "").upper().strip()
         if not sym:
             continue
-        s, r = _score_candidate(c)
-        scored.append((s, sym, r))
+        s, r, feats = _score_candidate(c, weights=weights, multipliers=multipliers)
+        scored.append((s, sym, r, feats, c))
     # Highest score first; ties broken alphabetically for determinism.
     scored.sort(key=lambda x: (-x[0], x[1]))
     chosen = scored[:focus_count]
     syms: list[str] = []
     details: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for s, sym, reasons in chosen:
+    for s, sym, reasons, feats, cand in chosen:
         if sym in seen:
             continue
         seen.add(sym)
         syms.append(sym)
-        details.append({"symbol": sym, "score": s, "reasons": reasons})
+        details.append(
+            {
+                "symbol": sym,
+                "score": s,
+                "reasons": reasons,
+                "features": feats,
+                "candidate": cand,
+            }
+        )
     return (syms, details)
 
 
@@ -379,15 +464,126 @@ async def run_one_tick(
         ts=STATE.last_sweep_finished_at,
     )
 
-    # Curiosity step.
+    # ------------------------------------------------------------------
+    # Phase 21-A: judge prior picks → reward the bandit.
+    # ------------------------------------------------------------------
+    judged_count = 0
+    if cfg.self_improve_enabled and cfg.price_lookup is not None:
+        try:
+            judged = brain_memory.judge_picks(
+                cfg.price_lookup,
+                horizon_hours=cfg.judgment_horizon_hours,
+            )
+            judged_count = len(judged)
+            for jp in judged:
+                status = jp.get("status")
+                if status not in {"hit", "miss", "flat"}:
+                    continue
+                # Reward: +1 hit, -1 miss, -0.25 flat (penalise weak picks).
+                reward = (
+                    1.0 if status == "hit"
+                    else -1.0 if status == "miss"
+                    else -0.25
+                )
+                feats = jp.get("features") or []
+                if feats:
+                    agent_bandit.update_with_outcome(feats, reward)
+            if judged_count:
+                hits = sum(1 for j in judged if j.get("status") == "hit")
+                misses = sum(1 for j in judged if j.get("status") == "miss")
+                agent_chatter.push(
+                    agent="reflection",
+                    status="ok" if hits >= misses else "warn",
+                    message=(
+                        f"Judged {judged_count} prior picks: {hits} hits, "
+                        f"{misses} misses — weights adapted."
+                    ),
+                    ts=STATE.last_sweep_finished_at,
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("brain_memory judge_picks failed: %s", exc)
+    STATE.last_judged_count = judged_count
+
+    # ------------------------------------------------------------------
+    # Phase 21-B: detect current market regime.
+    # ------------------------------------------------------------------
+    regime_snap = None
+    multipliers: dict[str, float] = {}
+    if cfg.self_improve_enabled:
+        try:
+            regime_snap = regime_module.detect(
+                price_provider=cfg.regime_price_provider,
+                vix_provider=cfg.regime_vix_provider,
+            )
+            multipliers = dict(regime_snap.multipliers)
+            STATE.last_regime = {
+                "label": regime_snap.label,
+                "confidence": regime_snap.confidence,
+                "reasons": list(regime_snap.reasons),
+                "vix": regime_snap.vix,
+                "spy_trend_20d": regime_snap.spy_trend_20d,
+                "spy_drawdown_60d": regime_snap.spy_drawdown_60d,
+                "breadth": regime_snap.breadth,
+                "ts": regime_snap.ts,
+            }
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("regime detect failed: %s", exc)
+            STATE.last_regime = {"label": "neutral", "reasons": [str(exc)[:120]]}
+
+    # Pull current bandit weights (cheap read-only call).
+    try:
+        weights = agent_bandit.current_weights() if cfg.self_improve_enabled else {}
+    except Exception as exc:  # pragma: no cover — defensive
+        log.warning("bandit weights load failed: %s", exc)
+        weights = {}
+    STATE.last_bandit_weights = dict(weights)
+
+    # ------------------------------------------------------------------
+    # Curiosity step — now tilted by bandit + regime.
+    # ------------------------------------------------------------------
     focus_syms, focus_details = pick_focus(
         result_dict.get("candidates") or [],
         top_n=cfg.curiosity_top_n,
         focus_count=cfg.curiosity_focus_count,
+        weights=weights or None,
+        multipliers=multipliers or None,
     )
     STATE.last_curiosity_at = STATE.last_sweep_finished_at
     STATE.last_curiosity_focus = focus_syms
     STATE.last_curiosity_reason = _curiosity_message(focus_details)
+
+    # ------------------------------------------------------------------
+    # Phase 21-C: record picks into brain memory for future judgment.
+    # ------------------------------------------------------------------
+    if cfg.self_improve_enabled:
+        regime_label = (STATE.last_regime or {}).get("label")
+        for fd in focus_details:
+            cand = fd.get("candidate") or {}
+            entry_price = None
+            for key in ("last_price", "price", "close", "current_price"):
+                val = cand.get(key)
+                if val is not None:
+                    try:
+                        entry_price = float(val)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+            if entry_price is None and cfg.price_lookup is not None:
+                try:
+                    entry_price = cfg.price_lookup(fd["symbol"])
+                except Exception:  # pragma: no cover — defensive
+                    entry_price = None
+            try:
+                brain_memory.record_pick(
+                    fd["symbol"],
+                    score=fd.get("score") or 0.0,
+                    reasons=fd.get("reasons") or [],
+                    features=fd.get("features") or [],
+                    entry_price=entry_price,
+                    regime=regime_label,
+                )
+            except Exception as exc:  # pragma: no cover — defensive
+                log.warning("record_pick failed for %s: %s", fd.get("symbol"), exc)
 
     agent_chatter.push(
         agent="curiosity",
@@ -395,6 +591,38 @@ async def run_one_tick(
         message=STATE.last_curiosity_reason,
         ts=STATE.last_sweep_finished_at,
     )
+
+    # ------------------------------------------------------------------
+    # Phase 21-D: compose + persist reflection.
+    # ------------------------------------------------------------------
+    if cfg.self_improve_enabled:
+        try:
+            stats = brain_memory.accuracy_stats()
+            prior = (STATE.last_reflection or {}).get("stats", {}).get("hit_rate")
+            bandit_snap = agent_bandit.snapshot()
+            refl = agent_reflection.compose(
+                stats=stats,
+                regime=STATE.last_regime,
+                bandit_snapshot=bandit_snap,
+                prior_hit_rate=prior,
+            )
+            agent_reflection.append(refl)
+            STATE.last_reflection = {
+                "ts": refl.ts,
+                "headline": refl.headline,
+                "paragraph": refl.paragraph,
+                "lessons": list(refl.lessons),
+                "stats": dict(refl.stats),
+                "regime": refl.regime,
+            }
+            agent_chatter.push(
+                agent="reflection",
+                status="info",
+                message=refl.headline,
+                ts=refl.ts,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("reflection failed: %s", exc)
 
     # Push focus into the agent scheduler if a hook is wired up. Keep
     # the user's portfolio symbols at the front so we never drop them.
@@ -420,6 +648,8 @@ async def run_one_tick(
         "candidates": STATE.last_sweep_candidates,
         "focus": focus_syms,
         "focus_details": focus_details,
+        "judged": judged_count,
+        "regime": (STATE.last_regime or {}).get("label"),
     }
 
 
@@ -501,11 +731,17 @@ def snapshot() -> dict[str, Any]:
         "last_curiosity_focus": list(STATE.last_curiosity_focus),
         "last_curiosity_reason": STATE.last_curiosity_reason,
         "last_error": STATE.last_error,
+        "last_regime": STATE.last_regime,
+        "last_reflection": STATE.last_reflection,
+        "last_judged_count": STATE.last_judged_count,
+        "last_bandit_weights": dict(STATE.last_bandit_weights),
         "config": {
             "sweep_market_seconds": cfg.sweep_market_seconds,
             "sweep_off_seconds": cfg.sweep_off_seconds,
             "curiosity_top_n": cfg.curiosity_top_n,
             "curiosity_focus_count": cfg.curiosity_focus_count,
+            "self_improve_enabled": cfg.self_improve_enabled,
+            "judgment_horizon_hours": cfg.judgment_horizon_hours,
         },
     }
 
@@ -521,4 +757,8 @@ def reset_for_tests() -> None:
     STATE.last_curiosity_focus = []
     STATE.last_curiosity_reason = ""
     STATE.last_error = ""
+    STATE.last_regime = None
+    STATE.last_reflection = None
+    STATE.last_judged_count = 0
+    STATE.last_bandit_weights = {}
     STATE._config = AutonomyConfig()

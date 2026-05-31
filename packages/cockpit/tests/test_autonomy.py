@@ -28,9 +28,15 @@ from packages.cockpit.web.server import app
 
 @pytest.fixture(autouse=True)
 def _reset_brain() -> None:
-    """Start every test from a clean autonomy + chatter state."""
+    """Start every test from a clean autonomy + chatter state.
+
+    Self-improvement is disabled by default so these Phase 20 tests
+    don't exercise (or write files for) Phase 21 internals. Phase 21
+    behaviour has its own dedicated test module.
+    """
     autonomy.reset_for_tests()
     chatter.clear()
+    autonomy.configure(self_improve_enabled=False)
     yield
     autonomy.reset_for_tests()
     chatter.clear()
@@ -80,10 +86,11 @@ def test_score_picks_up_corroboration_signal() -> None:
     corro = _cand(
         symbol="BBB", confidence=0.5, corroborated=True, corroboration_score=0.7
     )
-    s_plain, _r_plain = autonomy._score_candidate(plain)
-    s_corro, r_corro = autonomy._score_candidate(corro)
+    s_plain, _r_plain, _f_plain = autonomy._score_candidate(plain)
+    s_corro, r_corro, f_corro = autonomy._score_candidate(corro)
     assert s_corro > s_plain
     assert any("corroborat" in r for r in r_corro)
+    assert "corroborated" in f_corro
 
 
 def test_score_rewards_insider_activity_and_analyst_signals() -> None:
@@ -97,21 +104,24 @@ def test_score_rewards_insider_activity_and_analyst_signals() -> None:
         insider_net_shares=10_000.0,
     )
     bare = _cand(symbol="OTHER", confidence=0.4)
-    s_bull, reasons = autonomy._score_candidate(bullish)
-    s_bare, _ = autonomy._score_candidate(bare)
+    s_bull, reasons, feats = autonomy._score_candidate(bullish)
+    s_bare, _, _ = autonomy._score_candidate(bare)
     assert s_bull > s_bare + 0.15
     assert any("analyst" in r for r in reasons)
     assert any("insider" in r for r in reasons)
+    assert "insider" in feats and "analyst_action" in feats
 
 
 def test_score_resilient_to_malformed_input() -> None:
-    s, r = autonomy._score_candidate({})
+    s, r, f = autonomy._score_candidate({})
     assert s == 0.0
     assert r == []
+    assert f == []
     # Non-dict input also doesn't raise.
-    s2, r2 = autonomy._score_candidate("not a dict")  # type: ignore[arg-type]
+    s2, r2, f2 = autonomy._score_candidate("not a dict")  # type: ignore[arg-type]
     assert s2 == 0.0
     assert r2 == []
+    assert f2 == []
 
 
 def test_pick_focus_ranks_and_caps_results() -> None:

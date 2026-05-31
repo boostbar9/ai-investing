@@ -58,7 +58,11 @@ from packages.cockpit.state import (
     save_state,
 )
 from packages.cockpit.web import autonomy as autonomy_brain
+from packages.cockpit.web import bandit as autonomy_bandit
+from packages.cockpit.web import brain_memory as autonomy_memory
 from packages.cockpit.web import chatter as agent_chatter
+from packages.cockpit.web import reflection as autonomy_reflection
+from packages.cockpit.web import regime as autonomy_regime
 from packages.execution.broker import AlpacaPaperBroker, BrokerError, OrderRequest
 from packages.paper.streak import compute_paper_streak
 from packages.shared import conn_checks, secrets
@@ -3033,9 +3037,25 @@ async def _autonomy_startup() -> None:  # pragma: no cover
     if os.environ.get("AUTONOMY_DISABLED") == "1":
         log.info("autonomy brain disabled via AUTONOMY_DISABLED=1")
         return
+
+    # Phase 21: wire the self-improvement loop with best-effort price
+    # providers. Each falls back to None on any failure so the brain
+    # keeps running even when network/yfinance is unreachable.
+    def _last_price(sym: str) -> float | None:
+        try:
+            series = autonomy_regime.default_price_provider(sym, days=5)
+            if series:
+                return float(series[-1])
+        except Exception:  # pragma: no cover — defensive
+            pass
+        return None
+
     autonomy_brain.configure(
         on_curiosity_focus=_agent_sched_set_symbols,
         portfolio_symbols_getter=_portfolio_symbols_snapshot,
+        price_lookup=_last_price,
+        regime_price_provider=autonomy_regime.default_price_provider,
+        regime_vix_provider=autonomy_regime.default_vix_provider,
     )
     started = autonomy_brain.start()
     log.info("autonomy brain startup: started=%s", started)
@@ -3177,6 +3197,78 @@ def api_autonomy_disable() -> dict[str, Any]:
     """Stop the autonomy loop."""
     autonomy_brain.stop()
     return autonomy_brain.snapshot()
+
+
+# ---------------------------------------------------------------------------
+# Phase 21 — Self-improving brain endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/brain")
+def api_brain() -> dict[str, Any]:
+    """Self-improving brain status: accuracy, regime, weights, reflection.
+
+    Aggregates the four Phase 21 components so the dashboard can render
+    a single "Brain Health" card. Always returns 200 — errors degrade
+    to empty sections rather than crashing the page.
+    """
+    out: dict[str, Any] = {
+        "ok": True,
+        "memory": {},
+        "regime": None,
+        "bandit": {},
+        "reflection": None,
+        "recent_picks": [],
+        "recent_reflections": [],
+    }
+    try:
+        out["memory"] = autonomy_memory.accuracy_stats()
+    except Exception as exc:
+        out["memory"] = {"error": str(exc)[:200]}
+    try:
+        out["recent_picks"] = autonomy_memory.recent_picks(limit=15)
+    except Exception:
+        out["recent_picks"] = []
+    try:
+        out["bandit"] = autonomy_bandit.snapshot()
+    except Exception as exc:
+        out["bandit"] = {"error": str(exc)[:200]}
+    try:
+        out["reflection"] = autonomy_reflection.latest()
+    except Exception:
+        out["reflection"] = None
+    try:
+        out["recent_reflections"] = autonomy_reflection.recent(limit=8)
+    except Exception:
+        out["recent_reflections"] = []
+    snap = autonomy_brain.snapshot()
+    out["regime"] = snap.get("last_regime")
+    return out
+
+
+@app.post("/api/brain/reset")
+def api_brain_reset() -> dict[str, Any]:
+    """Wipe brain learning state — picks ledger, bandit weights,
+    reflections. The autonomy loop keeps running; it just starts
+    learning from scratch.
+    """
+    removed: dict[str, Any] = {}
+    try:
+        autonomy_memory.reset_for_tests()
+        removed["memory"] = True
+    except Exception as exc:
+        removed["memory_error"] = str(exc)[:200]
+    try:
+        autonomy_bandit.reset_for_tests()
+        removed["bandit"] = True
+    except Exception as exc:
+        removed["bandit_error"] = str(exc)[:200]
+    try:
+        autonomy_reflection.reset_for_tests()
+        removed["reflections"] = True
+    except Exception as exc:
+        removed["reflections_error"] = str(exc)[:200]
+    return {"ok": True, **removed}
 
 
 @app.get("/api/agents/discoveries")
