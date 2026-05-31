@@ -57,6 +57,7 @@ from packages.cockpit.state import (
     record_action,
     save_state,
 )
+from packages.cockpit.web import autonomy as autonomy_brain
 from packages.cockpit.web import chatter as agent_chatter
 from packages.execution.broker import AlpacaPaperBroker, BrokerError, OrderRequest
 from packages.paper.streak import compute_paper_streak
@@ -2879,8 +2880,13 @@ async def api_agents_run(req: AgentRunRequest) -> dict[str, Any]:
 # run would. Config is in-memory (resets on restart) by design — the user
 # explicitly opts in each session.
 
+# Phase 20 — the scheduler is now **enabled by default** so the AIs
+# actually talk in the background. The user can still disable it via
+# POST /api/agents/schedule, and the cockpit pause button universally
+# skips ticks. The stub backend is still the default so we don't
+# require Ollama just to feel alive.
 _AGENT_SCHED: dict[str, Any] = {
-    "enabled": False,
+    "enabled": True,
     "interval_seconds": 1800,  # 30 minutes
     "use_llm": False,
     "symbols": ["SPY", "QQQ", "TLT"],
@@ -2889,6 +2895,50 @@ _AGENT_SCHED: dict[str, Any] = {
     "last_error": None,
     "_task": None,
 }
+
+
+def _agent_sched_set_symbols(symbols: list[str], reason: str) -> None:
+    """Curiosity → scheduler bridge.
+
+    Replaces the scheduler's working watchlist with the symbols the
+    Curiosity agent picked. Capped at 6 to keep tick latency sane.
+    Reason is logged so the audit trail tells us *why* the focus
+    changed.
+    """
+    if not symbols:
+        return
+    deduped = [str(s).upper().strip() for s in symbols if s]
+    deduped = list(dict.fromkeys(deduped))[:6]
+    if not deduped:
+        return
+    prev = list(_AGENT_SCHED.get("symbols") or [])
+    if prev == deduped:
+        return
+    _AGENT_SCHED["symbols"] = deduped
+    log.info("curiosity updated scheduler symbols: %s (was %s) — %s",
+             deduped, prev, reason)
+
+
+def _portfolio_symbols_snapshot() -> list[str]:
+    """Best-effort portfolio symbols for Curiosity to anchor on.
+
+    Reads from the cached snapshot the dashboard uses so we don't make
+    a fresh broker call on every Curiosity tick.
+    """
+    try:
+        snap_path = Path("data/cockpit/snapshot.json")
+        if not snap_path.exists():
+            return []
+        data = json.loads(snap_path.read_text(encoding="utf-8"))
+        positions = data.get("positions") or []
+        out: list[str] = []
+        for p in positions:
+            sym = (p.get("symbol") or "").upper().strip()
+            if sym and sym not in out:
+                out.append(sym)
+        return out
+    except Exception:
+        return []
 
 
 class AgentScheduleConfig(BaseModel):
@@ -2969,6 +3019,31 @@ def _stop_scheduler_task() -> None:
 async def _agent_scheduler_startup() -> None:  # pragma: no cover
     if _AGENT_SCHED.get("enabled"):
         _start_scheduler_task()
+
+
+@app.on_event("startup")
+async def _autonomy_startup() -> None:  # pragma: no cover
+    """Boot the Always-On Brain.
+
+    Wires the Curiosity → scheduler bridge so the next pipeline tick
+    focuses on whatever the autonomy loop just decided is interesting,
+    then starts the long-lived sweep loop. Disabled when the env var
+    ``AUTONOMY_DISABLED=1`` is set (CI / tests / safe-mode).
+    """
+    if os.environ.get("AUTONOMY_DISABLED") == "1":
+        log.info("autonomy brain disabled via AUTONOMY_DISABLED=1")
+        return
+    autonomy_brain.configure(
+        on_curiosity_focus=_agent_sched_set_symbols,
+        portfolio_symbols_getter=_portfolio_symbols_snapshot,
+    )
+    started = autonomy_brain.start()
+    log.info("autonomy brain startup: started=%s", started)
+
+
+@app.on_event("shutdown")
+async def _autonomy_shutdown() -> None:  # pragma: no cover
+    autonomy_brain.stop()
 
 
 @app.on_event("shutdown")
@@ -3066,6 +3141,42 @@ def api_chatter(limit: int = 25) -> dict[str, Any]:
         "count": len(items),
         "max": agent_chatter.CHATTER_MAX,
     }
+
+
+@app.get("/api/autonomy")
+def api_autonomy() -> dict[str, Any]:
+    """Always-On Brain status.
+
+    Surfaces what the autonomous research + Curiosity loop is doing
+    without exposing internal task handles. Powers the dashboard's
+    autonomy pill.
+    """
+    return autonomy_brain.snapshot()
+
+
+@app.post("/api/autonomy/tick")
+async def api_autonomy_tick() -> dict[str, Any]:
+    """Force one autonomous research + curiosity tick right now.
+
+    Useful for the user button on the dashboard, and as a deterministic
+    entry point for tests. Honors the pause flag like the scheduled
+    loop does.
+    """
+    return await autonomy_brain.run_one_tick()
+
+
+@app.post("/api/autonomy/enable")
+def api_autonomy_enable() -> dict[str, Any]:
+    """Start the autonomy loop if it isn't already running."""
+    started = autonomy_brain.start()
+    return {"started": bool(started), **autonomy_brain.snapshot()}
+
+
+@app.post("/api/autonomy/disable")
+def api_autonomy_disable() -> dict[str, Any]:
+    """Stop the autonomy loop."""
+    autonomy_brain.stop()
+    return autonomy_brain.snapshot()
 
 
 @app.get("/api/agents/discoveries")

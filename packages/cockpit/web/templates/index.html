@@ -252,18 +252,27 @@
       </div>
     </section>
 
-    <!-- Rolling agent chatter — latest narrations from research / strategy /
-         risk / execution / discovery. Auto-refreshes every 8s. -->
+    <!-- Rolling agent chatter + Always-On Brain status. The autonomy
+         loop runs research sweeps every 2h (market hours) / 6h
+         (off-hours) and the Curiosity agent picks the next focus
+         after each one. Both feed the chatter list below. -->
     <section class="card p-5 mb-5" id="chatter-card">
-      <div class="flex items-center justify-between mb-3">
-        <h2 class="section-h mb-0" data-tt="Live tail of the most-recent agent narrations. Each pipeline pass (manual or auto-scheduled) drops up to one line per agent here.">Agent Chatter</h2>
-        <div class="flex items-center gap-2">
-          <span class="pill pill-live pill-accent" id="chatter-live-pill">live</span>
+      <div class="flex items-center justify-between mb-3" style="flex-wrap:wrap;gap:8px;">
+        <h2 class="section-h mb-0" data-tt="Live tail of agent narrations. The Always-On Brain runs a research sweep every 2 hours (market hours) / 6 hours (after hours), and Curiosity picks the next focus.">Agent Chatter</h2>
+        <div class="flex items-center gap-2" style="flex-wrap:wrap;">
+          <span class="pill pill-muted" id="autonomy-pill" data-tt="Always-On Brain status. When green the autonomy loop is actively running research + curiosity ticks.">autonomy —</span>
+          <span class="pill pill-live pill-accent">live</span>
+          <button id="autonomy-think-btn" class="btn btn-sm" data-tt="Force one autonomous research + curiosity pass now.">Think now</button>
           <span class="text-xs muted" id="chatter-meta">—</span>
         </div>
       </div>
+      <div id="autonomy-focus-row" class="text-xs mb-3" style="display:none;color:var(--text-secondary);">
+        <span class="eyebrow" style="margin-right:8px;">Current focus</span>
+        <span id="autonomy-focus-symbols" class="mono"></span>
+        <span id="autonomy-focus-reason" class="muted" style="margin-left:8px;"></span>
+      </div>
       <ol id="chatter-feed" class="flex flex-col gap-2" aria-live="polite">
-        <li class="muted text-sm">Waiting for the first pipeline pass… Click <a href="/agents">Run pipeline</a> or enable the auto-scheduler on the Agents page.</li>
+        <li class="muted text-sm">Waiting for the first pipeline pass… Click <a href="/agents">Run pipeline</a>, or hit <b>Think now</b> above to fire one immediately.</li>
       </ol>
     </section>
 
@@ -800,6 +809,91 @@
       } catch (e) { /* ignore — server may be restarting */ }
     }
     Cockpit.poll(refreshChatter, 8000, { name: 'index-chatter' });
+
+    // ----- Always-On Brain status pill -----
+    // Pulls /api/autonomy and renders a green/amber/grey pill with the
+    // next-tick countdown, current focus symbols and Curiosity reason.
+    function _fmtCountdown(secs) {
+      if (!isFinite(secs) || secs < 0) return '';
+      const m = Math.floor(secs / 60);
+      const h = Math.floor(m / 60);
+      if (h > 0) return h + 'h' + String(m % 60).padStart(2, '0') + 'm';
+      if (m > 0) return m + 'm';
+      return secs + 's';
+    }
+    async function refreshAutonomy() {
+      try {
+        const j = await Cockpit.api.get('/api/autonomy');
+        const pill = document.getElementById('autonomy-pill');
+        const focusRow = document.getElementById('autonomy-focus-row');
+        const focusSyms = document.getElementById('autonomy-focus-symbols');
+        const focusReason = document.getElementById('autonomy-focus-reason');
+        if (!pill) return;
+        // Compute time until next scheduled tick.
+        let nextIn = '';
+        if (j && j.last_sweep_finished_at && j.current_interval_s) {
+          const finished = Date.parse(j.last_sweep_finished_at);
+          if (!isNaN(finished)) {
+            const due = finished + (j.current_interval_s * 1000);
+            const delta = Math.max(0, Math.round((due - Date.now()) / 1000));
+            nextIn = _fmtCountdown(delta);
+          }
+        }
+        // Status color follows running + last_sweep_status.
+        pill.classList.remove('pill-muted', 'pill-good', 'pill-warn', 'pill-bad');
+        if (j && j.running) {
+          if (j.last_sweep_status === 'failed' || j.last_error) {
+            pill.classList.add('pill-warn');
+          } else {
+            pill.classList.add('pill-good');
+          }
+        } else if (j && j.enabled) {
+          pill.classList.add('pill-warn');
+        } else {
+          pill.classList.add('pill-muted');
+        }
+        const stateText = j && j.running ? 'live'
+          : (j && j.enabled ? 'starting' : 'off');
+        const session = j && j.market_open ? 'market' : 'after-hours';
+        const tail = nextIn ? ' · next ' + nextIn : '';
+        pill.textContent = 'autonomy ' + stateText + ' · ' + session + tail;
+        // Focus row.
+        const focus = (j && j.last_curiosity_focus) || [];
+        if (focus.length && focusRow) {
+          focusRow.style.display = '';
+          if (focusSyms) focusSyms.textContent = focus.join(' · ');
+          if (focusReason) focusReason.textContent = j.last_curiosity_reason || '';
+        } else if (focusRow) {
+          focusRow.style.display = 'none';
+        }
+      } catch (e) { /* ignore */ }
+    }
+    Cockpit.poll(refreshAutonomy, 8000, { name: 'index-autonomy' });
+
+    // Think now button — force a single autonomy tick.
+    (function wireThinkNow() {
+      const btn = document.getElementById('autonomy-think-btn');
+      if (!btn) return;
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Thinking…';
+        try {
+          await Cockpit.api.post('/api/autonomy/tick');
+          // Pull fresh chatter + autonomy immediately.
+          await refreshChatter();
+          await refreshAutonomy();
+        } catch (e) {
+          // Surface via toast helper if available; otherwise no-op.
+          if (window.Cockpit && Cockpit.toast) {
+            Cockpit.toast('Autonomy tick failed: ' + (e && e.message || e), 'error');
+          }
+        } finally {
+          btn.disabled = false;
+          btn.textContent = orig;
+        }
+      });
+    })();
   </script>
 </body>
 </html>
