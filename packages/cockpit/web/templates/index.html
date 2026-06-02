@@ -600,6 +600,45 @@
       }
     }
 
+    // Phase 27 — lazily annotates heatmap cells with an insider 'cluster_buy'
+    // (💰) or 'heavy_selling' (❗) icon from /api/insider-signal. Same
+    // best-effort, non-blocking contract as the news annotator.
+    function insiderIcon(info) {
+      if (!info) return "";
+      if (info.cluster_buy || info.label === "cluster_buy") {
+        const buyers = (info.top_buyers || []).slice(0, 3).join(", ");
+        const tip = `Insider cluster buy — ${info.unique_buyers || 0} insiders` +
+                    (buyers ? ` (${buyers})` : "");
+        return `<span class="insider-icon" title="${tip}" style="margin-left:4px;font-size:10px;vertical-align:middle">💰</span>`;
+      }
+      if (info.label === "heavy_selling") {
+        return `<span class="insider-icon" title="Heavy insider selling" style="margin-left:4px;font-size:10px;vertical-align:middle">❗</span>`;
+      }
+      return "";
+    }
+
+    async function annotateInsiderSignals(symbols) {
+      if (!symbols.length) return;
+      try {
+        const r = await fetch(`/api/insider-signal?symbols=${encodeURIComponent(symbols.join(","))}`);
+        if (!r.ok) return;
+        const data = await r.json();
+        const results = (data && data.results) || {};
+        for (const sym of Object.keys(results)) {
+          const info = results[sym];
+          const html = insiderIcon(info);
+          if (!html) continue;
+          const cell = document.querySelector(`.heat-cell[data-symbol="${sym}"] .sym`);
+          if (cell && !cell.querySelector(".insider-icon")) {
+            cell.insertAdjacentHTML("beforeend", html);
+            cell.parentElement.setAttribute("data-insider-label", info.label);
+          }
+        }
+      } catch (e) {
+        // Best-effort — silent failure.
+      }
+    }
+
     function renderHeatmap(positions, accountEquity) {
       const host = document.getElementById("positions-heat");
       if (!positions || positions.length === 0) {
@@ -624,8 +663,10 @@
       const total = sorted.reduce((s, p) => s + (p.target_weight || 0), 0);
       document.getElementById("positions-summary").textContent =
         `${sorted.length} symbols · ${Cockpit.fmt.pct(total)} allocated`;
-      // Kick off lazy news sentiment fetch (best-effort, non-blocking).
-      annotateNewsSentiment(sorted.map(p => p.symbol).filter(Boolean));
+      // Kick off lazy news + insider fetches (best-effort, non-blocking).
+      const symList = sorted.map(p => p.symbol).filter(Boolean);
+      annotateNewsSentiment(symList);
+      annotateInsiderSignals(symList);
     }
 
     function renderAgentLights(health) {

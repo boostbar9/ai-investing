@@ -1112,6 +1112,37 @@ async def api_news_sentiment_batch(symbols: str = "") -> dict[str, Any]:
     return {"results": results, "stats": client.stats()}
 
 
+# Phase 27 — Insider-transactions signal endpoint. Backed by Finnhub
+# /stock/insider-transactions with a 30-min in-process cache. Same
+# graceful-degrade contract as the news endpoint: no API key → 200
+# with ``label: "neutral"`` and confidence 0.
+@app.get("/api/insider-signal/{symbol}")
+async def api_insider_signal(symbol: str) -> dict[str, Any]:
+    from packages.data.finnhub_insider import get_insider_client
+
+    client = get_insider_client()
+    signal = await client.score_symbol(symbol)
+    return signal.to_dict()
+
+
+@app.get("/api/insider-signal")
+async def api_insider_signal_batch(symbols: str = "") -> dict[str, Any]:
+    """Batch insider-signal lookup. ``symbols`` is comma-separated.
+
+    Returns ``{results: {SYM: payload}, stats: {...}}``. The 30-min
+    cache means repeated lookups on the same set are essentially free.
+    """
+    from packages.data.finnhub_insider import get_insider_client
+
+    tickers = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    client = get_insider_client()
+    results: dict[str, Any] = {}
+    for sym in tickers:
+        signal = await client.score_symbol(sym)
+        results[sym] = signal.to_dict()
+    return {"results": results, "stats": client.stats()}
+
+
 @app.post("/api/pause")
 def api_pause() -> dict[str, Any]:
     state = load_state()
