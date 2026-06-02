@@ -63,6 +63,7 @@ from packages.cockpit.web import brain_memory as autonomy_memory
 from packages.cockpit.web import chatter as agent_chatter
 from packages.cockpit.web import knowledge_base as autonomy_knowledge
 from packages.cockpit.web import reflection as autonomy_reflection
+from packages.cockpit.web import finnhub_ws as finnhub_ws_mod
 from packages.cockpit.web import live_quotes as live_quotes_mod
 from packages.cockpit.web import regime as autonomy_regime
 from packages.execution.broker import AlpacaPaperBroker, BrokerError, OrderRequest
@@ -3064,6 +3065,22 @@ async def _autonomy_startup() -> None:  # pragma: no cover
     else:
         log.info("live quotes: no FINNHUB_API_KEY, using yfinance fallback only")
 
+    # Phase 25.4 — build the WS client that streams live ticks straight
+    # into the cache. None when no API key. The REST path keeps working
+    # if the WS disconnects, so this is purely additive freshness.
+    ws_client = finnhub_ws_mod.build_default_client(
+        on_tick=quote_cache.ingest_ws_tick
+    )
+    if ws_client is not None:
+        ws_started = ws_client.start()
+        log.info(
+            "finnhub_ws: client built (started=%s, max_symbols=%d)",
+            ws_started,
+            ws_client._max_symbols,  # noqa: SLF001 — telemetry only
+        )
+    else:
+        log.info("finnhub_ws: no API key, live tick stream disabled")
+
     def _last_price(sym: str) -> float | None:
         # Synchronous read — the cache is kept warm by the fast loop.
         # On a cold cache (very first call) fall back to a yfinance
@@ -3158,10 +3175,12 @@ async def _autonomy_startup() -> None:  # pragma: no cover
             with contextlib.suppress(Exception):
                 await broker.aclose()
 
-    # Phase 25.3 — keep the live-quote cache warm. Every fast tick
-    # refreshes prices for the current portfolio + any armed dip
-    # watchers + the regime SPY/VIX baseline. This is the call that
-    # actually burns Finnhub budget; everything else just peeks.
+    # Phase 25.3 + 25.4 — keep the live-quote cache warm AND keep the
+    # WS subscription set in sync with the active symbols (portfolio +
+    # dip-watchers + SPY/VIX baseline). REST refresh seeds the cache
+    # immediately; the WS provides sub-second updates after that.
+    # ^VIX is excluded from WS (Finnhub WS is equities-only) but still
+    # refreshes via REST/yfinance.
     async def _phase25_quote_warmup_tick() -> dict[str, Any]:
         symbols: set[str] = {"SPY", "^VIX"}
         try:
@@ -3183,10 +3202,21 @@ async def _autonomy_startup() -> None:  # pragma: no cover
             quote_cache, sorted(symbols)
         )
         ok = sum(1 for v in results.values() if v is not None)
+        ws_result: dict[str, Any] | None = None
+        if ws_client is not None:
+            # Finnhub WS supports US equities only — strip index symbols
+            # (^VIX, ^SPX, etc.) which would just bounce as server errors.
+            ws_symbols = sorted(s for s in symbols if not s.startswith("^"))
+            try:
+                ws_result = await ws_client.set_symbols(ws_symbols)
+            except Exception as exc:  # pragma: no cover — defensive
+                log.debug("finnhub_ws: set_symbols failed: %s", exc)
+                ws_result = {"error": str(exc)[:240]}
         return {
             "refreshed": ok,
             "attempted": len(symbols),
             "primary": quote_cache.status()["primary_provider"],
+            "ws": ws_result,
         }
 
     autonomy_brain.configure(
@@ -3206,6 +3236,14 @@ async def _autonomy_startup() -> None:  # pragma: no cover
 @app.on_event("shutdown")
 async def _autonomy_shutdown() -> None:  # pragma: no cover
     autonomy_brain.stop()
+
+
+@app.on_event("shutdown")
+async def _finnhub_ws_shutdown() -> None:  # pragma: no cover
+    """Phase 25.4 — close the Finnhub WS connection cleanly."""
+    client = finnhub_ws_mod.get_default_client()
+    if client is not None:
+        await client.stop()
 
 
 @app.on_event("shutdown")
@@ -4389,14 +4427,25 @@ def api_errors_unresolve(entry_id: str) -> dict[str, Any]:
 
 @app.get("/api/data-feed")
 def api_data_feed() -> dict[str, Any]:
-    """Snapshot of the live-quote cache: provider, per-symbol freshness, errors.
+    """Snapshot of the live-quote cache + WS stream.
 
-    Driven by :mod:`packages.cockpit.web.live_quotes`. The dashboard
-    polls this so the user can confirm Finnhub is live (or that it's
-    quietly falling back to yfinance daily closes).
+    Driven by :mod:`packages.cockpit.web.live_quotes` for the cache
+    half and :mod:`packages.cockpit.web.finnhub_ws` for the live
+    tick stream. The dashboard polls this so the user can confirm
+    Finnhub is live (REST + WS), tell at a glance whether the WS
+    stream is connected, and see per-symbol last-tick times.
     """
     cache = live_quotes_mod.get_default_cache()
-    return cache.status()
+    out = cache.status()
+    ws_client = finnhub_ws_mod.get_default_client()
+    if ws_client is not None:
+        out["websocket"] = ws_client.status()
+    else:
+        out["websocket"] = {
+            "enabled": False,
+            "reason": "no_api_key_or_disabled",
+        }
+    return out
 
 
 @app.post("/api/data-feed/refresh")

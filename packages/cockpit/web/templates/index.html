@@ -288,7 +288,7 @@
         <h2 class="section-h mb-0" data-tt="Live tail of agent narrations. The Always-On Brain runs a research sweep every 2 hours (market hours) / 6 hours (after hours), and Curiosity picks the next focus.">Agent Chatter</h2>
         <div class="flex items-center gap-2" style="flex-wrap:wrap;">
           <span class="pill pill-muted" id="autonomy-pill" data-tt="Always-On Brain status. When green the autonomy loop is actively running research + curiosity ticks.">autonomy —</span>
-          <span class="pill pill-muted" id="data-feed-pill" data-tt="Live market data source. Green = Finnhub real-time. Amber = yfinance daily-close fallback. Phase 25.3.">data feed —</span>
+          <span class="pill pill-muted" id="data-feed-pill" data-tt="Live market data source. Green = Finnhub WS live ticks (Phase 25.4) or Finnhub REST fresh. Amber = warming up / yfinance fallback.">data feed —</span>
           <span class="pill pill-live pill-accent">live</span>
           <button id="autonomy-think-btn" class="btn btn-sm" data-tt="Force one autonomous research + curiosity pass now.">Think now</button>
           <span class="text-xs muted" id="chatter-meta">—</span>
@@ -969,10 +969,13 @@
     }
     Cockpit.poll(refreshAutonomy, 8000, { name: 'index-autonomy' });
 
-    // ----- Phase 25.3 live data-feed pill -----
-    // Green when Finnhub is the primary provider AND we have at least
-    // one fresh quote. Amber when we're running on the yfinance daily-
-    // close fallback (cockpit still works but quotes are stale).
+    // ----- Phase 25.3 + 25.4 live data-feed pill -----
+    // Tiers:
+    //   green   = Finnhub WS connected AND ticks streaming
+    //   green   = Finnhub REST primary AND quotes fresh (no WS yet)
+    //   amber   = Finnhub primary but warming up / WS reconnecting
+    //   amber   = yfinance fallback (no Finnhub key)
+    //   muted   = nothing wired yet
     async function refreshDataFeed() {
       try {
         const j = await Cockpit.api.get('/api/data-feed');
@@ -982,9 +985,19 @@
         const primary = j && j.primary_provider;
         const freshCount = (j && j.symbols || []).filter(s => s.fresh).length;
         const total = (j && j.symbols || []).length;
-        if (primary === 'finnhub' && freshCount > 0) {
+        const ws = j && j.websocket || {};
+        const wsLive = ws.enabled && ws.connected && ws.ticks_ingested > 0;
+        const wsConnecting = ws.enabled && !ws.connected;
+        if (primary === 'finnhub' && wsLive) {
           pill.classList.add('pill-good');
-          pill.textContent = 'data feed · finnhub · ' + freshCount + '/' + total + ' fresh';
+          pill.textContent = 'data feed · finnhub ws · '
+            + ws.subscribed_count + ' live · ' + ws.ticks_ingested + ' ticks';
+        } else if (primary === 'finnhub' && freshCount > 0) {
+          pill.classList.add('pill-good');
+          pill.textContent = 'data feed · finnhub rest · ' + freshCount + '/' + total + ' fresh';
+        } else if (primary === 'finnhub' && wsConnecting) {
+          pill.classList.add('pill-warn');
+          pill.textContent = 'data feed · finnhub ws (connecting…)';
         } else if (primary === 'finnhub') {
           pill.classList.add('pill-warn');
           pill.textContent = 'data feed · finnhub (warming…)';

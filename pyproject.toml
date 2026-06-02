@@ -44,6 +44,7 @@ dependencies = [
   # Broker / data sources
   "alpaca-py>=0.33",
   "yfinance>=0.2.40",  # fallback price provider (regime + dip_watch)
+  "websockets>=13.0",  # Phase 25.4: Finnhub live tick stream client
   # Auth
   "pyjwt>=2.9",
   # Secrets storage (Windows Credential Manager + cross-platform fallback)
