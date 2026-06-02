@@ -56,6 +56,7 @@ from packages.regime.ensemble import (
 from packages.shared.dotenv import load_dotenv
 from packages.shared.schemas import Position
 from packages.strategies import (
+    IntradayTrendFollowing,
     MeanReversion,
     SectorRotation,
     SentimentOverlay,
@@ -85,12 +86,19 @@ STRATEGIES = {
     "sector-rotation": lambda: SectorRotation(top_n=3),
     # Walk-forward-tuned params (see docs/mean-reversion-tuning.md).
     "mean-reversion": lambda: MeanReversion(rsi_entry=15.0, rsi_exit=60.0, sma=200),
+    # Phase 28-R step 5: 5-min opening-range breakout + VWAP trail. Flat by
+    # 15:45 ET. Uses intraday OHLCV bars (yfinance 5m) rather than the
+    # daily parquet panel, so :func:`compute_target_weights` routes it
+    # through a dedicated branch below.
+    "intraday-trend": lambda: IntradayTrendFollowing(),
 }
 
 STRATEGY_UNIVERSE = {
     "trend-following": ["SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA"],
     "sector-rotation": ["XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU"],
     "mean-reversion": ["SPY", "QQQ", "IWM"],
+    # Phase 28-R step 5: liquid intraday names (matches IntradayTrendFollowing.meta.universe).
+    "intraday-trend": ["SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"],
     # Ensemble = union of trend + sector + mean-reversion, gated by HMM regime.
     "ensemble": [
         "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA",
@@ -234,6 +242,8 @@ def compute_target_weights(
         return compute_ensemble_weights()
     if strategy_name == "policy":
         return compute_policy_weights(equity=equity)
+    if strategy_name == "intraday-trend":
+        return compute_intraday_trend_weights()
     symbols = STRATEGY_UNIVERSE[strategy_name]
     panel = load_panel(symbols)
     if panel.empty:
@@ -243,6 +253,67 @@ def compute_target_weights(
     weights = strategy.generate_signals(panel)
     last_row = weights.iloc[-1].to_dict()
     return {k: float(v) for k, v in last_row.items() if not pd.isna(v)}
+
+
+def compute_intraday_trend_weights() -> dict[str, float]:
+    """Phase 28-R step 5: 5-minute opening-range breakout, VWAP trail.
+
+    Fetches recent 5m bars via the yfinance adapter for each symbol in
+    the ``intraday-trend`` universe, converts them to OHLCV frames, and
+    delegates to :meth:`IntradayTrendFollowing.generate_weights_for_panel`
+    for the per-bar long weights. Returns the last-bar weights (the
+    current target allocation) as a dict for the rebalancer.
+
+    Symbols whose intraday fetch fails (network/data error) are silently
+    skipped so a single bad ticker can't take down the whole cycle.
+    """
+    import asyncio
+
+    from packages.data.adapters.yfinance import YFinanceAdapter
+
+    symbols = STRATEGY_UNIVERSE["intraday-trend"]
+    strategy = STRATEGIES["intraday-trend"]()
+
+    async def _fetch_all() -> dict[str, pd.DataFrame]:
+        adapter = YFinanceAdapter()
+        try:
+            panel: dict[str, pd.DataFrame] = {}
+            for sym in symbols:
+                try:
+                    bars = await adapter.get_intraday_bars(
+                        sym, interval="5m", range_="5d"
+                    )
+                except Exception as exc:  # noqa: BLE001 - skip bad ticker
+                    log.warning("intraday-trend: %s fetch failed: %s", sym, exc)
+                    continue
+                if not bars:
+                    continue
+                df = pd.DataFrame(
+                    [
+                        {
+                            "open": b.open,
+                            "high": b.high,
+                            "low": b.low,
+                            "close": b.close,
+                            "volume": b.volume,
+                        }
+                        for b in bars
+                    ],
+                    index=pd.DatetimeIndex([b.ts for b in bars], name="ts"),
+                )
+                panel[sym] = df
+            return panel
+        finally:
+            await adapter.aclose()
+
+    panel = asyncio.run(_fetch_all())
+    if not panel:
+        raise RuntimeError("no intraday bars available for intraday-trend")
+    weights = strategy.generate_weights_for_panel(panel)
+    if weights.empty:
+        return {}
+    last_row = weights.iloc[-1].to_dict()
+    return {k: float(v) for k, v in last_row.items() if not pd.isna(v) and float(v) > 0}
 
 
 def _build_regime_series(panel: pd.DataFrame) -> pd.Series:
@@ -440,6 +511,12 @@ def compute_target_weights_with_sentiment(
         # Ensemble already aggregates per-strategy signals; sentiment overlay
         # is intentionally not stacked on top.
         return compute_ensemble_weights()
+    if base_name == "intraday-trend":
+        # Intraday strategy uses 5-min OHLCV bars, not the daily panel; the
+        # SentimentOverlay assumes daily prices. Sentiment is already baked
+        # into the intraday setup_finder's ranker (Phase 28-R step 4), so
+        # we just delegate to the bare intraday weights here.
+        return compute_intraday_trend_weights()
     symbols = STRATEGY_UNIVERSE[base_name]
     panel = load_panel(symbols)
     base = STRATEGIES[base_name]()
