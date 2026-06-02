@@ -195,6 +195,360 @@ def _to_cockpit_regime(hmm_label: str) -> str:
     return _HMM_TO_COCKPIT.get(hmm_label.lower(), "neutral")
 
 
+# Phase 33 ----------------------------------------------------------------
+# Per-agent narration emitter.
+#
+# Turns each sweep's outcome into one ``AgentStatus`` row per actor
+# (research / strategy / risk / execution / reflection / curiosity /
+# discovery). The cockpit reads these to render the "AGENT STATUS"
+# panel, giving the operator a glance-able answer to "what is each
+# lane doing and what's blocking it?".
+#
+# This function is intentionally a *pure translator* — it does no
+# trading logic. It must be cheap and crash-resistant: a narration
+# error must never poison a real cycle. The caller wraps it in try/
+# except for that reason.
+
+# Phase 33: persistent curiosity state lives here. Carries cumulative
+# relaxation across sweeps (capped at MAX_CUMULATIVE_RELAXATION) and
+# remembers the last watchlist signature so we can compute its age.
+_CURIOSITY_STATE_PATH = Path("data") / "learning" / "curiosity_state.json"
+
+# A small fallback wildcard pool for when the discovery layer hasn't
+# populated one yet. Mid-cap names outside the typical research universe.
+_FALLBACK_WILDCARD_POOL: tuple[str, ...] = (
+    "NET", "DDOG", "SNOW", "CRWD", "PLTR", "SHOP", "COIN", "RBLX",
+    "PATH", "MDB", "ZS", "OKTA", "PANW", "FTNT", "WDAY", "TEAM",
+)
+
+
+def _load_curiosity_state() -> dict[str, Any]:
+    """Read persisted curiosity state. Returns sane defaults on miss."""
+    try:
+        if _CURIOSITY_STATE_PATH.exists():
+            return json.loads(_CURIOSITY_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log.debug("curiosity: state read failed: %s", exc)
+    return {}
+
+
+def _save_curiosity_state(state: dict[str, Any]) -> None:
+    """Persist curiosity state atomically (best-effort)."""
+    try:
+        _CURIOSITY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CURIOSITY_STATE_PATH.write_text(
+            json.dumps(state, indent=2, default=str), encoding="utf-8"
+        )
+    except OSError as exc:
+        log.debug("curiosity: state write failed: %s", exc)
+
+
+def _compute_idle_streak(limit: int = 10) -> int:
+    """Count consecutive recent sweeps with zero submitted orders.
+
+    Reads ``data/paper_log/decisions.jsonl`` (the canonical sweep ledger)
+    newest-first, stopping at the first sweep that submitted >0 orders.
+    Halted sweeps count as idle (they couldn't submit anything).
+    """
+    p = Path("data") / "paper_log" / "decisions.jsonl"
+    if not p.exists():
+        return 0
+    try:
+        rows = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    streak = 0
+    for line in reversed(rows[-limit:]):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        submitted = rec.get("orders_submitted") or []
+        if isinstance(submitted, list) and len(submitted) > 0:
+            break
+        streak += 1
+    return streak
+
+
+def _dominant_rejection_from_audit(agent_audit: list[dict[str, Any]] | None) -> str:
+    """Infer which gate rejected the most candidates this cycle.
+
+    Looks at risk-agent events in the audit trail. Returns one of
+    ``"atr"``, ``"vwap"``, ``"cluster"``, ``"sentiment"`` or ``""``.
+    """
+    if not agent_audit:
+        return ""
+    counts: dict[str, int] = {"atr": 0, "vwap": 0, "cluster": 0, "sentiment": 0}
+    for ev in agent_audit:
+        payload = ev.get("payload") or {}
+        text = json.dumps(payload, default=str).lower()
+        for key in counts:
+            if key in text:
+                counts[key] += 1
+    best = max(counts.items(), key=lambda kv: kv[1])
+    return best[0] if best[1] > 0 else ""
+
+
+def _run_curiosity_step(
+    *,
+    universe: tuple[str, ...],
+    agent_audit: list[dict[str, Any]] | None,
+    halted: bool,
+    halt_reasons: list[str] | None,
+) -> Any | None:
+    """Build CuriosityInput from sweep state, call decide(), log the action.
+
+    Returns the ``CuriosityAction`` (or None on import/IO error). Pure
+    side effects are: appending to ``curiosity_actions.jsonl`` and
+    updating ``curiosity_state.json``. Never mutates trading state.
+    """
+    try:
+        from packages.agents.curiosity import (
+            CuriosityInput,
+            decide,
+            log_action,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("curiosity import failed: %s", exc)
+        return None
+
+    state = _load_curiosity_state()
+    cumulative = float(state.get("cumulative_relaxation", 0.0))
+
+    # Watchlist age: signature is the sorted universe tuple. If it
+    # hasn't changed since the last snapshot we accumulate age.
+    sig = ",".join(sorted(universe))
+    last_sig = state.get("watchlist_sig", "")
+    last_change_ts = float(state.get("watchlist_changed_at", 0.0))
+    now = datetime.now(UTC).timestamp()
+    if sig != last_sig or last_change_ts == 0.0:
+        state["watchlist_sig"] = sig
+        state["watchlist_changed_at"] = now
+        watchlist_age_s = 0.0
+    else:
+        watchlist_age_s = max(0.0, now - last_change_ts)
+
+    # Dominant rejection: from this cycle's audit, falling back to halt
+    # reason keywords.
+    dominant = _dominant_rejection_from_audit(agent_audit)
+    if not dominant and halted and halt_reasons:
+        hr = " ".join(halt_reasons).lower()
+        for key in ("sentiment", "atr", "vwap", "cluster"):
+            if key in hr:
+                dominant = key
+                break
+
+    # Reflection age: best-effort read of reflections.jsonl mtime.
+    refl_path = Path("data") / "learning" / "reflections.jsonl"
+    try:
+        last_reflection_age_s = (
+            max(0.0, now - refl_path.stat().st_mtime) if refl_path.exists() else 0.0
+        )
+    except OSError:
+        last_reflection_age_s = 0.0
+
+    wildcard_pool = tuple(
+        s for s in state.get("wildcard_pool") or _FALLBACK_WILDCARD_POOL
+        if s not in universe
+    )
+
+    inp = CuriosityInput(
+        idle_streak=_compute_idle_streak(),
+        watchlist_age_s=watchlist_age_s,
+        cumulative_relaxation=cumulative,
+        dominant_rejection=dominant,
+        universe=universe,
+        wildcard_pool=wildcard_pool,
+        last_reflection_age_s=last_reflection_age_s,
+    )
+    action = decide(inp)
+
+    # Honor lower_threshold by bumping cumulative; honor wildcard_scan
+    # by stashing the symbols for the next sweep to consume.
+    if action.kind == "lower_threshold":
+        state["cumulative_relaxation"] = float(
+            action.payload.get("new_cumulative", cumulative + 0.10)
+        )
+        state["last_relaxation_filter"] = action.payload.get("filter", "")
+    elif action.kind == "wildcard_scan":
+        state["pending_wildcards"] = list(action.payload.get("symbols") or [])
+
+    state["last_action_kind"] = action.kind
+    state["last_action_ts"] = datetime.now(UTC).isoformat(timespec="seconds")
+    _save_curiosity_state(state)
+
+    try:
+        log_action(action)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("curiosity log_action failed: %s", exc)
+    return action
+
+
+def _emit_phase33_narration(
+    *,
+    cycle_id: str,
+    strategy_name: str,
+    live_regime: str,
+    cockpit_regime: str,
+    sentiment: float,
+    approved_n: int,
+    planned_n: int,
+    submitted_n: int,
+    errors_n: int,
+    halted: bool,
+    halt_reasons: list[str] | None = None,
+    curiosity_action: Any | None = None,
+) -> None:
+    """Build and emit per-actor narration rows for one sweep cycle.
+
+    Status lines read like a human-readable status update; the cockpit
+    surfaces them verbatim. Keep them short, concrete, and noun-led.
+    """
+    from packages.agents.narration import AgentStatus, emit_many
+
+    halts_str = ", ".join(halt_reasons or []) if halted else ""
+
+    # ---- Research ---------------------------------------------------
+    research = AgentStatus(
+        actor="research",
+        working_on=(
+            f"scanning {strategy_name} universe in regime={cockpit_regime}"
+        ),
+        waiting_on=(
+            "" if approved_n > 0 else
+            "a candidate to clear sentiment/momentum gates"
+        ),
+        last_action=(
+            f"published sentiment={sentiment:+.2f}, "
+            f"approved={approved_n}"
+        ),
+        last_result="halt" if halted else ("ok" if approved_n > 0 else "idle"),
+        hints=(
+            ("sentiment under floor; loosen for intraday",)
+            if halted and "sentiment" in halts_str.lower() else ()
+        ),
+        cycle_id=cycle_id,
+    )
+
+    # ---- Strategy ---------------------------------------------------
+    strategy = AgentStatus(
+        actor="strategy",
+        working_on=f"computing target weights for strategy={strategy_name}",
+        waiting_on=(
+            "" if planned_n > 0 else "approved candidates from risk lane"
+        ),
+        last_action=f"planned {planned_n} order(s)",
+        last_result="halt" if halted else ("ok" if planned_n > 0 else "idle"),
+        cycle_id=cycle_id,
+    )
+
+    # ---- Risk -------------------------------------------------------
+    risk = AgentStatus(
+        actor="risk",
+        working_on="vetting candidates against position/sector/floor limits",
+        waiting_on=(halts_str if halted else ""),
+        last_action=(
+            f"halted: {halts_str}" if halted else
+            f"approved {approved_n}"
+        ),
+        last_result="halt" if halted else "ok",
+        cycle_id=cycle_id,
+    )
+
+    # ---- Execution --------------------------------------------------
+    execution = AgentStatus(
+        actor="execution",
+        working_on=(
+            "submitting orders" if planned_n > 0 else "idle (no plan)"
+        ),
+        waiting_on=(
+            "" if submitted_n > 0 else ("a plan to execute" if not halted else "halt to clear")
+        ),
+        last_action=(
+            f"submitted {submitted_n}/{planned_n}"
+            f"{', ' + str(errors_n) + ' error(s)' if errors_n else ''}"
+        ),
+        last_result=(
+            "halt" if halted else
+            ("warn" if errors_n else ("ok" if submitted_n > 0 else "idle"))
+        ),
+        cycle_id=cycle_id,
+    )
+
+    # ---- Reflection / Curiosity / Discovery -------------------------
+    # These run on their own cadence; we publish placeholder rows so
+    # the cockpit panel is never missing a lane. The respective
+    # subsystems overwrite when they actually fire.
+    reflection = AgentStatus(
+        actor="reflection",
+        working_on="watching judged outcomes; will speak after 2+ picks",
+        waiting_on="more EOD-settled picks",
+        last_action="",
+        last_result="idle",
+        cycle_id=cycle_id,
+    )
+    # Curiosity: if the orchestrator ran the meta-agent this cycle,
+    # surface its real action; otherwise show a watching-for-stall row.
+    if curiosity_action is not None:
+        _ck = getattr(curiosity_action, "kind", "noop")
+        _crat = getattr(curiosity_action, "rationale", "")
+        _cpayload = getattr(curiosity_action, "payload", {}) or {}
+        if _ck == "wildcard_scan":
+            _syms = _cpayload.get("symbols") or []
+            _working = f"injecting {len(_syms)} wildcard symbols into next sweep"
+            _waiting = "next sweep to consume wildcards"
+            _last = f"wildcard_scan: {', '.join(_syms[:5])}"
+            _result = "ok"
+        elif _ck == "lower_threshold":
+            _flt = _cpayload.get("filter", "?")
+            _cum = _cpayload.get("new_cumulative", 0.0)
+            _working = f"proposing 10% relaxation of {_flt} filter"
+            _waiting = "sweep to honour proposal"
+            _last = f"lower_threshold filter={_flt} cum={_cum:.0%}"
+            _result = "ok"
+        elif _ck == "narrate_blockers":
+            _working = "publishing structured why-no-trades note"
+            _waiting = ""
+            _last = "narrate_blockers"
+            _result = "ok"
+        else:
+            _working = "watching for idle streaks / stale watchlist"
+            _waiting = "a stall to unstick"
+            _last = "noop (bot correctly idle)"
+            _result = "idle"
+        curiosity = AgentStatus(
+            actor="curiosity",
+            working_on=_working,
+            waiting_on=_waiting,
+            last_action=_last,
+            last_result=_result,
+            hints=(_crat,) if _crat else (),
+            cycle_id=cycle_id,
+        )
+    else:
+        curiosity = AgentStatus(
+            actor="curiosity",
+            working_on="watching for idle streaks / stale watchlist",
+            waiting_on="a stall to unstick",
+            last_action="",
+            last_result="idle",
+            cycle_id=cycle_id,
+        )
+    discovery = AgentStatus(
+        actor="discovery",
+        working_on="deriving stub from research sentiment + regime",
+        waiting_on="",
+        last_action=f"regime={live_regime} ({cockpit_regime})",
+        last_result="ok",
+        cycle_id=cycle_id,
+    )
+
+    emit_many([research, strategy, risk, execution, reflection, curiosity, discovery])
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -927,6 +1281,38 @@ async def run(
                 "cockpit_regime": _to_cockpit_regime(_live_regime),
             }
             log_run(record)
+            # Phase 33: narrate the halted path so the cockpit can show
+            # WHY each agent stopped instead of going silent. Also run
+            # the curiosity meta-agent so the cockpit shows whether the
+            # bot is going to take any unblocking action next sweep.
+            halt_reasons_list = list(record.get("reasons") or [])
+            curiosity_action = None
+            try:
+                curiosity_action = _run_curiosity_step(
+                    universe=tuple(symbols),
+                    agent_audit=agent_audit,
+                    halted=True,
+                    halt_reasons=halt_reasons_list,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug("phase33 curiosity step failed: %s", exc)
+            try:
+                _emit_phase33_narration(
+                    cycle_id=str(agent_result.decision_id),
+                    strategy_name=strategy_name,
+                    live_regime=_live_regime,
+                    cockpit_regime=_to_cockpit_regime(_live_regime),
+                    sentiment=float(agent_result.research.sentiment or 0.0),
+                    approved_n=0,
+                    planned_n=0,
+                    submitted_n=0,
+                    errors_n=0,
+                    halted=True,
+                    halt_reasons=halt_reasons_list,
+                    curiosity_action=curiosity_action,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug("phase33 narration emit failed: %s", exc)
             return record
 
         # Filter target weights by the symbols the risk agent approved.
@@ -1037,6 +1423,35 @@ async def run(
         except Exception as exc:  # pragma: no cover - defensive only
             log.warning("prediction-log write failed: %s", exc)
         log_run(record)
+        # Phase 33: narrate the happy path + run curiosity meta-agent
+        # so the cockpit's AGENT STATUS panel reflects this sweep.
+        curiosity_action = None
+        try:
+            curiosity_action = _run_curiosity_step(
+                universe=tuple(symbols),
+                agent_audit=agent_audit,
+                halted=False,
+                halt_reasons=None,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("phase33 curiosity step failed: %s", exc)
+        try:
+            _emit_phase33_narration(
+                cycle_id=str(agent_result.decision_id),
+                strategy_name=strategy_name,
+                live_regime=_live_regime,
+                cockpit_regime=_to_cockpit_regime(_live_regime),
+                sentiment=float(agent_result.research.sentiment or 0.0),
+                approved_n=len(approved_syms),
+                planned_n=len(planned),
+                submitted_n=len(submitted),
+                errors_n=len(errors),
+                halted=False,
+                halt_reasons=None,
+                curiosity_action=curiosity_action,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("phase33 narration emit failed: %s", exc)
         # Refresh the §16 streak snapshot AFTER appending this run so the
         # dashboard always sees the latest day. Best-effort: a failure here
         # must not poison the actual run record.

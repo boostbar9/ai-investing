@@ -292,8 +292,11 @@ def test_regime_multipliers_lookup() -> None:
 
 
 def test_reflection_warmup_when_few_picks() -> None:
+    # Phase 33: warming-up floor lowered from 5 to 2. The previous
+    # test used window=2 which now sits above the floor; use window=1
+    # to still exercise the warming-up branch.
     refl = reflection.compose(
-        stats={"window": 2, "hit_rate": 0.5, "feature_stats": {}},
+        stats={"window": 1, "hit_rate": 0.5, "feature_stats": {}},
         regime={"label": "neutral"},
         bandit_snapshot=None,
     )

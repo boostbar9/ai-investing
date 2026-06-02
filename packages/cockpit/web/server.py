@@ -3567,6 +3567,25 @@ def api_autonomy_disable() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+@app.get("/api/agent_status")
+def api_agent_status() -> dict[str, Any]:
+    """Phase 33: per-agent narration for the Agent Status panel.
+
+    Returns the latest ``AgentStatus`` row per actor so the cockpit
+    can render "what is each lane doing right now?". Always 200 —
+    a missing log degrades to ``rows: {}``.
+    """
+    from dataclasses import asdict
+
+    try:
+        from packages.agents.narration import read_latest
+
+        latest = read_latest()
+        return {"ok": True, "rows": {a: asdict(s) for a, s in latest.items()}}
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"ok": False, "rows": {}, "error": str(exc)[:200]}
+
+
 @app.get("/api/brain")
 def api_brain() -> dict[str, Any]:
     """Self-improving brain status: accuracy, regime, weights, reflection.

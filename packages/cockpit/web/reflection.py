@@ -118,7 +118,14 @@ def compose(
     feature_stats = stats.get("feature_stats") or {}
 
     arrow = _trend_arrow(hit_rate, prior_hit_rate)
-    if n < 5:
+    # Phase 33: lowered the warming-up floor from 5 to 2 judged picks.
+    # The 2026-06-02 reflection log already showed judged=2/hit_rate=1.0
+    # but the floor of 5 silenced the brain anyway, so the cockpit
+    # kept rendering "warming up" for 24h+ even though we had real
+    # data to talk about. 2 is enough to publish *something* honest
+    # ("100% hit rate on 2 picks — too small to trust yet, but here's
+    # what we're seeing") while still flagging the small sample.
+    if n < 2:
         headline = "Brain warming up — too few judged picks to draw conclusions."
         paragraph = (
             f"Only {n} judged picks so far. Reflection holds until more "

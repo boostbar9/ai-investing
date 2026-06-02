@@ -336,6 +336,20 @@
       </div>
     </section>
 
+    <!-- Phase 33: Agent Status panel. Per-lane narration of what each
+         AI is working on, waiting on, and what its last action was.
+         Answers the operator question "why does nothing seem to be
+         happening?" by surfacing the brain's actual reasoning. -->
+    <section class="card p-5 mb-5" id="agent-status-card">
+      <div class="flex items-center justify-between mb-3" style="flex-wrap:wrap;gap:8px;">
+        <h2 class="section-h mb-0" data-tt="Per-agent narration. Shows what each lane (research, strategy, risk, execution, reflection, curiosity, discovery) is working on right now and what's blocking it.">Agent Status</h2>
+        <span class="pill pill-muted" id="agent-status-updated" data-tt="Time of the last sweep that published statuses.">updated —</span>
+      </div>
+      <div id="agent-status-rows" class="flex flex-col gap-2 text-xs">
+        <div class="text-gray-500">Waiting for first sweep…</div>
+      </div>
+    </section>
+
     <!-- Memory Health: durable learnings + storage stats -->
     <section class="card p-5 mb-5" id="memory-card">
       <div class="flex items-center justify-between mb-3" style="flex-wrap:wrap;gap:8px;">
@@ -1372,6 +1386,89 @@
       } catch (e) { /* ignore */ }
     }
     Cockpit.poll(refreshBrain, 12000, { name: 'index-brain' });
+
+    // ---------------------------------------------------------------
+    // Phase 33 — Agent Status panel.
+    // Polls /api/agent_status every 10s and renders one row per agent.
+    // Format per row: [ACTOR] working on X · waiting on Y · last: Z
+    // Result chip colours: ok=green, warn=amber, halt=red, idle=muted.
+    // ---------------------------------------------------------------
+    function _agentResultClass(result) {
+      if (result === 'ok') return 'pill-accent';
+      if (result === 'warn') return 'pill-warn';
+      if (result === 'halt') return 'pill-warn';
+      return 'pill-muted';
+    }
+    function _agentRow(actor, status) {
+      const row = document.createElement('div');
+      row.className = 'flex items-start gap-2';
+      row.style.borderBottom = '1px solid var(--border, #222)';
+      row.style.padding = '6px 0';
+
+      const tag = document.createElement('span');
+      tag.className = 'pill ' + _agentResultClass(status.last_result);
+      tag.style.minWidth = '90px';
+      tag.style.textAlign = 'center';
+      tag.textContent = actor;
+      row.appendChild(tag);
+
+      const body = document.createElement('div');
+      body.className = 'flex flex-col gap-0';
+      body.style.flex = '1';
+
+      const working = document.createElement('div');
+      working.style.color = 'var(--text-primary)';
+      working.textContent = status.working_on || '—';
+      body.appendChild(working);
+
+      const meta = document.createElement('div');
+      meta.style.color = 'var(--text-secondary)';
+      meta.style.fontSize = '11px';
+      const parts = [];
+      if (status.waiting_on) parts.push('waiting on ' + status.waiting_on);
+      if (status.last_action) parts.push('last: ' + status.last_action);
+      meta.textContent = parts.join(' · ');
+      body.appendChild(meta);
+
+      row.appendChild(body);
+      return row;
+    }
+    async function refreshAgentStatus() {
+      try {
+        const j = await Cockpit.api.get('/api/agent_status');
+        const rows = j && j.rows ? j.rows : {};
+        const host = document.getElementById('agent-status-rows');
+        if (!host) return;
+        host.innerHTML = '';
+        // Render in a stable lane order so the panel doesn't jump.
+        const order = ['research', 'strategy', 'risk', 'execution', 'reflection', 'curiosity', 'discovery'];
+        let anyShown = false;
+        let newestTs = '';
+        order.forEach(actor => {
+          const s = rows[actor];
+          if (!s) return;
+          anyShown = true;
+          host.appendChild(_agentRow(actor, s));
+          if (s.ts && s.ts > newestTs) newestTs = s.ts;
+        });
+        if (!anyShown) {
+          const empty = document.createElement('div');
+          empty.className = 'text-gray-500';
+          empty.textContent = 'Waiting for first sweep…';
+          host.appendChild(empty);
+        }
+        const pill = document.getElementById('agent-status-updated');
+        if (pill) {
+          if (newestTs) {
+            const t = newestTs.replace('T', ' ').replace(/\+.*$/, ' UTC');
+            pill.textContent = 'updated ' + t;
+          } else {
+            pill.textContent = 'updated —';
+          }
+        }
+      } catch (e) { /* ignore */ }
+    }
+    Cockpit.poll(refreshAgentStatus, 10000, { name: 'index-agent-status' });
   </script>
 </body>
 </html>
