@@ -481,10 +481,38 @@ class FinnhubInsiderClient:
         }
 
     def invalidate(self, symbol: str | None = None) -> None:
+        """Drop a cached signal from **both** in-memory and disk tiers.
+
+        Phase 31: previously this only cleared the in-memory LRU, which
+        meant the disk cache silently re-hydrated the very next call.
+        That's a footgun for a method whose name promises invalidation,
+        so we now extend it to also delete the on-disk file. Best-effort
+        — disk failures are logged via the cache module, never raised.
+        """
+        # Lazy import to keep the module-level dep graph clean; the
+        # cache module imports InsiderSignal from us already.
+        from packages.data.finnhub_insider_cache import (
+            _cache_path,
+            _resolved_default_dir,
+        )
+
         if symbol is None:
             self._cache.clear()
+            # Wipe every JSON file in the active cache dir.
+            cd = _resolved_default_dir()
+            if cd.exists():
+                for path in cd.glob("*.json"):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
         else:
             self._cache.pop(symbol.upper(), None)
+            path = _cache_path(_resolved_default_dir(), symbol)
+            try:
+                path.unlink()
+            except (OSError, FileNotFoundError):
+                pass
 
     async def score_symbol(
         self, symbol: str, *, now: datetime | None = None
@@ -498,6 +526,23 @@ class FinnhubInsiderClient:
             self._hits += 1
             self._cache.move_to_end(sym)
             return cached.signal
+
+        # Phase 31: consult the persistent disk cache before the network.
+        # This is the cross-process / post-restart layer that prevented
+        # the 22:36:26 burst on the live bot from coming back. Imported
+        # lazily to avoid a hard module-level cycle.
+        from packages.data.finnhub_insider_cache import (
+            load_cached_signal,
+            save_cached_signal,
+        )
+
+        disk_signal = load_cached_signal(sym)
+        if disk_signal is not None:
+            self._hits += 1
+            # Warm the in-memory tier so subsequent intra-sweep hits
+            # don't pay the JSON-decode cost.
+            self._put(sym, disk_signal, cache_now)
+            return disk_signal
 
         self._misses += 1
         if not self.enabled:
@@ -517,10 +562,14 @@ class FinnhubInsiderClient:
             return aggregate_insider_signal(sym, transactions=[], now=wall_now)
 
         signal = aggregate_insider_signal(sym, txns, now=wall_now)
-        # Only cache meaningful payloads (>=1 txn). Empty results are
-        # transient; refetch next call rather than serve emptiness.
-        if signal.buy_count + signal.sell_count > 0:
-            self._put(sym, signal, cache_now)
+        # Phase 31: cache **every** successful fetch, including empty
+        # payloads. ETFs like SPY / XLE legitimately return zero
+        # transactions; skipping the cache on emptiness caused the live
+        # bot to re-fetch them every sweep forever and burn through the
+        # 60 req/min quota in a single burst.
+        self._put(sym, signal, cache_now)
+        # Best-effort disk write; logs and swallows on any I/O error.
+        save_cached_signal(signal)
         return signal
 
     async def aclose(self) -> None:

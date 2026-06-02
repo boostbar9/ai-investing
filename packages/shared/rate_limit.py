@@ -40,7 +40,13 @@ class TokenBucket:
 BUCKETS: dict[str, TokenBucket] = {
     "polygon": TokenBucket(rate_per_second=5 / 60, capacity=5),       # 5/min free
     "alpha_vantage": TokenBucket(rate_per_second=25 / 86400, capacity=25),  # 25/day
-    "finnhub": TokenBucket(rate_per_second=60 / 60, capacity=60),    # 60/min
+    # Finnhub free tier is 60/min average **but** the
+    # /stock/insider-transactions endpoint enforces a separate ~10 req/s
+    # sub-limit. The live log on 2026-06-01 22:36:26 showed a 6-symbol
+    # burst (XLI/SPY/XLK/XLU/XLB/XLE) tripping 429s because the previous
+    # capacity=60 let a cold bucket fire 60 calls back-to-back. Cap the
+    # burst at 8 while keeping the 60/min average refill.
+    "finnhub": TokenBucket(rate_per_second=60 / 60, capacity=8),
     "sec_edgar": TokenBucket(rate_per_second=10, capacity=10),       # SEC asks <10 req/s
     "fred": TokenBucket(rate_per_second=5, capacity=20),             # generous default
     "reddit": TokenBucket(rate_per_second=1, capacity=10),

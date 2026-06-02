@@ -102,7 +102,15 @@ class _FakeClock:
 
 
 @pytest.fixture(autouse=True)
-def _reset_singleton():
+def _reset_singleton(tmp_path, monkeypatch):
+    # Phase 31: isolate the on-disk insider cache per test. Without this
+    # the persistent JSON files written by score_symbol would bleed
+    # across tests — e.g. test_score_symbol_returns_neutral_without_api_key
+    # would see a prior test's AAPL.json and serve it instead of
+    # calling the fake fetcher.
+    monkeypatch.setenv(
+        "FINNHUB_INSIDER_CACHE_DIR", str(tmp_path / "insider_cache")
+    )
     reset_insider_client_for_tests()
     yield
     reset_insider_client_for_tests()
@@ -360,6 +368,14 @@ async def test_score_symbol_caches_repeat_calls():
 
 @pytest.mark.asyncio
 async def test_cache_expiry_forces_refetch():
+    """In-memory TTL expiry routes through the disk cache.
+
+    Phase 31: with the disk tier in place, an in-memory miss is no
+    longer a guaranteed network hit — if disk is fresh, we serve from
+    disk and the fetcher stays at calls == 1. To force a true network
+    refetch we must invalidate both tiers (the public ``invalidate``
+    API now does this).
+    """
     today = date(2026, 6, 1)
     now = datetime(2026, 6, 1, tzinfo=UTC)
     items = [
@@ -375,6 +391,13 @@ async def test_cache_expiry_forces_refetch():
         fetcher=fetcher,
     )
     await client.score_symbol("AAPL", now=now)
+    clock.advance(61)
+    # In-memory expired → disk hit, no second network call.
+    await client.score_symbol("AAPL", now=now)
+    assert fetcher.calls == 1
+
+    # After full invalidation both tiers are cold → next call refetches.
+    client.invalidate("AAPL")
     clock.advance(61)
     await client.score_symbol("AAPL", now=now)
     assert fetcher.calls == 2
@@ -400,10 +423,18 @@ async def test_lru_eviction_caps_cache_size():
     await client.score_symbol("NVDA", now=now)
     stats = client.stats()
     assert stats["cached_symbols"] == 2
-    # AAPL was first-in → evicted. Refetch becomes a miss.
+    # AAPL was first-in → evicted from in-memory LRU. Phase 31: the
+    # disk tier still holds it, so the next call is a disk **hit**,
+    # not a network miss. That's the intended behaviour — LRU
+    # eviction is purely a memory-pressure relief valve, not a
+    # cache-invalidation signal.
+    hits_before = stats["hits"]
     misses_before = stats["misses"]
     await client.score_symbol("AAPL", now=now)
-    assert client.stats()["misses"] == misses_before + 1
+    after = client.stats()
+    assert after["misses"] == misses_before  # no network call
+    assert after["hits"] == hits_before + 1  # served from disk
+    assert fetcher.calls == 3  # only the original 3 distinct fetches
 
 
 @pytest.mark.asyncio
@@ -426,7 +457,18 @@ async def test_adapter_failure_returns_neutral_no_cache():
 
 
 @pytest.mark.asyncio
-async def test_empty_result_is_not_cached():
+async def test_empty_result_is_cached_phase31():
+    """Phase 31 contract reversal.
+
+    The old Phase 27 behaviour skipped the cache on empty payloads on
+    the theory that emptiness was "transient". In production this
+    backfired hard: ETFs (SPY/XLE/XLU) legitimately return zero insider
+    transactions, so the bot re-fetched them every sweep and burned
+    through the 60 req/min quota in a single burst (see live log
+    2026-06-01 22:36:26). The new contract: every successful fetch
+    — including empties — caches. The disk tier uses a shorter TTL
+    (6h) so genuinely-new activity still surfaces within a trading day.
+    """
     fetcher = _FakeFetcher(items=[])
     client = FinnhubInsiderClient(
         adapter=_FakeAdapter(),
@@ -435,8 +477,11 @@ async def test_empty_result_is_not_cached():
     )
     await client.score_symbol("AAPL")
     await client.score_symbol("AAPL")
-    assert fetcher.calls == 2  # transient emptiness → always refetch
-    assert client.stats()["cached_symbols"] == 0
+    # Second call must be served from the in-memory tier; fetcher
+    # called exactly once.
+    assert fetcher.calls == 1
+    assert client.stats()["cached_symbols"] == 1
+    assert client.stats()["hits"] == 1
 
 
 @pytest.mark.asyncio
