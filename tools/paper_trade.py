@@ -116,6 +116,85 @@ STRATEGY_UNIVERSE = {
 STRATEGY_CHOICES = [*STRATEGIES, "ensemble", "policy"]
 
 
+# Phase 32 ----------------------------------------------------------------
+# Default strategy auto-selection.
+#
+# The 2026-06-02 live log showed every cycle logged ``strategy:
+# mean-reversion`` with 0 orders submitted all day. Root cause: the
+# argparse default was ``mean-reversion`` and the Windows service
+# invokes ``paper_trade.py`` without ``--strategy``. The intraday
+# rewrite (Phase 28-R) and all its downstream wiring is in place but
+# never actually selected.
+#
+# Fix: during US regular trading hours we default to ``intraday-trend``;
+# outside RTH we fall back to ``mean-reversion`` so the after-hours
+# advisory loop still does something useful. Explicit ``--strategy``
+# on the command line always wins.
+from datetime import time as _dt_time  # noqa: E402  (after STRATEGIES block)
+from zoneinfo import ZoneInfo  # noqa: E402
+
+_RTH_OPEN = _dt_time(9, 30)
+_RTH_CLOSE = _dt_time(16, 0)
+_ET = ZoneInfo("America/New_York")
+
+
+def _is_rth(now_utc: datetime | None = None) -> bool:
+    """True if the supplied (or wall-clock) instant is inside RTH ET.
+
+    Mon–Fri only. Holidays are intentionally not handled here — they
+    cost us at most one wasted sweep and zero correctness because the
+    broker rejects orders on holidays anyway.
+    """
+    now = now_utc or datetime.now(UTC)
+    et = now.astimezone(_ET)
+    if et.weekday() >= 5:  # Sat/Sun
+        return False
+    return _RTH_OPEN <= et.time() < _RTH_CLOSE
+
+
+def _auto_default_strategy(now_utc: datetime | None = None) -> str:
+    """Pick the right default strategy for the current wall-clock instant.
+
+    Inside RTH: ``intraday-trend`` (the Phase 28-R brain).
+    Outside RTH: ``mean-reversion`` (steady-state advisory).
+    """
+    return "intraday-trend" if _is_rth(now_utc) else "mean-reversion"
+
+
+# Phase 32 ----------------------------------------------------------------
+# Regime vocabulary translation.
+#
+# The cockpit (packages/cockpit/web/regime.py) publishes the chip badge
+# using the vocabulary ``{risk_on, neutral, risk_off, volatile}``. The
+# trader's HMM ensemble (packages/regime/ensemble.py via
+# _build_regime_series) speaks ``{bull, bear, chop, crisis}``. The two
+# classifiers ran in parallel and silently disagreed: live log on
+# 2026-06-02 showed the chip green at ``risk_on`` while every decision
+# logged ``regime: chop`` or ``regime: unknown``. The trader was gating
+# on a different signal than the operator was reading.
+#
+# Fix: define a one-way mapping so we can log *both* vocabularies on
+# every cycle. The trader keeps using HMM regimes for its gating logic
+# (that's what its strategies were tuned against), but we publish the
+# cockpit-vocab translation alongside so the operator UI matches what
+# the brain is actually thinking.
+_HMM_TO_COCKPIT: dict[str, str] = {
+    "bull": "risk_on",
+    "bear": "risk_off",
+    "chop": "neutral",
+    "crisis": "volatile",
+}
+
+
+def _to_cockpit_regime(hmm_label: str) -> str:
+    """Translate the HMM regime vocabulary to the cockpit chip vocabulary.
+
+    Unknown / unmapped labels degrade to ``"neutral"`` so the chip stays
+    informative even on degraded data — never raises.
+    """
+    return _HMM_TO_COCKPIT.get(hmm_label.lower(), "neutral")
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -808,12 +887,23 @@ async def run(
             _live_regime = "chop"
         log.info("agent advisory regime: %s", _live_regime)
 
+        # Phase 32: relax the sentiment floor for intraday strategies.
+        # The default floor of -0.5 halted half of the 2026-06-02 live
+        # sweeps because aggregate news sentiment dipped on a chop day.
+        # For an intraday trend-follower that's the wrong gate — we
+        # actively want to trade down-momentum on bearish sentiment, and
+        # sentiment should scale position size, not halt the sweep.
+        # Multi-day strategies still use the tight floor.
+        _intraday_strategies = {"intraday-trend"}
+        _min_sentiment = -1.0 if strategy_name in _intraday_strategies else -0.5
+
         agent_result = await agent_advise(
             symbols=symbols,
             regime=_live_regime,
             positions=agent_positions,
             target_weights=target,
             sentiment_scores=sentiment_scores,
+            min_sentiment=_min_sentiment,
         )
         agent_audit = [
             {"actor": a.actor, "event_type": a.event_type, "payload": a.payload}
@@ -831,6 +921,10 @@ async def run(
                 "agent_audit": agent_audit,
                 "agent_decision_id": str(agent_result.decision_id),
                 "agent_sentiment": agent_result.research.sentiment,
+                # Phase 32: include regime on the halted-path record so the
+                # cockpit can show *why* a sweep halted in the same vocab.
+                "agent_regime": _live_regime,
+                "cockpit_regime": _to_cockpit_regime(_live_regime),
             }
             log_run(record)
             return record
@@ -911,6 +1005,12 @@ async def run(
             "agent_decision_id": str(agent_result.decision_id),
             "agent_sentiment": agent_result.research.sentiment,
             "agent_regime": _live_regime,
+            # Phase 32: log the cockpit-vocab translation alongside the
+            # raw HMM label so the operator UI and the decision ledger
+            # speak the same language. ``agent_regime`` stays the source
+            # of truth for gating logic; ``cockpit_regime`` is for
+            # display / cross-reference only.
+            "cockpit_regime": _to_cockpit_regime(_live_regime),
             "agent_thesis": agent_result.research.thesis,
             "agent_audit": agent_audit,
             "duration_sec": (datetime.now(UTC) - started).total_seconds(),
@@ -1006,7 +1106,18 @@ def _one_run(args) -> dict[str, Any]:  # type: ignore[no-untyped-def]
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--strategy", choices=STRATEGY_CHOICES, default="mean-reversion")
+    # Phase 32: default is now auto-selected from the wall clock. If the
+    # caller passes ``--strategy`` we honour it; otherwise we route to
+    # intraday-trend during RTH and mean-reversion outside.
+    ap.add_argument(
+        "--strategy",
+        choices=STRATEGY_CHOICES,
+        default=None,
+        help=(
+            "Trading strategy to run. Default: intraday-trend during "
+            "RTH (9:30–16:00 ET, Mon–Fri), mean-reversion otherwise."
+        ),
+    )
     ap.add_argument("--dry-run", action="store_true", help="Plan orders but do not submit.")
     ap.add_argument("--use-sentiment", action="store_true", help="Apply real sentiment overlay.")
     ap.add_argument(
@@ -1021,6 +1132,9 @@ def main() -> int:
         help="Seconds between cycles in --loop mode (default 900 = 15 minutes).",
     )
     args = ap.parse_args()
+    if args.strategy is None:
+        args.strategy = _auto_default_strategy()
+        log.info("strategy auto-selected: %s", args.strategy)
 
     if not args.loop:
         result = _one_run(args)
