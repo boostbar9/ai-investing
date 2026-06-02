@@ -3051,12 +3051,89 @@ async def _autonomy_startup() -> None:  # pragma: no cover
             pass
         return None
 
+    # Phase 25: build the exit_rules / dip_watch tick hooks. The hooks
+    # capture _last_price + a broker factory so autonomy.py never has
+    # to import the broker directly (keeps it testable in isolation).
+    async def _phase25_exit_rules_tick() -> dict[str, Any]:
+        from packages.cockpit.web.dip_watch import arm as dip_arm
+        from packages.cockpit.web.exit_rules import run_tick as exit_run_tick
+
+        if not (os.getenv("ALPACA_PAPER_KEY_ID") and os.getenv("ALPACA_PAPER_SECRET")):
+            return {"skipped": True, "reason": "no_broker_creds"}
+        broker = AlpacaPaperBroker()
+        try:
+            async def _submit_sell(symbol: str, qty: float) -> Any:
+                from packages.execution.broker import OrderRequest
+                return await broker.submit(
+                    OrderRequest(symbol=symbol, side="sell", qty=qty)
+                )
+
+            # Capture qty from positions so dip_watch can re-arm same size.
+            qty_map: dict[str, float] = {}
+            try:
+                for p in await broker.positions():
+                    qty_map[p.symbol] = abs(float(p.qty))
+            except Exception:
+                pass
+
+            def _on_profit(symbol: str, exit_price: float, pnl_pct: float) -> None:
+                dip_arm(
+                    symbol=symbol,
+                    exit_price=exit_price,
+                    exit_pnl_pct=pnl_pct,
+                    qty=qty_map.get(symbol, 1.0),
+                )
+
+            r = await exit_run_tick(
+                positions_getter=broker.positions,
+                submit_sell=_submit_sell,
+                on_profit_taken=_on_profit,
+            )
+            return {
+                "evaluated": r.evaluated,
+                "sells_triggered": r.sells_triggered,
+                "sells_executed": r.sells_executed,
+                "errors": r.errors,
+            }
+        finally:
+            with contextlib.suppress(Exception):
+                await broker.aclose()
+
+    async def _phase25_dip_watch_tick() -> dict[str, Any]:
+        from packages.cockpit.web.dip_watch import run_tick as dip_run_tick
+
+        if not (os.getenv("ALPACA_PAPER_KEY_ID") and os.getenv("ALPACA_PAPER_SECRET")):
+            return {"skipped": True, "reason": "no_broker_creds"}
+        broker = AlpacaPaperBroker()
+        try:
+            async def _submit_buy(symbol: str, qty: float) -> Any:
+                from packages.execution.broker import OrderRequest
+                return await broker.submit(
+                    OrderRequest(symbol=symbol, side="buy", qty=qty)
+                )
+
+            r = await dip_run_tick(
+                price_lookup=_last_price,
+                submit_buy=_submit_buy,
+            )
+            return {
+                "checked": r.checked,
+                "fired": r.fired,
+                "expired": r.expired,
+                "errors": r.errors,
+            }
+        finally:
+            with contextlib.suppress(Exception):
+                await broker.aclose()
+
     autonomy_brain.configure(
         on_curiosity_focus=_agent_sched_set_symbols,
         portfolio_symbols_getter=_portfolio_symbols_snapshot,
         price_lookup=_last_price,
         regime_price_provider=autonomy_regime.default_price_provider,
         regime_vix_provider=autonomy_regime.default_vix_provider,
+        exit_rules_tick=_phase25_exit_rules_tick,
+        dip_watch_tick=_phase25_dip_watch_tick,
     )
     started = autonomy_brain.start()
     log.info("autonomy brain startup: started=%s", started)
@@ -3945,6 +4022,128 @@ def api_sizing_audit(limit: int = 50) -> dict[str, Any]:
     capped = max(1, min(int(limit), 500))
     rows = read_audit(limit=capped)
     return {"events": rows, "count": len(rows)}
+
+
+# --------------------------------------------------------------------------
+# Phase 25: active profit-taking + dip-watch buy-back
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/exit-rules")
+def api_exit_rules() -> dict[str, Any]:
+    """Snapshot of active exit thresholds, peaks, and recent audit."""
+    from packages.cockpit.web.exit_rules import snapshot
+
+    return snapshot()
+
+
+@app.post("/api/exit-rules/tick")
+async def api_exit_rules_tick() -> dict[str, Any]:
+    """Manual trigger for the exit-rules tick (autonomy normally drives it).
+
+    Evaluates every open Alpaca paper position; submits sells when any
+    rule fires. Use this to test the loop without waiting for autonomy.
+    """
+    from packages.cockpit.web.dip_watch import arm as dip_arm
+    from packages.cockpit.web.exit_rules import run_tick
+
+    broker = AlpacaPaperBroker()
+    try:
+        async def _submit_sell(symbol: str, qty: float) -> Any:
+            from packages.execution.broker import OrderRequest
+            return await broker.submit(
+                OrderRequest(symbol=symbol, side="sell", qty=qty)
+            )
+
+        def _on_profit(symbol: str, exit_price: float, pnl_pct: float) -> None:
+            # Find the qty we just closed so dip_watch can re-arm same size.
+            # Best-effort — if we can't introspect, default to 1 share.
+            dip_arm(
+                symbol=symbol,
+                exit_price=exit_price,
+                exit_pnl_pct=pnl_pct,
+                qty=1.0,
+            )
+
+        result = await run_tick(
+            positions_getter=broker.positions,
+            submit_sell=_submit_sell,
+            on_profit_taken=_on_profit,
+        )
+        return {
+            "evaluated": result.evaluated,
+            "sells_triggered": result.sells_triggered,
+            "sells_executed": result.sells_executed,
+            "decisions": [
+                {
+                    "symbol": d.symbol,
+                    "action": d.action,
+                    "reason": d.reason,
+                    "pnl_pct": d.pnl_pct,
+                    "peak_pct": d.peak_pct,
+                }
+                for d in result.decisions
+            ],
+            "errors": result.errors,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            await broker.aclose()
+
+
+@app.get("/api/dip-watch")
+def api_dip_watch() -> dict[str, Any]:
+    """Snapshot of armed dip-watchers + config."""
+    from packages.cockpit.web.dip_watch import snapshot
+
+    return snapshot()
+
+
+@app.post("/api/dip-watch/clear")
+def api_dip_watch_clear(symbol: str | None = None) -> dict[str, Any]:
+    """Manually cancel one watcher (symbol=...) or all (no arg)."""
+    from packages.cockpit.web.dip_watch import clear
+
+    removed = clear(symbol)
+    return {"removed": removed, "symbol": symbol}
+
+
+@app.post("/api/dip-watch/tick")
+async def api_dip_watch_tick() -> dict[str, Any]:
+    """Manual trigger for the dip-watch tick."""
+    from packages.cockpit.web.dip_watch import run_tick
+
+    # Cheap price lookup via yfinance fast_info.
+    def _price(symbol: str) -> float | None:
+        try:
+            import yfinance as yf  # type: ignore[import-not-found]
+            t = yf.Ticker(symbol)
+            p = t.fast_info.get("last_price") if hasattr(t, "fast_info") else None
+            return float(p) if p else None
+        except Exception:
+            return None
+
+    broker = AlpacaPaperBroker()
+    try:
+        async def _submit_buy(symbol: str, qty: float) -> Any:
+            from packages.execution.broker import OrderRequest
+            return await broker.submit(
+                OrderRequest(symbol=symbol, side="buy", qty=qty)
+            )
+
+        result = await run_tick(
+            price_lookup=_price,
+            submit_buy=_submit_buy,
+        )
+        return {
+            "checked": result.checked,
+            "fired": result.fired,
+            "expired": result.expired,
+            "errors": result.errors,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            await broker.aclose()
 
 
 # --------------------------------------------------------------------------

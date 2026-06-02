@@ -68,8 +68,9 @@ class AutonomyConfig:
     """
 
     sweep_market_seconds: int = int(
-        os.environ.get("AUTONOMY_SWEEP_MARKET_S") or 2 * 3600
-    )  # every 2h during the regular session
+        os.environ.get("AUTONOMY_SWEEP_MARKET_S") or 900
+    )  # every 15min during the regular session (Phase 25 — was 2h, too slow
+    # to catch intraday profit-take opportunities)
     sweep_off_seconds: int = int(
         os.environ.get("AUTONOMY_SWEEP_OFF_S") or 6 * 3600
     )  # every 6h overnight / weekends
@@ -101,6 +102,16 @@ class AutonomyConfig:
     price_lookup: Callable[[str], float | None] | None = None
     regime_price_provider: Callable[[str], list[float] | None] | None = None
     regime_vix_provider: Callable[[], float | None] | None = None
+    # ---- Phase 25: active profit-taking + dip-watch hooks ---------
+    # When True, each market-hours tick also evaluates exit_rules on
+    # every open position and checks armed dip-watchers for re-entry.
+    # Disabled outside market hours to avoid spurious quote calls.
+    exit_rules_enabled: bool = os.environ.get("AUTONOMY_EXIT_RULES", "1") != "0"
+    dip_watch_enabled: bool = os.environ.get("AUTONOMY_DIP_WATCH", "1") != "0"
+    # Async hooks supplied by the cockpit at wire-up time so the
+    # autonomy module never imports the broker directly (testability).
+    exit_rules_tick: Callable[[], Any] | None = None
+    dip_watch_tick: Callable[[], Any] | None = None
 
 
 @dataclass
@@ -649,6 +660,35 @@ async def run_one_tick(
         except Exception as e:  # pragma: no cover \u2014 don't break the loop
             log.warning("curiosity focus hook failed: %s", e)
 
+    # ------------------------------------------------------------------
+    # Phase 25: active profit-taking + dip-watch buy-back.
+    # Only fires during market hours — outside hours, quotes are stale
+    # and Alpaca rejects orders anyway, so the calls would be wasted.
+    # ------------------------------------------------------------------
+    exit_tick_result: dict[str, Any] | None = None
+    dip_tick_result: dict[str, Any] | None = None
+    if is_market_open():
+        if cfg.exit_rules_enabled and cfg.exit_rules_tick is not None:
+            try:
+                exit_tick_result = await cfg.exit_rules_tick()
+            except Exception as exc:  # pragma: no cover — defensive
+                log.warning("exit_rules tick failed: %s", exc)
+                agent_chatter.push(
+                    agent="exit_rules",
+                    status="warn",
+                    message=f"Exit-rules tick failed: {exc}",
+                )
+        if cfg.dip_watch_enabled and cfg.dip_watch_tick is not None:
+            try:
+                dip_tick_result = await cfg.dip_watch_tick()
+            except Exception as exc:  # pragma: no cover — defensive
+                log.warning("dip_watch tick failed: %s", exc)
+                agent_chatter.push(
+                    agent="dip_watch",
+                    status="warn",
+                    message=f"Dip-watch tick failed: {exc}",
+                )
+
     return {
         "skipped": False,
         "ok": True,
@@ -658,6 +698,8 @@ async def run_one_tick(
         "focus_details": focus_details,
         "judged": judged_count,
         "regime": (STATE.last_regime or {}).get("label"),
+        "exit_rules": exit_tick_result,
+        "dip_watch": dip_tick_result,
     }
 
 
