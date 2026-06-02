@@ -108,10 +108,15 @@ class AutonomyConfig:
     # Disabled outside market hours to avoid spurious quote calls.
     exit_rules_enabled: bool = os.environ.get("AUTONOMY_EXIT_RULES", "1") != "0"
     dip_watch_enabled: bool = os.environ.get("AUTONOMY_DIP_WATCH", "1") != "0"
+    # Phase 28-R step 2 — end-of-day flattener. Closes every position
+    # in the 15:55-16:05 ET window so the bot never holds overnight.
+    # The hook is idempotent per-session; safe to call every 60s.
+    eod_flatten_enabled: bool = os.environ.get("AUTONOMY_EOD_FLATTEN", "1") != "0"
     # Async hooks supplied by the cockpit at wire-up time so the
     # autonomy module never imports the broker directly (testability).
     exit_rules_tick: Callable[[], Any] | None = None
     dip_watch_tick: Callable[[], Any] | None = None
+    eod_flatten_tick: Callable[[], Any] | None = None
     # ---- Phase 25.3: live-quote cache warmer ---------------------
     # Called at the head of every fast tick (and exposed via run_tick)
     # to refresh the LiveQuoteCache for the active symbol set before
@@ -155,6 +160,8 @@ class AutonomyState:
     last_fast_tick_status: str | None = None
     last_fast_tick_exit: dict[str, Any] | None = None
     last_fast_tick_dip: dict[str, Any] | None = None
+    # Phase 28-R step 2 — last EOD-flatten result.
+    last_fast_tick_eod_flatten: dict[str, Any] | None = None
 
 
 # Module-level singleton. The cockpit owns at most one autonomy loop.
@@ -436,12 +443,17 @@ def _default_pause_check() -> bool:
 
 async def _run_phase25_hooks(
     cfg: AutonomyConfig,
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Run exit_rules_tick + dip_watch_tick in parallel.
+) -> tuple[
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
+    """Run exit_rules_tick + dip_watch_tick + eod_flatten_tick in parallel.
 
-    Returns ``(exit_result, dip_result)``. Either is ``None`` if its
-    hook is disabled or unset. Exceptions are caught per-hook and
-    surfaced via chatter — the other hook still runs.
+    Returns ``(exit_result, dip_result, eod_flatten_result)``. Any
+    element is ``None`` if its hook is disabled or unset. Exceptions
+    are caught per-hook and surfaced via chatter — the other hooks
+    still run.
     """
 
     async def _wrap_exit() -> dict[str, Any] | None:
@@ -472,7 +484,21 @@ async def _run_phase25_hooks(
             )
             return {"error": str(exc)[:240]}
 
-    return await asyncio.gather(_wrap_exit(), _wrap_dip())
+    async def _wrap_eod_flatten() -> dict[str, Any] | None:
+        if not (cfg.eod_flatten_enabled and cfg.eod_flatten_tick is not None):
+            return None
+        try:
+            return await cfg.eod_flatten_tick()
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("eod_flatten tick failed: %s", exc)
+            agent_chatter.push(
+                agent="eod_flatten",
+                status="warn",
+                message=f"EOD-flatten tick failed: {exc}",
+            )
+            return {"error": str(exc)[:240]}
+
+    return await asyncio.gather(_wrap_exit(), _wrap_dip(), _wrap_eod_flatten())
 
 
 async def run_fast_tick() -> dict[str, Any]:
@@ -505,9 +531,10 @@ async def run_fast_tick() -> dict[str, Any]:
             log.debug("quote_warmup_tick failed: %s", exc)
             warmup_result = {"error": str(exc)[:240]}
 
-    exit_result, dip_result = await _run_phase25_hooks(cfg)
+    exit_result, dip_result, eod_flatten_result = await _run_phase25_hooks(cfg)
     STATE.last_fast_tick_exit = exit_result
     STATE.last_fast_tick_dip = dip_result
+    STATE.last_fast_tick_eod_flatten = eod_flatten_result
     STATE.last_fast_tick_status = "ok"
     return {
         "skipped": False,
@@ -515,6 +542,7 @@ async def run_fast_tick() -> dict[str, Any]:
         "quote_warmup": warmup_result,
         "exit_rules": exit_result,
         "dip_watch": dip_result,
+        "eod_flatten": eod_flatten_result,
         "ts": now_iso,
     }
 
@@ -777,8 +805,11 @@ async def run_one_tick(
     # ------------------------------------------------------------------
     exit_tick_result: dict[str, Any] | None = None
     dip_tick_result: dict[str, Any] | None = None
+    eod_flatten_tick_result: dict[str, Any] | None = None
     if is_market_open():
-        exit_tick_result, dip_tick_result = await _run_phase25_hooks(cfg)
+        exit_tick_result, dip_tick_result, eod_flatten_tick_result = (
+            await _run_phase25_hooks(cfg)
+        )
 
     return {
         "skipped": False,
@@ -791,6 +822,7 @@ async def run_one_tick(
         "regime": (STATE.last_regime or {}).get("label"),
         "exit_rules": exit_tick_result,
         "dip_watch": dip_tick_result,
+        "eod_flatten": eod_flatten_tick_result,
     }
 
 
@@ -924,6 +956,7 @@ def snapshot() -> dict[str, Any]:
             "last_tick_status": STATE.last_fast_tick_status,
             "last_exit": STATE.last_fast_tick_exit,
             "last_dip": STATE.last_fast_tick_dip,
+            "last_eod_flatten": STATE.last_fast_tick_eod_flatten,
         },
         "config": {
             "sweep_market_seconds": cfg.sweep_market_seconds,
@@ -956,4 +989,5 @@ def reset_for_tests() -> None:
     STATE.last_fast_tick_status = None
     STATE.last_fast_tick_exit = None
     STATE.last_fast_tick_dip = None
+    STATE.last_fast_tick_eod_flatten = None
     STATE._config = AutonomyConfig()

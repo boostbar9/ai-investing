@@ -3388,6 +3388,19 @@ async def _autonomy_startup() -> None:  # pragma: no cover
             "ws": ws_result,
         }
 
+    # Phase 28-R step 2 — EOD flattener. Closes everything at 15:55-16:05
+    # ET so the bot stays pure intraday. Idempotent per session.
+    from packages.execution.eod_flattener import make_flatten_tick_hook
+
+    def _eod_broker_factory() -> AlpacaPaperBroker | None:
+        if not (
+            os.getenv("ALPACA_PAPER_KEY_ID") and os.getenv("ALPACA_PAPER_SECRET")
+        ):
+            return None
+        return AlpacaPaperBroker()
+
+    _eod_flatten_hook = make_flatten_tick_hook(_eod_broker_factory)
+
     autonomy_brain.configure(
         on_curiosity_focus=_agent_sched_set_symbols,
         portfolio_symbols_getter=_portfolio_symbols_snapshot,
@@ -3397,6 +3410,7 @@ async def _autonomy_startup() -> None:  # pragma: no cover
         exit_rules_tick=_phase25_exit_rules_tick,
         dip_watch_tick=_phase25_dip_watch_tick,
         quote_warmup_tick=_phase25_quote_warmup_tick,
+        eod_flatten_tick=_eod_flatten_hook,
     )
     started = autonomy_brain.start()
     log.info("autonomy brain startup: started=%s", started)

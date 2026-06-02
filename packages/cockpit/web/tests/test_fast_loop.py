@@ -45,11 +45,13 @@ async def test_run_phase25_hooks_runs_in_parallel(monkeypatch: pytest.MonkeyPatc
     cfg = autonomy.STATE._config
 
     started = time.perf_counter()
-    exit_r, dip_r = await autonomy._run_phase25_hooks(cfg)
+    exit_r, dip_r, eod_r = await autonomy._run_phase25_hooks(cfg)
     elapsed = time.perf_counter() - started
 
     assert exit_r == {"evaluated": 3, "sells_triggered": 0}
     assert dip_r == {"checked": 2, "fired": 0}
+    # eod_flatten_tick unset — should be None.
+    assert eod_r is None
     # Sequential would be ≥ 2*delay = 0.30s. Parallel should be ≈ delay
     # plus a tiny overhead. We allow a generous ceiling for CI jitter.
     assert elapsed < delay * 1.8, f"Hooks did not run in parallel: {elapsed:.3f}s"
@@ -70,9 +72,10 @@ async def test_run_phase25_hooks_isolates_exceptions(
     autonomy.configure(exit_rules_tick=boom_exit, dip_watch_tick=good_dip)
     cfg = autonomy.STATE._config
 
-    exit_r, dip_r = await autonomy._run_phase25_hooks(cfg)
+    exit_r, dip_r, eod_r = await autonomy._run_phase25_hooks(cfg)
     assert exit_r is not None and "error" in exit_r
     assert dip_r == {"checked": 1, "fired": 1}
+    assert eod_r is None
 
 
 @pytest.mark.asyncio
@@ -81,10 +84,12 @@ async def test_run_phase25_hooks_skips_unset_hooks() -> None:
     cfg = autonomy.STATE._config
     cfg.exit_rules_tick = None
     cfg.dip_watch_tick = None
+    cfg.eod_flatten_tick = None
 
-    exit_r, dip_r = await autonomy._run_phase25_hooks(cfg)
+    exit_r, dip_r, eod_r = await autonomy._run_phase25_hooks(cfg)
     assert exit_r is None
     assert dip_r is None
+    assert eod_r is None
 
 
 @pytest.mark.asyncio
@@ -109,9 +114,10 @@ async def test_run_phase25_hooks_respects_enabled_flags(
     )
     cfg = autonomy.STATE._config
 
-    exit_r, dip_r = await autonomy._run_phase25_hooks(cfg)
+    exit_r, dip_r, eod_r = await autonomy._run_phase25_hooks(cfg)
     assert exit_r is None  # disabled
     assert dip_r == {"checked": 0}
+    assert eod_r is None  # unset
     assert calls == {"exit": 0, "dip": 1}
 
 
@@ -226,6 +232,94 @@ async def test_slow_loop_still_runs_hooks_via_helper(
     assert calls["hooks"] == 2
     assert out["exit_rules"] == {"ok": True}
     assert out["dip_watch"] == {"ok": True}
+    # eod_flatten_tick unset → None
+    assert out["eod_flatten"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_fast_tick_invokes_eod_flatten_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 28-R step 2 — the EOD flattener runs as a 3rd parallel branch."""
+    _force_market_open(monkeypatch, open_=True)
+    monkeypatch.setattr(autonomy, "_default_pause_check", lambda: False)
+    calls = {"exit": 0, "dip": 0, "eod": 0}
+
+    async def exit_hook() -> dict[str, Any]:
+        calls["exit"] += 1
+        return {"evaluated": 1}
+
+    async def dip_hook() -> dict[str, Any]:
+        calls["dip"] += 1
+        return {"checked": 1}
+
+    async def eod_hook() -> dict[str, Any]:
+        calls["eod"] += 1
+        return {"action": "flatten", "session": "2026-06-03"}
+
+    autonomy.configure(
+        exit_rules_tick=exit_hook,
+        dip_watch_tick=dip_hook,
+        eod_flatten_tick=eod_hook,
+    )
+
+    out = await autonomy.run_fast_tick()
+    assert out["ok"] is True
+    assert out["eod_flatten"] == {"action": "flatten", "session": "2026-06-03"}
+    assert calls == {"exit": 1, "dip": 1, "eod": 1}
+    assert autonomy.STATE.last_fast_tick_eod_flatten == {
+        "action": "flatten",
+        "session": "2026-06-03",
+    }
+
+
+@pytest.mark.asyncio
+async def test_eod_flatten_disabled_flag_skips_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_market_open(monkeypatch, open_=True)
+    monkeypatch.setattr(autonomy, "_default_pause_check", lambda: False)
+    fired = {"n": 0}
+
+    async def eod_hook() -> dict[str, Any]:
+        fired["n"] += 1
+        return {"action": "flatten"}
+
+    autonomy.configure(
+        exit_rules_tick=None,
+        dip_watch_tick=None,
+        eod_flatten_tick=eod_hook,
+        eod_flatten_enabled=False,
+    )
+    out = await autonomy.run_fast_tick()
+    assert out["eod_flatten"] is None
+    assert fired["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_eod_flatten_exception_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EOD-flatten errors must not take down the other fast-loop branches."""
+    _force_market_open(monkeypatch, open_=True)
+    monkeypatch.setattr(autonomy, "_default_pause_check", lambda: False)
+
+    async def boom() -> dict[str, Any]:
+        raise RuntimeError("broker timeout")
+
+    async def good_exit() -> dict[str, Any]:
+        return {"evaluated": 2}
+
+    autonomy.configure(
+        exit_rules_tick=good_exit,
+        dip_watch_tick=None,
+        eod_flatten_tick=boom,
+    )
+    out = await autonomy.run_fast_tick()
+    assert out["exit_rules"] == {"evaluated": 2}
+    assert out["eod_flatten"] is not None
+    assert "error" in out["eod_flatten"]
+    assert "broker timeout" in out["eod_flatten"]["error"]
 
 
 @pytest.mark.asyncio
