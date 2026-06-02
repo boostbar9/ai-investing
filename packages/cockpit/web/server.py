@@ -1078,6 +1078,40 @@ def api_equity_curve(window: int = 90) -> list[dict[str, Any]]:
     return equity_curve_points(window=window)
 
 
+# Phase 26 — News sentiment endpoint. Backed by Finnhub /company-news
+# with a 15-min in-process cache. When FINNHUB_API_KEY is unset the
+# endpoint still returns 200 with ``label: "neutral"`` and confidence 0,
+# so the cockpit UI degrades gracefully instead of erroring out.
+@app.get("/api/news-sentiment/{symbol}")
+async def api_news_sentiment(symbol: str) -> dict[str, Any]:
+    from packages.data.finnhub_news import get_news_client
+
+    client = get_news_client()
+    sentiment = await client.score_symbol(symbol)
+    return sentiment.to_dict()
+
+
+@app.get("/api/news-sentiment")
+async def api_news_sentiment_batch(symbols: str = "") -> dict[str, Any]:
+    """Batch news-sentiment lookup. ``symbols`` is comma-separated.
+
+    Returns a map of upper-cased ticker -> sentiment payload. Each
+    lookup hits the same 15-min cache as the singular endpoint, so
+    repeated calls on the same set are cheap.
+    """
+    from packages.data.finnhub_news import get_news_client
+
+    tickers = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    client = get_news_client()
+    results: dict[str, Any] = {}
+    for sym in tickers:
+        sentiment = await client.score_symbol(sym)
+        results[sym] = sentiment.to_dict()
+    # Capture stats AFTER the lookups so the hit/miss counts reflect
+    # this batch (not the state at request entry).
+    return {"results": results, "stats": client.stats()}
+
+
 @app.post("/api/pause")
 def api_pause() -> dict[str, Any]:
     state = load_state()

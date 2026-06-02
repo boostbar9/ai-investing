@@ -565,7 +565,41 @@
       return m[r] || "pill-gray";
     }
 
-    // Heatmap renderer: color intensity by weight, sorted descending
+    // Heatmap renderer: color intensity by weight, sorted descending.
+    // Phase 26 — lazily annotates each cell with a news-sentiment dot
+    // (green/gray/red) from /api/news-sentiment. Runs after paint so it
+    // never blocks the initial render even if Finnhub is slow.
+    function newsDot(label) {
+      // Returns a colored dot for bullish/neutral/bearish news sentiment.
+      const map = { bullish: "#10b981", bearish: "#ef4444", neutral: "#6b7280" };
+      const color = map[label] || "#6b7280";
+      return `<span class="news-dot" title="News: ${label}" style="display:inline-block;width:6px;height:6px;border-radius:9999px;background:${color};margin-left:4px;vertical-align:middle"></span>`;
+    }
+
+    async function annotateNewsSentiment(symbols) {
+      if (!symbols.length) return;
+      try {
+        const r = await fetch(`/api/news-sentiment?symbols=${encodeURIComponent(symbols.join(","))}`);
+        if (!r.ok) return;
+        const data = await r.json();
+        const results = (data && data.results) || {};
+        for (const sym of Object.keys(results)) {
+          const info = results[sym];
+          const cell = document.querySelector(`.heat-cell[data-symbol="${sym}"] .sym`);
+          if (cell && !cell.querySelector(".news-dot")) {
+            cell.insertAdjacentHTML("beforeend", newsDot(info.label));
+            cell.parentElement.setAttribute("data-news-label", info.label);
+            cell.parentElement.setAttribute(
+              "title",
+              `News sentiment: ${info.label} (score ${info.score}, ${info.article_count} articles)`
+            );
+          }
+        }
+      } catch (e) {
+        // Best-effort — silent failure; positions remain visible.
+      }
+    }
+
     function renderHeatmap(positions, accountEquity) {
       const host = document.getElementById("positions-heat");
       if (!positions || positions.length === 0) {
@@ -581,14 +615,17 @@
         // Green ramp for positive weights; using HSL so it scales nicely
         const bg = `rgba(16, 185, 129, ${0.10 + intensity * 0.45})`;
         const border = `rgba(52, 211, 153, ${0.20 + intensity * 0.6})`;
-        return `<div class="heat-cell" style="background:${bg};border-color:${border}">
-          <div class="sym">${Cockpit.fmt.escape(p.symbol)}</div>
+        const sym = Cockpit.fmt.escape(p.symbol);
+        return `<div class="heat-cell" data-symbol="${sym}" style="background:${bg};border-color:${border}">
+          <div class="sym">${sym}</div>
           <div class="wt">${Cockpit.fmt.pct(w)}</div>
         </div>`;
       }).join("");
       const total = sorted.reduce((s, p) => s + (p.target_weight || 0), 0);
       document.getElementById("positions-summary").textContent =
         `${sorted.length} symbols · ${Cockpit.fmt.pct(total)} allocated`;
+      // Kick off lazy news sentiment fetch (best-effort, non-blocking).
+      annotateNewsSentiment(sorted.map(p => p.symbol).filter(Boolean));
     }
 
     function renderAgentLights(health) {
