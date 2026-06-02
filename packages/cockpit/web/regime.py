@@ -336,8 +336,21 @@ def default_price_provider(symbol: str, *, days: int = 90) -> list[float] | None
         )
         if df is None or df.empty:
             return None
-        col = "Close" if "Close" in df.columns else df.columns[0]
-        closes = [float(x) for x in df[col].dropna().tolist() if not math.isnan(float(x))]
+        # yfinance ≥ 0.2.40 returns a MultiIndex (top level = OHLCV,
+        # second level = ticker) even for a single symbol. Collapse it
+        # so we always end up with a 1-D Series of closes.
+        close_obj = df["Close"] if "Close" in df.columns else df[df.columns[0]]
+        # If MultiIndex slice still yields a DataFrame, collapse to 1-D.
+        close_series = (
+            close_obj.iloc[:, 0]
+            if hasattr(close_obj, "columns")
+            else close_obj
+        )
+        closes = [
+            float(x)
+            for x in close_series.dropna().tolist()
+            if not math.isnan(float(x))
+        ]
         return closes or None
     except Exception as exc:  # pragma: no cover — network
         log.debug("regime: yfinance error %s: %s", symbol, exc)

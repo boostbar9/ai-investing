@@ -43,6 +43,7 @@ dependencies = [
   "structlog>=24.4",
   # Broker / data sources
   "alpaca-py>=0.33",
+  "yfinance>=0.2.40",  # fallback price provider (regime + dip_watch)
   # Auth
   "pyjwt>=2.9",
   # Secrets storage (Windows Credential Manager + cross-platform fallback)
