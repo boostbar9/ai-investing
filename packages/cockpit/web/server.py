@@ -1143,6 +1143,92 @@ async def api_insider_signal_batch(symbols: str = "") -> dict[str, Any]:
     return {"results": results, "stats": client.stats()}
 
 
+# Phase 28 — Learning / trade-journal endpoints.
+#
+# These read directly from ``data/learning/outcomes.jsonl`` (an append-
+# only journal written by the outcome labeler). The labeler runs out-of-
+# band (a script, cron, or the autonomy loop); the cockpit only *reads*
+# the journal so the page is always cheap.
+
+@app.get("/learning", response_class=HTMLResponse)
+def learning_page() -> HTMLResponse:
+    """Phase 28 — trade journal + per-agent win-rate dashboard."""
+    return _render("learning.html")
+
+
+@app.get("/api/learning/summary")
+def api_learning_summary() -> dict[str, Any]:
+    """Top-line stats + per-regime breakdown + per-agent scores.
+
+    Returns an empty (but well-formed) payload when no outcomes have
+    been labeled yet, so the page can render gracefully on first run.
+    """
+    from packages.learning.outcome_labeler import (
+        DEFAULT_OUTCOMES_PATH,
+        load_outcomes,
+        per_agent_scores,
+        summary_stats,
+    )
+
+    rows = load_outcomes(DEFAULT_OUTCOMES_PATH)
+    return {
+        "summary": summary_stats(rows),
+        "agents": [s.to_dict() for s in per_agent_scores(rows)],
+        "total_rows": len(rows),
+    }
+
+
+@app.get("/api/learning/picks")
+def api_learning_picks(
+    limit: int = 200,
+    symbol: str = "",
+    regime: str = "",
+) -> dict[str, Any]:
+    """Sortable trade-journal table data.
+
+    Returns the most recent ``limit`` labeled picks (default 200),
+    optionally filtered by symbol or regime. Sorted by ts desc.
+    """
+    from packages.learning.outcome_labeler import (
+        DEFAULT_OUTCOMES_PATH,
+        load_outcomes,
+    )
+
+    rows = load_outcomes(DEFAULT_OUTCOMES_PATH)
+    sym_filter = symbol.strip().upper()
+    reg_filter = regime.strip().lower()
+    if sym_filter:
+        rows = [r for r in rows if (r.get("symbol") or "").upper() == sym_filter]
+    if reg_filter:
+        rows = [r for r in rows if (r.get("regime_at_pick") or "").lower() == reg_filter]
+    rows.sort(key=lambda r: r.get("ts") or "", reverse=True)
+    return {"picks": rows[: max(1, min(limit, 1000))], "count": len(rows)}
+
+
+class _BackfillRequest(BaseModel):
+    max_picks: int | None = None
+
+
+@app.post("/api/learning/backfill")
+async def api_learning_backfill(req: _BackfillRequest | None = None) -> dict[str, Any]:
+    """Trigger the outcome labeler to walk predictions.jsonl now.
+
+    Idempotent: already-labeled picks are skipped. Bounded by
+    ``req.max_picks`` so the cockpit can show progress on a one-button
+    backfill without blocking the event loop for too long.
+    """
+    from packages.data.adapters.yfinance import YFinanceAdapter
+    from packages.learning.outcome_labeler import backfill_outcomes
+
+    max_picks = (req.max_picks if req else None)
+    adapter = YFinanceAdapter()
+    try:
+        report = await backfill_outcomes(adapter, max_picks=max_picks)
+    finally:
+        await adapter.aclose()
+    return {"report": report.to_dict()}
+
+
 @app.post("/api/pause")
 def api_pause() -> dict[str, Any]:
     state = load_state()
