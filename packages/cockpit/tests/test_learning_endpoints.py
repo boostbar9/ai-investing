@@ -65,8 +65,8 @@ def test_summary_endpoint_with_outcomes(client):
             "ts": "2026-05-01T12:00:00+00:00", "symbol": "AAPL",
             "confidence": 0.5, "regime_at_pick": "risk_on",
             "agents_voted": ["research", "strategy"],
-            "entry_price": 100.0, "exit_price_5d": 105.0,
-            "return_1d": 0.01, "return_5d": 0.05, "return_20d": 0.10,
+            "entry_price": 100.0, "exit_price_eod": 105.0,
+            "return_30m": 0.005, "return_2h": 0.02, "return_eod": 0.05,
             "correct": True,
         },
         {
@@ -74,8 +74,8 @@ def test_summary_endpoint_with_outcomes(client):
             "ts": "2026-05-02T12:00:00+00:00", "symbol": "MSFT",
             "confidence": 0.3, "regime_at_pick": "chop",
             "agents_voted": ["research"],
-            "entry_price": 400.0, "exit_price_5d": 395.0,
-            "return_1d": -0.01, "return_5d": -0.012, "return_20d": 0.0,
+            "entry_price": 400.0, "exit_price_eod": 395.0,
+            "return_30m": -0.005, "return_2h": -0.01, "return_eod": -0.012,
             "correct": False,
         },
     ])
@@ -96,11 +96,11 @@ def test_picks_endpoint_filters(client):
         {"pick_id": "p1", "ts": "2026-05-01T12:00:00+00:00",
          "symbol": "AAPL", "regime_at_pick": "risk_on",
          "confidence": 0.5, "agents_voted": ["research"],
-         "return_5d": 0.05, "correct": True},
+         "return_eod": 0.05, "correct": True},
         {"pick_id": "p2", "ts": "2026-05-02T12:00:00+00:00",
          "symbol": "MSFT", "regime_at_pick": "chop",
          "confidence": 0.3, "agents_voted": ["research"],
-         "return_5d": -0.02, "correct": False},
+         "return_eod": -0.02, "correct": False},
     ])
     # No filter — both.
     r = c.get("/api/learning/picks")

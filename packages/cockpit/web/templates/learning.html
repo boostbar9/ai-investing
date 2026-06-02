@@ -53,8 +53,8 @@
       <div>
         <h1 class="text-2xl font-semibold text-gray-100">Learning · Trade Journal</h1>
         <p class="text-sm text-gray-400 mt-1">
-          Outcome labels for every pick the brain has made. We measure
-          return at +1, +5, +20 trading days; "correct" is judged at +5d.
+          Outcome labels for every day-trade pick the brain has made. We measure
+          return at +30m, +2h, and end-of-day; "correct" is judged at EOD (the round-trip P&L).
         </p>
       </div>
       <button id="backfill-btn" class="btn-primary">Backfill outcomes</button>
@@ -67,15 +67,15 @@
         <div class="stat-num text-gray-100" id="stat-total">—</div>
       </div>
       <div class="card">
-        <div class="stat-label">Decided (have +5d data)</div>
+        <div class="stat-label">Decided (have EOD data)</div>
         <div class="stat-num text-gray-100" id="stat-decided">—</div>
       </div>
       <div class="card">
-        <div class="stat-label">Win rate (+5d)</div>
+        <div class="stat-label">Win rate (EOD)</div>
         <div class="stat-num" id="stat-winrate">—</div>
       </div>
       <div class="card">
-        <div class="stat-label">Avg return +5d</div>
+        <div class="stat-label">Avg return EOD</div>
         <div class="stat-num" id="stat-avgret">—</div>
       </div>
     </div>
@@ -116,9 +116,9 @@
               <th data-sort="regime_at_pick">Regime</th>
               <th data-sort="confidence" class="num">Confidence</th>
               <th data-sort="entry_price" class="num">Entry</th>
-              <th data-sort="return_1d" class="num">+1d</th>
-              <th data-sort="return_5d" class="num">+5d</th>
-              <th data-sort="return_20d" class="num">+20d</th>
+              <th data-sort="return_30m" class="num">+30m</th>
+              <th data-sort="return_2h" class="num">+2h</th>
+              <th data-sort="return_eod" class="num">EOD</th>
               <th>Outcome</th>
               <th>Agents</th>
             </tr>
@@ -170,7 +170,7 @@
       wr.textContent = fmtPct(rate);
       wr.className = "stat-num " + (rate >= 0.5 ? "ret-pos" : rate > 0 ? "" : "text-gray-100");
       const ar = document.getElementById("stat-avgret");
-      const avg = s.avg_return_5d ?? 0;
+      const avg = s.avg_return_eod ?? 0;
       ar.textContent = fmtPct(avg);
       ar.className = "stat-num " + (avg > 0 ? "ret-pos" : avg < 0 ? "ret-neg" : "text-gray-100");
 
@@ -202,7 +202,7 @@
       } else {
         rhost.innerHTML = names.map(name => {
           const slot = regimes[name];
-          const ret = slot.avg_return_5d ?? 0;
+          const ret = slot.avg_return_eod ?? 0;
           const retCls = ret > 0 ? "ret-pos" : ret < 0 ? "ret-neg" : "";
           return `
             <div class="flex items-center justify-between">
@@ -212,7 +212,7 @@
               </div>
               <div class="text-xs">
                 <span class="text-gray-400">win </span><span class="text-gray-100">${fmtPct(slot.win_rate)}</span>
-                <span class="ml-3 text-gray-400">avg +5d </span><span class="${retCls}">${fmtPct(ret)}</span>
+                <span class="ml-3 text-gray-400">avg EOD </span><span class="${retCls}">${fmtPct(ret)}</span>
               </div>
             </div>`;
         }).join("");
@@ -232,9 +232,9 @@
           <td>${regimePill(r.regime_at_pick)}</td>
           <td class="num">${(r.confidence ?? 0).toFixed(2)}</td>
           <td class="num">${fmtNum(r.entry_price)}</td>
-          ${returnCell(r.return_1d)}
-          ${returnCell(r.return_5d)}
-          ${returnCell(r.return_20d)}
+          ${returnCell(r.return_30m)}
+          ${returnCell(r.return_2h)}
+          ${returnCell(r.return_eod)}
           <td>${outcomePill(r.correct)}</td>
           <td class="text-xs text-gray-400">${escape((r.agents_voted || []).join(", "))}</td>
         </tr>`;
