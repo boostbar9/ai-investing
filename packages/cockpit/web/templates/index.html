@@ -551,7 +551,17 @@
     }
 
     function regimePill(r) {
-      const m = { bull: "pill-green", chop: "pill-blue", bear: "pill-yellow", crisis: "pill-red" };
+      // Two vocabularies map onto the same color scale:
+      //   bull / risk_on  -> green
+      //   chop / neutral  -> blue
+      //   bear / risk_off -> yellow
+      //   crisis          -> red
+      const m = {
+        bull: "pill-green", risk_on: "pill-green",
+        chop: "pill-blue", neutral: "pill-blue",
+        bear: "pill-yellow", risk_off: "pill-yellow",
+        crisis: "pill-red",
+      };
       return m[r] || "pill-gray";
     }
 

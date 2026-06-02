@@ -23,6 +23,7 @@ from typing import Any
 
 import httpx
 
+from packages.agents.reddit_trust.oauth import get_oauth
 from packages.data.adapters.sentiment import extract_tickers
 from packages.shared.otel import span
 
@@ -37,6 +38,13 @@ logger = logging.getLogger(__name__)
 # to the RSS endpoint, which has a different rate-limit pool entirely.
 # We try them IN ORDER until one returns 200 -- the corroboration gate just
 # needs *some* community signal, not necessarily the richest one.
+# Phase 25.5 — when ``REDDIT_CLIENT_ID`` is set, we hit oauth.reddit.com
+# with a bearer token instead of the public hosts (which 403 from
+# datacenter IPs). oauth.reddit.com is the *only* host that gives the
+# 100/min/per-OAuth-app rate limit and never 403s on a valid token.
+RICH_REDDIT_OAUTH_URL = os.getenv(
+    "RICH_REDDIT_OAUTH_URL", "https://oauth.reddit.com/r/{subreddit}/hot"
+)
 RICH_REDDIT_URL = os.getenv(
     "RICH_REDDIT_URL", "https://www.reddit.com/r/{subreddit}/hot.json"
 )
@@ -219,15 +227,26 @@ async def fetch_rich_reddit(
         client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S)
     try:
         with span("reddit_trust.fetch", {"subreddit": subreddit}):
-            # Try each JSON host in order until one returns 200. The fallbacks
-            # exist because www.reddit.com routinely 403s anonymous JSON
-            # requests during heavy crawl pressure; old.reddit.com and
-            # api.reddit.com run on separate slices that almost always work.
+            # Phase 25.5 — prefer OAuth (oauth.reddit.com) when configured.
+            # That host returns 200 even from datacenter IPs as long as the
+            # bearer is valid; the public hosts 403 us anonymously. We still
+            # keep the unauthenticated fallback chain for the no-OAuth case.
+            oauth = get_oauth()
+            bearer = await oauth.get_token() if oauth.enabled else None
             headers = {
-                "User-Agent": USER_AGENT,
+                "User-Agent": oauth.user_agent if oauth.enabled else USER_AGENT,
                 "Accept": "application/json",
             }
-            json_hosts = [RICH_REDDIT_URL, *RICH_REDDIT_FALLBACKS]
+            if bearer:
+                headers["Authorization"] = f"bearer {bearer}"
+                json_hosts = [
+                    RICH_REDDIT_OAUTH_URL,
+                    RICH_REDDIT_URL,
+                    *RICH_REDDIT_FALLBACKS,
+                ]
+            else:
+                json_hosts = [RICH_REDDIT_URL, *RICH_REDDIT_FALLBACKS]
+
             payload: dict[str, Any] | None = None
             last_status = 0
             for host_template in json_hosts:
@@ -242,6 +261,12 @@ async def fetch_rich_reddit(
                     )
                     continue
                 last_status = r.status_code
+                # If OAuth token went stale (401), invalidate and let the
+                # next host attempt mint a fresh one on the subsequent call.
+                if r.status_code == 401 and bearer and "oauth.reddit.com" in url:
+                    logger.info("reddit oauth: 401 — invalidating cached token")
+                    oauth.invalidate()
+                    continue
                 if r.status_code != 200:
                     continue
                 try:

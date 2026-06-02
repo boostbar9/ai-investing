@@ -399,6 +399,24 @@ def latest_regime() -> dict[str, Any]:
         # Try a few likely keys; the ensemble logger may evolve over time.
         auto_regime = runs[0].get("regime") or runs[0].get("current_regime")
         confidence = runs[0].get("regime_confidence")
+    # Phase 25.5 — the paper runs ledger may not carry a regime label
+    # (older runs, or strategies that never write one). Fall back to
+    # the live autonomy brain so the hero card matches Brain Health
+    # instead of showing "—".
+    if not auto_regime:
+        try:
+            snap = autonomy_brain.snapshot() or {}
+            # The brain publishes the current regime under `last_regime`
+            # (set by `autonomy._sweep` after `regime_module.detect`).
+            # Accept `regime` too for forward-compat with future renames.
+            brain_reg = (snap.get("last_regime") or snap.get("regime") or {})
+            label = brain_reg.get("label")
+            if label:
+                auto_regime = label
+            if confidence is None and brain_reg.get("confidence") is not None:
+                confidence = brain_reg["confidence"]
+        except Exception:  # pragma: no cover — defensive
+            pass
     effective = state.regime_override if state.regime_override != "auto" else auto_regime
     return {
         "auto": auto_regime,
