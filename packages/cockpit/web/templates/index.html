@@ -288,6 +288,7 @@
         <h2 class="section-h mb-0" data-tt="Live tail of agent narrations. The Always-On Brain runs a research sweep every 2 hours (market hours) / 6 hours (after hours), and Curiosity picks the next focus.">Agent Chatter</h2>
         <div class="flex items-center gap-2" style="flex-wrap:wrap;">
           <span class="pill pill-muted" id="autonomy-pill" data-tt="Always-On Brain status. When green the autonomy loop is actively running research + curiosity ticks.">autonomy —</span>
+          <span class="pill pill-muted" id="data-feed-pill" data-tt="Live market data source. Green = Finnhub real-time. Amber = yfinance daily-close fallback. Phase 25.3.">data feed —</span>
           <span class="pill pill-live pill-accent">live</span>
           <button id="autonomy-think-btn" class="btn btn-sm" data-tt="Force one autonomous research + curiosity pass now.">Think now</button>
           <span class="text-xs muted" id="chatter-meta">—</span>
@@ -967,6 +968,36 @@
       } catch (e) { /* ignore */ }
     }
     Cockpit.poll(refreshAutonomy, 8000, { name: 'index-autonomy' });
+
+    // ----- Phase 25.3 live data-feed pill -----
+    // Green when Finnhub is the primary provider AND we have at least
+    // one fresh quote. Amber when we're running on the yfinance daily-
+    // close fallback (cockpit still works but quotes are stale).
+    async function refreshDataFeed() {
+      try {
+        const j = await Cockpit.api.get('/api/data-feed');
+        const pill = document.getElementById('data-feed-pill');
+        if (!pill) return;
+        pill.classList.remove('pill-muted', 'pill-good', 'pill-warn', 'pill-bad');
+        const primary = j && j.primary_provider;
+        const freshCount = (j && j.symbols || []).filter(s => s.fresh).length;
+        const total = (j && j.symbols || []).length;
+        if (primary === 'finnhub' && freshCount > 0) {
+          pill.classList.add('pill-good');
+          pill.textContent = 'data feed · finnhub · ' + freshCount + '/' + total + ' fresh';
+        } else if (primary === 'finnhub') {
+          pill.classList.add('pill-warn');
+          pill.textContent = 'data feed · finnhub (warming…)';
+        } else if (primary === 'yfinance') {
+          pill.classList.add('pill-warn');
+          pill.textContent = 'data feed · yfinance (no Finnhub key)';
+        } else {
+          pill.classList.add('pill-muted');
+          pill.textContent = 'data feed —';
+        }
+      } catch (e) { /* ignore */ }
+    }
+    Cockpit.poll(refreshDataFeed, 10000, { name: 'index-data-feed' });
 
     // Think now button — force a single autonomy tick.
     (function wireThinkNow() {

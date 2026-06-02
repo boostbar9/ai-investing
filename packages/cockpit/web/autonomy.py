@@ -112,6 +112,12 @@ class AutonomyConfig:
     # autonomy module never imports the broker directly (testability).
     exit_rules_tick: Callable[[], Any] | None = None
     dip_watch_tick: Callable[[], Any] | None = None
+    # ---- Phase 25.3: live-quote cache warmer ---------------------
+    # Called at the head of every fast tick (and exposed via run_tick)
+    # to refresh the LiveQuoteCache for the active symbol set before
+    # exit_rules / dip_watch read prices. None-safe: when missing,
+    # the fast tick proceeds with the existing cache contents.
+    quote_warmup_tick: Callable[[], Any] | None = None
     # ---- Phase 25.1: fast loop ------------------------------------
     # Exit-rules + dip-watch are price-sensitive and must not wait a
     # full research-sweep cycle (15min) to fire. The fast loop runs
@@ -488,6 +494,17 @@ async def run_fast_tick() -> dict[str, Any]:
         STATE.last_fast_tick_status = "skipped_paused"
         return {"skipped": True, "reason": "paused"}
 
+    # Phase 25.3 — refresh the live-quote cache before reading prices.
+    # Best-effort: any failure is swallowed so a flaky data feed never
+    # blocks exit-rules / dip-watch.
+    warmup_result: dict[str, Any] | None = None
+    if cfg.quote_warmup_tick is not None:
+        try:
+            warmup_result = await cfg.quote_warmup_tick()
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("quote_warmup_tick failed: %s", exc)
+            warmup_result = {"error": str(exc)[:240]}
+
     exit_result, dip_result = await _run_phase25_hooks(cfg)
     STATE.last_fast_tick_exit = exit_result
     STATE.last_fast_tick_dip = dip_result
@@ -495,6 +512,7 @@ async def run_fast_tick() -> dict[str, Any]:
     return {
         "skipped": False,
         "ok": True,
+        "quote_warmup": warmup_result,
         "exit_rules": exit_result,
         "dip_watch": dip_result,
         "ts": now_iso,

@@ -63,6 +63,7 @@ from packages.cockpit.web import brain_memory as autonomy_memory
 from packages.cockpit.web import chatter as agent_chatter
 from packages.cockpit.web import knowledge_base as autonomy_knowledge
 from packages.cockpit.web import reflection as autonomy_reflection
+from packages.cockpit.web import live_quotes as live_quotes_mod
 from packages.cockpit.web import regime as autonomy_regime
 from packages.execution.broker import AlpacaPaperBroker, BrokerError, OrderRequest
 from packages.paper.streak import compute_paper_streak
@@ -3039,14 +3040,45 @@ async def _autonomy_startup() -> None:  # pragma: no cover
         log.info("autonomy brain disabled via AUTONOMY_DISABLED=1")
         return
 
-    # Phase 21: wire the self-improvement loop with best-effort price
-    # providers. Each falls back to None on any failure so the brain
-    # keeps running even when network/yfinance is unreachable.
+    # Phase 21 + 25.3: wire the self-improvement loop with best-effort
+    # price providers. The LiveQuoteCache is the single seam every
+    # Phase 25 hook hits to ask "what's the last price?" — it fronts
+    # Finnhub real-time REST quotes and falls back to yfinance daily
+    # closes when Finnhub is unavailable (no key / network error /
+    # rate limited). The cache is kept warm by the fast loop so the
+    # sync `peek()` used here is virtually always within TTL.
+    quote_cache = live_quotes_mod.get_default_cache()
+    quote_cache.set_fallback(
+        lambda symbol: autonomy_regime.default_price_provider(symbol, days=5)
+    )
+    if os.getenv("FINNHUB_API_KEY"):
+        try:
+            from packages.data.adapters.finnhub import FinnhubAdapter
+            _finnhub_adapter = FinnhubAdapter()
+            quote_cache.set_fetcher(
+                live_quotes_mod.make_finnhub_fetcher(_finnhub_adapter)
+            )
+            log.info("live quotes: Finnhub REST primary, yfinance fallback")
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("live quotes: Finnhub adapter init failed: %s", exc)
+    else:
+        log.info("live quotes: no FINNHUB_API_KEY, using yfinance fallback only")
+
     def _last_price(sym: str) -> float | None:
+        # Synchronous read — the cache is kept warm by the fast loop.
+        # On a cold cache (very first call) fall back to a yfinance
+        # daily close so we never return None just because the cache
+        # hasn't been primed yet.
+        cached = quote_cache.peek(sym)
+        if cached is not None and cached > 0:
+            return cached
         try:
             series = autonomy_regime.default_price_provider(sym, days=5)
             if series:
-                return float(series[-1])
+                price = float(series[-1])
+                # Seed the cache so subsequent peeks succeed.
+                quote_cache.ingest_ws_tick(sym, price)
+                return price
         except Exception:  # pragma: no cover — defensive
             pass
         return None
@@ -3126,6 +3158,37 @@ async def _autonomy_startup() -> None:  # pragma: no cover
             with contextlib.suppress(Exception):
                 await broker.aclose()
 
+    # Phase 25.3 — keep the live-quote cache warm. Every fast tick
+    # refreshes prices for the current portfolio + any armed dip
+    # watchers + the regime SPY/VIX baseline. This is the call that
+    # actually burns Finnhub budget; everything else just peeks.
+    async def _phase25_quote_warmup_tick() -> dict[str, Any]:
+        symbols: set[str] = {"SPY", "^VIX"}
+        try:
+            for s in (_portfolio_symbols_snapshot() or []):
+                symbols.add(str(s).upper())
+        except Exception:
+            pass
+        try:
+            from packages.cockpit.web.dip_watch import snapshot as dip_snapshot
+            for w in (dip_snapshot() or {}).get("watchers", []):
+                sym = (w or {}).get("symbol")
+                if sym:
+                    symbols.add(str(sym).upper())
+        except Exception:
+            pass
+        if not symbols:
+            return {"refreshed": 0}
+        results = await live_quotes_mod.refresh_symbols(
+            quote_cache, sorted(symbols)
+        )
+        ok = sum(1 for v in results.values() if v is not None)
+        return {
+            "refreshed": ok,
+            "attempted": len(symbols),
+            "primary": quote_cache.status()["primary_provider"],
+        }
+
     autonomy_brain.configure(
         on_curiosity_focus=_agent_sched_set_symbols,
         portfolio_symbols_getter=_portfolio_symbols_snapshot,
@@ -3134,6 +3197,7 @@ async def _autonomy_startup() -> None:  # pragma: no cover
         regime_vix_provider=autonomy_regime.default_vix_provider,
         exit_rules_tick=_phase25_exit_rules_tick,
         dip_watch_tick=_phase25_dip_watch_tick,
+        quote_warmup_tick=_phase25_quote_warmup_tick,
     )
     started = autonomy_brain.start()
     log.info("autonomy brain startup: started=%s", started)
@@ -4316,6 +4380,40 @@ def api_errors_unresolve(entry_id: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 # Error handlers
 # --------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Phase 25.3 — live data-feed status
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/data-feed")
+def api_data_feed() -> dict[str, Any]:
+    """Snapshot of the live-quote cache: provider, per-symbol freshness, errors.
+
+    Driven by :mod:`packages.cockpit.web.live_quotes`. The dashboard
+    polls this so the user can confirm Finnhub is live (or that it's
+    quietly falling back to yfinance daily closes).
+    """
+    cache = live_quotes_mod.get_default_cache()
+    return cache.status()
+
+
+@app.post("/api/data-feed/refresh")
+async def api_data_feed_refresh(symbol: str | None = None) -> dict[str, Any]:
+    """Force-refresh one symbol (or the active portfolio when omitted)."""
+    cache = live_quotes_mod.get_default_cache()
+    if symbol:
+        price = await cache.lookup(symbol.upper())
+        return {"symbol": symbol.upper(), "price": price}
+    syms: set[str] = {"SPY", "^VIX"}
+    try:
+        for s in (_portfolio_symbols_snapshot() or []):
+            syms.add(str(s).upper())
+    except Exception:
+        pass
+    results = await live_quotes_mod.refresh_symbols(cache, sorted(syms))
+    return {"refreshed": {k: v for k, v in results.items()}}
 
 
 @app.exception_handler(Exception)
