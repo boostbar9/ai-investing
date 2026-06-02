@@ -335,3 +335,140 @@ def test_run_tick_handles_dict_positions(
     )
     assert r.sells_triggered == 1
     assert sells == [("MSFT", 5.0)]
+
+
+# ---------------------------------------------------------------------------
+# Phase 28-R step 3 — session-scoped peak reset
+# ---------------------------------------------------------------------------
+
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _et_dt(year: int, month: int, day: int, hour: int = 10, minute: int = 0) -> datetime:
+    return datetime(year, month, day, hour, minute, tzinfo=_ET).astimezone(UTC)
+
+
+class _FakeClock:
+    """Mutable now() returned to the peak store via _now_fn."""
+
+    def __init__(self, dt: datetime) -> None:
+        self.now = dt
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def _build_store_with_clock(
+    tmp_path: Path, start_dt: datetime
+) -> tuple[exit_rules._PeakStore, _FakeClock]:
+    p = tmp_path / "peaks.json"
+    clock = _FakeClock(start_dt)
+    store = exit_rules._PeakStore(path=p, _now_fn=clock)
+    return store, clock
+
+
+def test_peak_store_resets_when_et_session_rolls_over(tmp_path: Path) -> None:
+    """A peak set yesterday must NOT be visible today."""
+    store, clock = _build_store_with_clock(
+        tmp_path, _et_dt(2026, 6, 3, 14, 0)
+    )
+    store.update("NVDA", 0.04)
+    assert store.get("NVDA") == pytest.approx(0.04)
+
+    # Advance to the next ET trading day — store must self-clear.
+    clock.now = _et_dt(2026, 6, 4, 10, 0)
+    assert store.get("NVDA") == 0.0
+    assert store.snapshot() == {}
+
+
+def test_peak_store_persists_within_same_session(tmp_path: Path) -> None:
+    """Updates inside one ET session keep their high-water mark across calls."""
+    store, clock = _build_store_with_clock(
+        tmp_path, _et_dt(2026, 6, 3, 10, 0)
+    )
+    store.update("AAPL", 0.025)
+
+    # Advance clock 4h inside the same ET session.
+    clock.now = _et_dt(2026, 6, 3, 14, 0)
+    store.update("AAPL", 0.018)  # lower — peak should stay at 0.025
+    assert store.get("AAPL") == pytest.approx(0.025)
+
+
+def test_peak_store_disk_load_drops_stale_session(tmp_path: Path) -> None:
+    """A peaks.json written yesterday must NOT influence today's run."""
+    p = tmp_path / "peaks.json"
+    # Hand-craft a stale on-disk file.
+    p.write_text(
+        json.dumps({"TSLA": 0.05, "__session_date__": "2026-06-02"}),
+        encoding="utf-8",
+    )
+    clock = _FakeClock(_et_dt(2026, 6, 3, 10, 0))
+    store = exit_rules._PeakStore(path=p, _now_fn=clock)
+    assert store.get("TSLA") == 0.0
+    # And the on-disk file should now be empty of yesterday's data.
+    on_disk = json.loads(p.read_text(encoding="utf-8"))
+    assert "TSLA" not in on_disk
+    assert on_disk["__session_date__"] == "2026-06-03"
+
+
+def test_peak_store_disk_load_keeps_same_session_data(tmp_path: Path) -> None:
+    """A restart inside the same ET session must KEEP yesterday's peaks."""
+    p = tmp_path / "peaks.json"
+    p.write_text(
+        json.dumps({"AAPL": 0.03, "__session_date__": "2026-06-03"}),
+        encoding="utf-8",
+    )
+    clock = _FakeClock(_et_dt(2026, 6, 3, 14, 0))
+    store = exit_rules._PeakStore(path=p, _now_fn=clock)
+    assert store.get("AAPL") == pytest.approx(0.03)
+
+
+def test_peak_store_disk_load_missing_session_marker_treated_as_stale(
+    tmp_path: Path,
+) -> None:
+    """Legacy peaks.json with no __session_date__ key is treated as stale."""
+    p = tmp_path / "peaks.json"
+    p.write_text(json.dumps({"NFLX": 0.04}), encoding="utf-8")
+    clock = _FakeClock(_et_dt(2026, 6, 3, 10, 0))
+    store = exit_rules._PeakStore(path=p, _now_fn=clock)
+    assert store.get("NFLX") == 0.0
+
+
+def test_peak_store_reset_session_clears_and_flushes(tmp_path: Path) -> None:
+    """reset_session() empties the cache and rewrites the file."""
+    store, clock = _build_store_with_clock(
+        tmp_path, _et_dt(2026, 6, 3, 10, 0)
+    )
+    store.update("AMD", 0.02)
+    store.update("INTC", 0.015)
+    assert len(store.snapshot()) == 2
+
+    store.reset_session()
+    assert store.snapshot() == {}
+    on_disk = json.loads(store.path.read_text(encoding="utf-8"))
+    assert {k for k in on_disk if k != "__session_date__"} == set()
+    assert on_disk["__session_date__"] == "2026-06-03"
+
+
+def test_peak_store_flush_writes_session_marker(tmp_path: Path) -> None:
+    """Every flush includes the __session_date__ key."""
+    store, _ = _build_store_with_clock(tmp_path, _et_dt(2026, 6, 3, 10, 0))
+    store.update("META", 0.022)
+    on_disk = json.loads(store.path.read_text(encoding="utf-8"))
+    assert on_disk["__session_date__"] == "2026-06-03"
+    assert on_disk["META"] == pytest.approx(0.022)
+
+
+def test_peak_store_weekend_rollover_resets(tmp_path: Path) -> None:
+    """Friday peak should NOT carry into Monday's session."""
+    store, clock = _build_store_with_clock(
+        tmp_path, _et_dt(2026, 6, 5, 15, 0)  # Friday
+    )
+    store.update("AMZN", 0.035)
+    assert store.get("AMZN") == pytest.approx(0.035)
+
+    clock.now = _et_dt(2026, 6, 8, 9, 30)  # Monday open
+    assert store.get("AMZN") == 0.0

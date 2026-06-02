@@ -41,11 +41,25 @@ import contextlib
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, date
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from packages.cockpit.web import chatter as agent_chatter
+
+ET = ZoneInfo("America/New_York")
+
+
+def _current_session_date(now: datetime | None = None) -> date:
+    """ET date for the current trading session.
+
+    Phase 28-R step 3: peaks are reset when the ET session date rolls
+    over so a winner from yesterday doesn't gate today's exits.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    return now.astimezone(ET).date()
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = REPO_ROOT / "data" / "cockpit"
@@ -141,29 +155,78 @@ class _PeakStore:
     Loaded lazily; flushed atomically on every update. Keys that no
     longer have a matching open position are pruned by `evaluate()` so
     the file stays small.
+
+    Phase 28-R step 3: the store is **session-scoped**. Every public
+    accessor checks the current ET session date; when the date rolls
+    over, the in-memory cache and on-disk file are wiped before the
+    operation proceeds. This matches the intraday-only policy: a
+    position opened today starts with peak = 0 even if a same-ticker
+    position closed yesterday at peak = 4%. The session date itself is
+    persisted alongside the peaks under the ``__session_date__`` key so
+    a restart inside the same session keeps the high-water marks.
     """
 
     path: Path = EXIT_PEAKS_PATH
     _cache: dict[str, float] = field(default_factory=dict)
+    _session_date: date | None = None
     _loaded: bool = False
+    # Test seam — swap in a deterministic clock.
+    _now_fn: Any = None
+
+    def _now_session(self) -> date:
+        if self._now_fn is not None:
+            return _current_session_date(self._now_fn())
+        return _current_session_date()
 
     def _ensure(self) -> None:
-        if self._loaded:
+        """Load on first access AND reset when the ET session rolls over."""
+        current_session = self._now_session()
+        if not self._loaded:
+            self._loaded = True
+            self._session_date = current_session
+            if self.path.exists():
+                try:
+                    with self.path.open("r", encoding="utf-8") as f:
+                        data = json.load(f) or {}
+                    if isinstance(data, dict):
+                        # Read persisted session-date marker.
+                        stored_session_raw = data.pop(
+                            "__session_date__", None
+                        )
+                        stored_session: date | None = None
+                        if isinstance(stored_session_raw, str):
+                            try:
+                                stored_session = date.fromisoformat(
+                                    stored_session_raw
+                                )
+                            except ValueError:
+                                stored_session = None
+                        # If the file came from a previous session,
+                        # treat it as empty — today's peaks start at 0.
+                        if (
+                            stored_session is not None
+                            and stored_session == current_session
+                        ):
+                            self._cache = {
+                                str(k): float(v)
+                                for k, v in data.items()
+                                if isinstance(v, (int, float))
+                            }
+                        else:
+                            self._cache = {}
+                            # Flush a clean file so the stale data is
+                            # gone on disk too.
+                            self._flush()
+                except (OSError, ValueError, json.JSONDecodeError):
+                    self._cache = {}
             return
-        self._loaded = True
-        if not self.path.exists():
-            return
-        try:
-            with self.path.open("r", encoding="utf-8") as f:
-                data = json.load(f) or {}
-            if isinstance(data, dict):
-                self._cache = {
-                    str(k): float(v)
-                    for k, v in data.items()
-                    if isinstance(v, (int, float))
-                }
-        except (OSError, ValueError, json.JSONDecodeError):
+
+        # Already loaded — check whether the session rolled over since
+        # the last call (e.g. the process stayed alive past 16:00 ET).
+        if self._session_date != current_session:
             self._cache = {}
+            self._session_date = current_session
+            self._flush()
 
     def get(self, symbol: str) -> float:
         self._ensure()
@@ -197,12 +260,25 @@ class _PeakStore:
         self._ensure()
         return dict(self._cache)
 
+    def reset_session(self) -> None:
+        """Force-clear the cache and bump the session date to today.
+
+        Useful for tests and the optional EOD-flatten post-hook.
+        """
+        self._loaded = True
+        self._session_date = self._now_session()
+        self._cache = {}
+        self._flush()
+
     def _flush(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         try:
+            payload: dict[str, Any] = dict(self._cache)
+            if self._session_date is not None:
+                payload["__session_date__"] = self._session_date.isoformat()
             with tmp.open("w", encoding="utf-8") as f:
-                json.dump(self._cache, f)
+                json.dump(payload, f)
             tmp.replace(self.path)
         except OSError:
             with contextlib.suppress(OSError):
