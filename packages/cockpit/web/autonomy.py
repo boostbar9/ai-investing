@@ -112,6 +112,14 @@ class AutonomyConfig:
     # autonomy module never imports the broker directly (testability).
     exit_rules_tick: Callable[[], Any] | None = None
     dip_watch_tick: Callable[[], Any] | None = None
+    # ---- Phase 25.1: fast loop ------------------------------------
+    # Exit-rules + dip-watch are price-sensitive and must not wait a
+    # full research-sweep cycle (15min) to fire. The fast loop runs
+    # ONLY those two hooks every ``fast_loop_seconds`` during market
+    # hours. Set to 0 to disable and fall back to the slow loop only.
+    fast_loop_seconds: int = int(
+        os.environ.get("AUTONOMY_FAST_LOOP_S") or 60
+    )
 
 
 @dataclass
@@ -134,7 +142,13 @@ class AutonomyState:
     last_bandit_weights: dict[str, float] = field(default_factory=dict)
     # Background asyncio task handles; managed by start()/stop().
     _sweep_task: asyncio.Task[Any] | None = None
+    _fast_task: asyncio.Task[Any] | None = None
     _config: AutonomyConfig = field(default_factory=AutonomyConfig)
+    # Phase 25.1 — last fast-tick observability.
+    last_fast_tick_at: str | None = None
+    last_fast_tick_status: str | None = None
+    last_fast_tick_exit: dict[str, Any] | None = None
+    last_fast_tick_dip: dict[str, Any] | None = None
 
 
 # Module-level singleton. The cockpit owns at most one autonomy loop.
@@ -414,6 +428,79 @@ def _default_pause_check() -> bool:
         return False
 
 
+async def _run_phase25_hooks(
+    cfg: AutonomyConfig,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Run exit_rules_tick + dip_watch_tick in parallel.
+
+    Returns ``(exit_result, dip_result)``. Either is ``None`` if its
+    hook is disabled or unset. Exceptions are caught per-hook and
+    surfaced via chatter — the other hook still runs.
+    """
+
+    async def _wrap_exit() -> dict[str, Any] | None:
+        if not (cfg.exit_rules_enabled and cfg.exit_rules_tick is not None):
+            return None
+        try:
+            return await cfg.exit_rules_tick()
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("exit_rules tick failed: %s", exc)
+            agent_chatter.push(
+                agent="exit_rules",
+                status="warn",
+                message=f"Exit-rules tick failed: {exc}",
+            )
+            return {"error": str(exc)[:240]}
+
+    async def _wrap_dip() -> dict[str, Any] | None:
+        if not (cfg.dip_watch_enabled and cfg.dip_watch_tick is not None):
+            return None
+        try:
+            return await cfg.dip_watch_tick()
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("dip_watch tick failed: %s", exc)
+            agent_chatter.push(
+                agent="dip_watch",
+                status="warn",
+                message=f"Dip-watch tick failed: {exc}",
+            )
+            return {"error": str(exc)[:240]}
+
+    return await asyncio.gather(_wrap_exit(), _wrap_dip())
+
+
+async def run_fast_tick() -> dict[str, Any]:
+    """Phase 25.1 — the fast loop.
+
+    Runs ONLY the price-sensitive hooks (exit_rules + dip_watch) in
+    parallel. Skips outside market hours and when the cockpit is paused.
+    Cheap enough to call every 60s; the heavy research sweep stays on
+    the slow loop.
+    """
+    cfg = STATE._config
+    now_iso = datetime.now(UTC).isoformat(timespec="seconds")
+    STATE.last_fast_tick_at = now_iso
+
+    if not is_market_open():
+        STATE.last_fast_tick_status = "skipped_closed"
+        return {"skipped": True, "reason": "market_closed"}
+    if _default_pause_check():
+        STATE.last_fast_tick_status = "skipped_paused"
+        return {"skipped": True, "reason": "paused"}
+
+    exit_result, dip_result = await _run_phase25_hooks(cfg)
+    STATE.last_fast_tick_exit = exit_result
+    STATE.last_fast_tick_dip = dip_result
+    STATE.last_fast_tick_status = "ok"
+    return {
+        "skipped": False,
+        "ok": True,
+        "exit_rules": exit_result,
+        "dip_watch": dip_result,
+        "ts": now_iso,
+    }
+
+
 async def run_one_tick(
     *,
     sweep_runner: SweepCallable | None = None,
@@ -661,33 +748,19 @@ async def run_one_tick(
             log.warning("curiosity focus hook failed: %s", e)
 
     # ------------------------------------------------------------------
-    # Phase 25: active profit-taking + dip-watch buy-back.
+    # Phase 25 / 25.1: active profit-taking + dip-watch buy-back.
     # Only fires during market hours — outside hours, quotes are stale
     # and Alpaca rejects orders anyway, so the calls would be wasted.
+    #
+    # Phase 25.1: the two hooks are independent and both make remote
+    # calls. Run them in parallel via asyncio.gather so the tick
+    # finishes in max(exit, dip) instead of exit+dip. The fast loop
+    # uses the same helper.
     # ------------------------------------------------------------------
     exit_tick_result: dict[str, Any] | None = None
     dip_tick_result: dict[str, Any] | None = None
     if is_market_open():
-        if cfg.exit_rules_enabled and cfg.exit_rules_tick is not None:
-            try:
-                exit_tick_result = await cfg.exit_rules_tick()
-            except Exception as exc:  # pragma: no cover — defensive
-                log.warning("exit_rules tick failed: %s", exc)
-                agent_chatter.push(
-                    agent="exit_rules",
-                    status="warn",
-                    message=f"Exit-rules tick failed: {exc}",
-                )
-        if cfg.dip_watch_enabled and cfg.dip_watch_tick is not None:
-            try:
-                dip_tick_result = await cfg.dip_watch_tick()
-            except Exception as exc:  # pragma: no cover — defensive
-                log.warning("dip_watch tick failed: %s", exc)
-                agent_chatter.push(
-                    agent="dip_watch",
-                    status="warn",
-                    message=f"Dip-watch tick failed: {exc}",
-                )
+        exit_tick_result, dip_tick_result = await _run_phase25_hooks(cfg)
 
     return {
         "skipped": False,
@@ -735,32 +808,70 @@ async def _sweep_loop() -> None:  # pragma: no cover \u2014 exercised via run_on
             raise
 
 
-def start() -> bool:
-    """Start the long-lived loop if not already running.
+async def _fast_loop() -> None:  # pragma: no cover — exercised via run_fast_tick
+    """Phase 25.1 — wake every ``fast_loop_seconds`` and run a fast tick.
 
-    Returns True if a fresh task was started, False if one was already
-    in flight. Safe to call multiple times.
+    Idle outside market hours (sleeps the same fast interval and bails
+    immediately on the next check). Resilient to transport errors via
+    backoff like the sweep loop.
+    """
+    backoff = 30
+    while STATE.enabled:
+        cfg = STATE._config
+        # Allow disabling fast loop via cfg.fast_loop_seconds = 0.
+        interval = cfg.fast_loop_seconds
+        if interval <= 0:
+            await asyncio.sleep(60)
+            continue
+        try:
+            await run_fast_tick()
+            backoff = 30
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # defensive — run_fast_tick already catches
+            STATE.last_error = str(e)[:300]
+            log.warning("autonomy fast loop tick crashed: %s", e)
+            backoff = min(backoff * 2, 600)
+            await asyncio.sleep(backoff)
+            continue
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+
+
+def start() -> bool:
+    """Start the long-lived loops if not already running.
+
+    Returns True if a fresh sweep task was started, False if one was
+    already in flight. Safe to call multiple times. The fast loop is
+    started alongside whenever a fresh event loop is available.
     """
     STATE.enabled = True
-    task = STATE._sweep_task
-    if task is not None and not task.done():
-        return False
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         # No event loop \u2014 will be retried on the next start() call.
+        return False
+    # Fast loop: start independently of the sweep loop.
+    fast_task = STATE._fast_task
+    if fast_task is None or fast_task.done():
+        STATE._fast_task = loop.create_task(_fast_loop())
+    sweep_task = STATE._sweep_task
+    if sweep_task is not None and not sweep_task.done():
         return False
     STATE._sweep_task = loop.create_task(_sweep_loop())
     return True
 
 
 def stop() -> None:
-    """Stop the loop. Safe even if nothing is running."""
+    """Stop both loops. Safe even if nothing is running."""
     STATE.enabled = False
-    task = STATE._sweep_task
-    if task is not None and not task.done():
-        task.cancel()
-    STATE._sweep_task = None
+    for attr in ("_sweep_task", "_fast_task"):
+        task = getattr(STATE, attr)
+        if task is not None and not task.done():
+            task.cancel()
+        setattr(STATE, attr, None)
 
 
 def snapshot() -> dict[str, Any]:
@@ -785,9 +896,21 @@ def snapshot() -> dict[str, Any]:
         "last_reflection": STATE.last_reflection,
         "last_judged_count": STATE.last_judged_count,
         "last_bandit_weights": dict(STATE.last_bandit_weights),
+        # Phase 25.1 fast-loop telemetry.
+        "fast_loop": {
+            "running": bool(
+                STATE._fast_task is not None and not STATE._fast_task.done()
+            ),
+            "interval_s": cfg.fast_loop_seconds,
+            "last_tick_at": STATE.last_fast_tick_at,
+            "last_tick_status": STATE.last_fast_tick_status,
+            "last_exit": STATE.last_fast_tick_exit,
+            "last_dip": STATE.last_fast_tick_dip,
+        },
         "config": {
             "sweep_market_seconds": cfg.sweep_market_seconds,
             "sweep_off_seconds": cfg.sweep_off_seconds,
+            "fast_loop_seconds": cfg.fast_loop_seconds,
             "curiosity_top_n": cfg.curiosity_top_n,
             "curiosity_focus_count": cfg.curiosity_focus_count,
             "self_improve_enabled": cfg.self_improve_enabled,
@@ -811,4 +934,8 @@ def reset_for_tests() -> None:
     STATE.last_reflection = None
     STATE.last_judged_count = 0
     STATE.last_bandit_weights = {}
+    STATE.last_fast_tick_at = None
+    STATE.last_fast_tick_status = None
+    STATE.last_fast_tick_exit = None
+    STATE.last_fast_tick_dip = None
     STATE._config = AutonomyConfig()
