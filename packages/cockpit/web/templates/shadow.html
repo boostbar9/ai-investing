@@ -209,11 +209,25 @@
     <div class="panel">
       <div class="flex items-center justify-between mb-3">
         <h2 class="text-lg font-semibold">Per-cycle Decisions (last 25)</h2>
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-3">
+          <!-- Phase 35c: mode indicator + dry-run toggle. Default mode
+               is LIVE PAPER so cycles actually hit the Alpaca paper
+               account; flip the checkbox to do a dry-run preview that
+               only logs to the shadow ledger. -->
+          <span id="force-cycle-mode"
+                class="px-2 py-0.5 rounded text-xs font-semibold bg-green-700 text-green-100"
+                title="Cycles route to Alpaca paper trading. Toggle dry-run to preview without submitting.">
+            LIVE PAPER
+          </span>
+          <label class="flex items-center gap-1 text-xs text-gray-300 cursor-pointer"
+                 title="When ON, cycles only log to shadow ledger and never submit Alpaca orders.">
+            <input id="force-cycle-dryrun" type="checkbox" class="accent-yellow-500" />
+            <span>Dry-run preview</span>
+          </label>
           <span id="force-cycle-status" class="text-xs text-gray-400"></span>
           <button id="force-cycle-btn"
                   class="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm font-medium"
-                  title="Run one paper-trade cycle now (dry-run, no live orders)">
+                  title="Run one paper-trade cycle now. Submits live to Alpaca paper unless Dry-run is checked.">
             Run one cycle now
           </button>
         </div>
@@ -996,11 +1010,28 @@
 
     // Force-cycle button: triggers one paper-trade cycle synchronously,
     // then refreshes all panels so the new decision row appears immediately.
-    // Defaults to dry_run=true so this can never accidentally fire a live order.
+    // Phase 35c: default is LIVE PAPER (dry_run=false). The checkbox lets
+    // the operator opt into a preview-only dry-run.
+    function updateForceCycleModeBadge() {
+      const dry = document.getElementById("force-cycle-dryrun").checked;
+      const badge = document.getElementById("force-cycle-mode");
+      if (!badge) return;
+      if (dry) {
+        badge.textContent = "DRY-RUN";
+        badge.className = "px-2 py-0.5 rounded text-xs font-semibold bg-yellow-700 text-yellow-100";
+      } else {
+        badge.textContent = "LIVE PAPER";
+        badge.className = "px-2 py-0.5 rounded text-xs font-semibold bg-green-700 text-green-100";
+      }
+    }
+    document.getElementById("force-cycle-dryrun").addEventListener("change", updateForceCycleModeBadge);
+    updateForceCycleModeBadge();
+
     async function forceCycle() {
       const btn = document.getElementById("force-cycle-btn");
       const status = document.getElementById("force-cycle-status");
       if (!btn) return;
+      const dryRun = document.getElementById("force-cycle-dryrun").checked;
       btn.disabled = true;
       const original = btn.textContent;
       btn.textContent = "Running...";
@@ -1008,7 +1039,7 @@
       status.className = "text-xs text-gray-400";
       try {
         const res = await Cockpit.api.post(
-          "/api/shadow/force-cycle?strategy=ensemble&dry_run=true",
+          `/api/shadow/force-cycle?strategy=ensemble&dry_run=${dryRun}`,
           null
         );
         if (!res.ok) {

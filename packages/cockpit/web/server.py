@@ -860,9 +860,13 @@ _FORCE_CYCLE_LOCK = asyncio.Lock()
 @app.post("/api/shadow/force-cycle")
 async def api_shadow_force_cycle(
     strategy: str = "ensemble",
-    dry_run: bool = True,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Run one paper-trade cycle synchronously and return the record.
+
+    Phase 35c: default flipped to ``dry_run=False`` so the cockpit's
+    primary mode is live Alpaca paper trading. Callers that still want
+    a dry-run preview can pass ``dry_run=true`` explicitly.
 
     Single-flight via a module-level lock so a user mashing the button
     doesn't kick off overlapping cycles. The response includes the new
@@ -2352,6 +2356,43 @@ def api_trading_stop() -> dict[str, Any]:
 @app.get("/api/trading/status")
 def api_trading_status() -> dict[str, Any]:
     return job_mgr.status(PAPER_LOOP_KIND).to_dict()
+
+
+@app.get("/api/trading/broker-health")
+async def api_trading_broker_health() -> dict[str, Any]:
+    """Phase 35c: report Alpaca paper-broker reachability + key presence.
+
+    Lets the UI show a clear status before the operator clicks "Start
+    loop" or "Run one cycle". Returns:
+
+    * ``keys_present`` — ALPACA_PAPER_KEY_ID and ALPACA_PAPER_SECRET set
+    * ``reachable``    — a GET /v2/account against the paper API returned 200
+    * ``base_url``     — the resolved paper-broker URL
+    * ``error``        — short string when unreachable (else ``None``)
+    """
+    key_id = os.environ.get("ALPACA_PAPER_KEY_ID", "")
+    secret = os.environ.get("ALPACA_PAPER_SECRET", "")
+    base_url = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+    keys_present = bool(key_id) and bool(secret)
+    reachable = False
+    error: str | None = None
+    if not keys_present:
+        error = "ALPACA_PAPER_KEY_ID / ALPACA_PAPER_SECRET not set in environment"
+    else:
+        try:
+            broker = AlpacaPaperBroker()
+            reachable = await broker.health()
+            if not reachable:
+                error = "Alpaca /v2/account returned non-200 — check keys / outage"
+        except Exception as exc:  # pragma: no cover — defensive
+            error = f"{exc.__class__.__name__}: {exc}"
+    return {
+        "ok": keys_present and reachable,
+        "keys_present": keys_present,
+        "reachable": reachable,
+        "base_url": base_url,
+        "error": error,
+    }
 
 
 @app.post("/api/trading/liquidate")

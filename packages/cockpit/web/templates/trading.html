@@ -88,20 +88,27 @@
           </select>
         </div>
         <div>
-          <label class="text-xs text-gray-400 block mb-1">Mode <span class="tt" data-tt="Dry-run is the safe default — signals are computed and logged but no orders are submitted.">?</span></label>
+          <label class="text-xs text-gray-400 block mb-1">Mode <span class="tt" data-tt="Phase 35c: live Alpaca paper trading is the primary mode. Check Dry-run only for preview cycles that log to the shadow ledger without submitting orders.">?</span></label>
           <label class="flex items-center gap-2 mt-2">
-            <input id="dry-run" type="checkbox" checked />
-            <span class="text-sm">Dry run (no real orders)</span>
+            <input id="dry-run" type="checkbox" />
+            <span class="text-sm">Dry run (preview only — no Alpaca orders)</span>
           </label>
+          <div class="mt-1">
+            <span id="mode-badge"
+                  class="inline-block px-2 py-0.5 rounded text-xs font-semibold bg-green-700 text-green-100">
+              LIVE PAPER (Alpaca)
+            </span>
+          </div>
         </div>
         <div class="flex gap-2 justify-end">
-          <button id="start-btn" class="btn btn-primary" data-tt="Begin a continuous trading loop. Default is dry-run for safety.">Start loop</button>
+          <button id="start-btn" class="btn btn-primary" data-tt="Begin a continuous trading loop. Default is LIVE PAPER — submits to your Alpaca paper account.">Start loop</button>
           <button id="stop-btn" class="btn btn-danger" data-tt="Stop the running loop. Open positions are not touched — use Flatten on the dashboard for that.">Stop loop</button>
         </div>
       </div>
-      <div class="mt-4 flex items-center gap-3">
+      <div class="mt-4 flex items-center gap-3 flex-wrap">
         <span id="status-pill" class="pill pill-gray">idle</span>
         <span id="status-meta" class="text-xs text-gray-400"></span>
+        <span id="broker-health" class="text-xs text-gray-400">Broker: checking...</span>
       </div>
     </section>
 
@@ -212,11 +219,52 @@
       } catch (e) { /* ignore */ }
     }
 
+    // Phase 35c: live-paper is now the default mode. Update the
+    // mode badge whenever the checkbox flips so the operator always
+    // sees which mode the Start button will use.
+    function updateModeBadge() {
+      const dry = document.getElementById('dry-run').checked;
+      const badge = document.getElementById('mode-badge');
+      if (!badge) return;
+      if (dry) {
+        badge.textContent = 'DRY-RUN (preview only)';
+        badge.className = 'inline-block px-2 py-0.5 rounded text-xs font-semibold bg-yellow-700 text-yellow-100';
+      } else {
+        badge.textContent = 'LIVE PAPER (Alpaca)';
+        badge.className = 'inline-block px-2 py-0.5 rounded text-xs font-semibold bg-green-700 text-green-100';
+      }
+    }
+    document.getElementById('dry-run').addEventListener('change', updateModeBadge);
+    updateModeBadge();
+
+    // Phase 35c: poll broker health so the user sees up-front whether
+    // Alpaca paper keys are loaded and the account is reachable.
+    async function refreshBrokerHealth() {
+      const el = document.getElementById('broker-health');
+      if (!el) return;
+      try {
+        const r = await fetch('/api/trading/broker-health');
+        const j = await r.json();
+        if (j.ok) {
+          el.textContent = `Broker: ✓ Alpaca paper reachable (${j.base_url})`;
+          el.className = 'text-xs text-green-400';
+        } else {
+          el.textContent = `Broker: ⚠ ${j.error || 'unreachable'}`;
+          el.className = 'text-xs text-red-400';
+        }
+      } catch (e) {
+        el.textContent = 'Broker: health-check failed';
+        el.className = 'text-xs text-red-400';
+      }
+    }
+    refreshBrokerHealth();
+    setInterval(refreshBrokerHealth, 60000);
+
     async function start() {
       const strategy = document.getElementById('strategy').value;
       const dryRun = document.getElementById('dry-run').checked;
       if (!dryRun) {
-        if (!confirm('Start LIVE paper-trading? Orders will be submitted to Alpaca paper account.')) return;
+        if (!confirm('Start LIVE paper-trading? Orders will be submitted to your Alpaca paper account.')) return;
       }
       try {
         await Cockpit.api.post('/api/trading/start', {strategy, dry_run: dryRun});
