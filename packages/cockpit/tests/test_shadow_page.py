@@ -30,7 +30,10 @@ def test_shadow_page_renders() -> None:
     r = client.get("/shadow")
     assert r.status_code == 200
     body = r.text
-    assert "Shadow Trading" in body
+    # Phase 36a renamed this surface from "Shadow Trading" to
+    # "Research — decision deep-dive" since live paper trading is now
+    # the primary mode and /shadow is the analytical/research view.
+    assert "Research" in body
     assert "/api/shadow/snapshot" in body
     assert "14" in body  # default days required
 

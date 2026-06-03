@@ -49,7 +49,7 @@
 
       <a href="/preflight" class="nav-link">Pre-flight</a>
       <a href="/promote" class="nav-link">Promote</a>
-      <a href="/shadow" class="nav-link">Shadow</a>
+      <a href="/shadow" class="nav-link" title="Research deep-dive (formerly Shadow). Reasoning/funnel/calibration for each cycle.">Research</a>
       <a href="/agents" class="nav-link">Agents</a>
       <a href="/models" class="nav-link">Models</a>
       <a href="/data-sources" class="nav-link">Data Sources</a>
@@ -109,6 +109,81 @@
         <span id="status-pill" class="pill pill-gray">idle</span>
         <span id="status-meta" class="text-xs text-gray-400"></span>
         <span id="broker-health" class="text-xs text-gray-400">Broker: checking...</span>
+        <div class="flex items-center gap-2 ml-auto">
+          <span id="force-cycle-status" class="text-xs text-gray-400"></span>
+          <button id="force-cycle-btn"
+                  class="btn btn-secondary btn-sm"
+                  data-tt="Run one paper-trade cycle right now. Uses the same LIVE PAPER / Dry-run mode as the Start loop button.">
+            Run one cycle now
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Phase 36a — Unified trading view. The cockpit's primary surface
+         joins Alpaca account state with the shadow decision ledger so the
+         operator sees one story per cycle instead of two parallel ones. -->
+    <section class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium">
+          Account &amp; signals
+          <span class="tt" data-tt="Phase 36a unified view: live Alpaca paper account on top, shadow decision context below. Refreshes every 15s.">?</span>
+        </div>
+        <span id="unified-meta" class="text-xs text-gray-500">Loading...</span>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+        <div class="bg-slate-800/60 rounded p-3">
+          <div class="text-xs text-gray-400">Equity</div>
+          <div id="u-equity" class="text-lg font-semibold">—</div>
+        </div>
+        <div class="bg-slate-800/60 rounded p-3">
+          <div class="text-xs text-gray-400">Buying power</div>
+          <div id="u-bp" class="text-lg font-semibold">—</div>
+        </div>
+        <div class="bg-slate-800/60 rounded p-3">
+          <div class="text-xs text-gray-400">Open positions</div>
+          <div id="u-positions" class="text-lg font-semibold">—</div>
+        </div>
+        <div class="bg-slate-800/60 rounded p-3">
+          <div class="text-xs text-gray-400">Soak window</div>
+          <div id="u-window" class="text-lg font-semibold">—</div>
+        </div>
+      </div>
+      <div class="mt-3 flex items-center gap-3 text-xs text-gray-400 flex-wrap">
+        <span>Streak: <span id="u-streak" class="text-gray-200">—</span></span>
+        <span>•</span>
+        <span>Cycles (last 5): <span id="u-cycles" class="text-gray-200">—</span></span>
+        <span>•</span>
+        <span>Last decision: <span id="u-last-dec" class="text-gray-200">—</span></span>
+      </div>
+    </section>
+
+    <!-- Phase 36a — Per-cycle decision context, embedded directly on the
+         trading page so the operator no longer has to flip to /shadow. -->
+    <section class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-medium">
+          Recent decisions
+          <span class="tt" data-tt="Per-cycle decision rows from the shadow ledger — candidates considered, regime, planned orders, halt reason. The reasoning behind each fill.">?</span>
+        </div>
+        <a href="/shadow" class="text-xs text-gray-400 hover:text-gray-200">Open full research view →</a>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-sm">
+          <thead>
+            <tr class="text-xs uppercase tracking-wider text-gray-500">
+              <th class="pb-2 pr-3">Time</th>
+              <th class="pb-2 pr-3">Strategy</th>
+              <th class="pb-2 pr-3">Regime</th>
+              <th class="pb-2 pr-3">Planned</th>
+              <th class="pb-2 pr-3">Submitted</th>
+              <th class="pb-2 pr-3">Status</th>
+            </tr>
+          </thead>
+          <tbody id="decisions-body">
+            <tr><td colspan="6" class="text-xs text-gray-500 py-3">Loading...</td></tr>
+          </tbody>
+        </table>
       </div>
     </section>
 
@@ -414,10 +489,119 @@
       loadMode();
       refreshTopbar();
       refreshCycles();
+      refreshUnified();
       Cockpit.poll(refreshStatus, 3000, { name: 'trading-status' });
       Cockpit.poll(refreshTopbar, 5000, { name: 'topbar' });
       Cockpit.poll(refreshCycles, 10000, { name: 'cycles' });
+      Cockpit.poll(refreshUnified, 15000, { name: 'unified' });
     });
+
+    // Phase 36a — unified snapshot fetcher. Joins Alpaca account state
+    // with the shadow decision ledger in one API call and renders both
+    // the summary cards and the per-cycle decisions table.
+    function fmtMoney(n) {
+      if (n === null || n === undefined || isNaN(n)) return '—';
+      return '$' + Number(n).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    }
+    async function refreshUnified() {
+      try {
+        const j = await Cockpit.api.get('/api/trading/unified-snapshot?decisions_limit=15');
+        // Account / equity / BP
+        const acct = j.account || {};
+        document.getElementById('u-equity').textContent = fmtMoney(acct.equity);
+        document.getElementById('u-bp').textContent = fmtMoney(acct.buying_power);
+        // Open positions count
+        const positions = j.positions || [];
+        document.getElementById('u-positions').textContent = positions.length;
+        // 14-day soak window
+        const win = j.window || {};
+        if (win.days_elapsed !== undefined) {
+          document.getElementById('u-window').textContent =
+            `Day ${win.days_elapsed}/${win.target_days || 14}`;
+        }
+        // Streak
+        const streak = j.streak || {};
+        document.getElementById('u-streak').textContent =
+          (streak.current_days !== undefined)
+            ? `${streak.current_days} clean days (longest ${streak.longest_days ?? '?'})`
+            : '—';
+        // Cycles summary
+        const cycles = j.cycles || [];
+        document.getElementById('u-cycles').textContent =
+          cycles.length ? `${cycles.length} recent` : 'none yet';
+        // Last decision timestamp
+        const decisions = j.decisions || [];
+        const last = decisions[0];
+        document.getElementById('u-last-dec').textContent =
+          last && last.ts ? new Date(last.ts).toLocaleTimeString() : 'none yet';
+        document.getElementById('unified-meta').textContent =
+          `Updated ${new Date().toLocaleTimeString()}`;
+        // Decisions table
+        const tbody = document.getElementById('decisions-body');
+        if (!decisions.length) {
+          tbody.innerHTML = '<tr><td colspan="6" class="text-xs text-gray-500 py-3">No decisions yet — start the loop or click Run one cycle now.</td></tr>';
+        } else {
+          tbody.innerHTML = decisions.map(d => {
+            const ts = d.ts ? new Date(d.ts).toLocaleTimeString() : '—';
+            const halted = d.halted;
+            const statusBadge = halted
+              ? `<span class="pill pill-yellow">halted</span>`
+              : (d.dry_run ? `<span class="pill pill-gray">dry-run</span>` : `<span class="pill pill-green">live</span>`);
+            return `<tr class="border-t border-slate-800">
+              <td class="py-2 pr-3 text-xs text-gray-300">${ts}</td>
+              <td class="py-2 pr-3">${d.strategy ?? '—'}</td>
+              <td class="py-2 pr-3 text-xs text-gray-400">${d.regime ?? '—'}</td>
+              <td class="py-2 pr-3">${d.orders_planned ?? 0}</td>
+              <td class="py-2 pr-3">${d.orders_submitted ?? 0}</td>
+              <td class="py-2 pr-3">${statusBadge}</td>
+            </tr>`;
+          }).join('');
+        }
+      } catch (e) {
+        document.getElementById('unified-meta').textContent = 'snapshot failed';
+      }
+    }
+
+    // Phase 36a — Force one cycle from the trading page. Reuses the
+    // dry-run checkbox so the operator's chosen mode is honored.
+    async function forceCycle() {
+      const btn = document.getElementById('force-cycle-btn');
+      const status = document.getElementById('force-cycle-status');
+      const dryRun = document.getElementById('dry-run').checked;
+      if (!dryRun) {
+        if (!confirm('Run one LIVE PAPER cycle now? Orders will be submitted to your Alpaca paper account.')) return;
+      }
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = 'Running...';
+      status.textContent = '';
+      try {
+        const res = await Cockpit.api.post(
+          `/api/shadow/force-cycle?strategy=ensemble&dry_run=${dryRun}`,
+          null
+        );
+        if (!res.ok) {
+          status.textContent = res.error || 'cycle failed';
+          status.className = 'text-xs text-red-400';
+        } else if (res.halted) {
+          status.textContent = `halted: ${(res.reasons || []).join(', ') || 'unknown'}`;
+          status.className = 'text-xs text-yellow-400';
+        } else {
+          status.textContent = `ok — planned ${res.planned}, submitted ${res.submitted}`;
+          status.className = 'text-xs text-green-400';
+        }
+        refreshUnified();
+        refreshCycles();
+      } catch (e) {
+        status.textContent = String(e.message || e);
+        status.className = 'text-xs text-red-400';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+        setTimeout(() => { if (!btn.disabled) status.textContent = ''; }, 10000);
+      }
+    }
+    document.getElementById('force-cycle-btn').addEventListener('click', forceCycle);
   </script>
 </body>
 </html>

@@ -2358,6 +2358,117 @@ def api_trading_status() -> dict[str, Any]:
     return job_mgr.status(PAPER_LOOP_KIND).to_dict()
 
 
+@app.get("/api/trading/unified-snapshot")
+async def api_trading_unified_snapshot(
+    decisions_limit: int = 10,
+) -> dict[str, Any]:
+    """Phase 36a — single payload joining Alpaca state + shadow context.
+
+    The cockpit's primary trading page should show one unified story
+    per cycle instead of forcing the operator to flip between /trading
+    and /shadow. This endpoint composes:
+
+    * ``account``     — latest Alpaca paper account snapshot (equity, BP)
+    * ``positions``   — currently open Alpaca paper positions
+    * ``broker``      — reachability + key presence (subset of broker-health)
+    * ``loop``        — paper_loop job status (running / stopped / crashed)
+    * ``cycles``      — last 5 paper-trade cycle records
+    * ``decisions``   — last N per-cycle shadow decisions (the *reasoning*)
+    * ``window``      — 14-day shadow window progress (day X of 14)
+    * ``streak``      — clean-paper-days streak counter
+
+    Each section is best-effort: if one source raises, we degrade that
+    field to ``None`` rather than failing the whole response, so the UI
+    can still render the panels that *do* have data.
+    """
+    out: dict[str, Any] = {
+        "account": None,
+        "positions": None,
+        "broker": None,
+        "loop": None,
+        "cycles": None,
+        "decisions": None,
+        "window": None,
+        "streak": None,
+        "errors": {},
+    }
+
+    # Alpaca account + positions (best-effort)
+    try:
+        out["account"] = latest_account_snapshot()
+    except Exception as exc:  # pragma: no cover — defensive
+        out["errors"]["account"] = f"{exc.__class__.__name__}: {exc}"
+    try:
+        out["positions"] = latest_positions()
+    except Exception as exc:  # pragma: no cover
+        out["errors"]["positions"] = f"{exc.__class__.__name__}: {exc}"
+
+    # Broker health (subset of /api/trading/broker-health)
+    try:
+        key_id = os.environ.get("ALPACA_PAPER_KEY_ID", "")
+        secret = os.environ.get("ALPACA_PAPER_SECRET", "")
+        base_url = os.environ.get(
+            "ALPACA_BASE_URL", "https://paper-api.alpaca.markets"
+        )
+        keys_present = bool(key_id) and bool(secret)
+        reachable = False
+        if keys_present:
+            try:
+                reachable = await AlpacaPaperBroker().health()
+            except Exception:
+                reachable = False
+        out["broker"] = {
+            "keys_present": keys_present,
+            "reachable": reachable,
+            "base_url": base_url,
+        }
+    except Exception as exc:  # pragma: no cover
+        out["errors"]["broker"] = f"{exc.__class__.__name__}: {exc}"
+
+    # Paper-loop job status
+    try:
+        out["loop"] = job_mgr.status(PAPER_LOOP_KIND).to_dict()
+    except Exception as exc:  # pragma: no cover
+        out["errors"]["loop"] = f"{exc.__class__.__name__}: {exc}"
+
+    # Recent shadow decisions (the per-cycle reasoning ledger). This is
+    # what makes the unified view valuable — each fill is paired with
+    # the candidate funnel + scoring that produced it.
+    try:
+        from packages.paper.decisions import load_recent
+
+        n = max(1, min(int(decisions_limit), 50))
+        out["decisions"] = load_recent(limit=n)
+    except Exception as exc:
+        out["errors"]["decisions"] = f"{exc.__class__.__name__}: {exc}"
+
+    # 14-day shadow window progress (day X of 14 counter for soak gating)
+    try:
+        from packages.paper.decisions import window_status
+
+        out["window"] = window_status()
+    except Exception as exc:
+        out["errors"]["window"] = f"{exc.__class__.__name__}: {exc}"
+
+    # Clean-paper-days streak
+    try:
+        out["streak"] = compute_paper_streak(PAPER_LOG).to_dict()
+    except Exception as exc:  # pragma: no cover
+        out["errors"]["streak"] = f"{exc.__class__.__name__}: {exc}"
+
+    # Last 5 paper-trade cycle records (from runs.jsonl)
+    try:
+        from packages.paper import iter_paper_runs
+
+        rows = list(iter_paper_runs())
+        rows.reverse()
+        out["cycles"] = rows[:5]
+    except Exception as exc:
+        out["errors"]["cycles"] = f"{exc.__class__.__name__}: {exc}"
+
+    return out
+
+
 @app.get("/api/trading/broker-health")
 async def api_trading_broker_health() -> dict[str, Any]:
     """Phase 35c: report Alpaca paper-broker reachability + key presence.

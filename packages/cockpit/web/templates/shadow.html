@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Shadow Trading · The Seer</title>
+  <title>Research · The Seer</title>
   {% include "_head_icons.html" %}
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="/static/cockpit.css" />
@@ -112,7 +112,7 @@
       <a href="/" class="nav-link">Dashboard</a>
       <a href="/trading" class="nav-link">Trading</a>
       <a href="/preflight" class="nav-link">Pre-flight</a>
-      <a href="/shadow" class="nav-link nav-active">Shadow</a>
+      <a href="/shadow" class="nav-link nav-active" title="Research deep-dive (formerly Shadow). Reasoning/funnel/calibration per cycle.">Research</a>
       <a href="/autopilot" class="nav-link">Autopilot</a>
       <a href="/agents" class="nav-link">Agents</a>
       <a href="/models" class="nav-link">Models</a>
@@ -121,7 +121,10 @@
       <a href="/settings" class="nav-link">Settings</a>
     </nav>
 
-    <h1 class="text-2xl font-semibold mb-2">Shadow Trading</h1>
+    <h1 class="text-2xl font-semibold mb-2">Research — decision deep-dive</h1>
+    <p class="text-xs text-gray-500 mb-4">
+      Phase 36a: this page is now the research surface. Live trading is on <a href="/trading" class="underline hover:text-gray-300">/trading</a>; this page shows the funnel, calibration, and per-cycle reasoning behind every decision — including the ones that didn't fill.
+    </p>
     <p class="text-gray-400 text-sm mb-6">
       Decision instrumentation + simulated PnL for the paper-trade loop.
       The system auto-greenlights for live capital after
