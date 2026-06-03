@@ -40,6 +40,37 @@ class OrderAck:
 
 
 @dataclass(frozen=True)
+class BracketOrderRequest:
+    """Phase 35 — broker-side OCO bracket order.
+
+    Submitted as a single ``order_class=bracket`` parent order so the
+    exchange itself triggers the take-profit limit OR the stop-loss
+    leg at machine speed — we don't need our 60s fast loop in the
+    loop for these exits. The two child legs are mutually exclusive
+    (one cancels the other when filled).
+
+    ``take_profit_price`` and ``stop_loss_stop_price`` are absolute
+    dollar prices, not percent offsets. The caller is responsible for
+    deriving them from the entry price + exit thresholds (see
+    ``tools/paper_trade.py``).
+
+    ``stop_loss_limit_price`` is optional — when set, the stop leg
+    becomes a stop-limit instead of a stop-market. Useful in fast
+    moves to avoid getting filled at a price worse than the limit.
+    """
+
+    symbol: str
+    side: str  # parent order side — typically "buy"
+    qty: float
+    take_profit_price: float
+    stop_loss_stop_price: float
+    stop_loss_limit_price: float | None = None
+    type: str = "market"  # parent order type
+    limit_price: float | None = None  # required when type == "limit"
+    time_in_force: str = "day"
+
+
+@dataclass(frozen=True)
 class BrokerPosition:
     symbol: str
     qty: float
@@ -157,6 +188,62 @@ class AlpacaPaperBroker(Broker):
                 except (KeyError, ValueError, TypeError):
                     continue
             return out
+
+    async def submit_bracket(self, req: BracketOrderRequest) -> OrderAck:
+        """Phase 35 — submit a parent order with attached OCO bracket.
+
+        Alpaca supports ``order_class=bracket`` natively: the parent
+        order fills first, then the broker arms both child legs
+        (take-profit limit + stop-loss). Whichever fills first cancels
+        the other. Exits run at exchange speed independent of our loop.
+
+        We treat all bracket prices as 2-decimal stock-equity prices,
+        matching Alpaca's tick-size requirements.
+        """
+        client_order_id = str(uuid4())
+        # Alpaca's stock equities require <= 2 decimal places for prices.
+        def _px(p: float | None) -> str | None:
+            if p is None:
+                return None
+            return f"{float(p):.2f}"
+
+        take_profit_leg = {"limit_price": _px(req.take_profit_price)}
+        stop_loss_leg: dict[str, Any] = {
+            "stop_price": _px(req.stop_loss_stop_price),
+        }
+        if req.stop_loss_limit_price is not None:
+            stop_loss_leg["limit_price"] = _px(req.stop_loss_limit_price)
+
+        body: dict[str, Any] = {
+            "symbol": req.symbol,
+            "qty": str(req.qty),
+            "side": req.side,
+            "type": req.type,
+            "time_in_force": req.time_in_force,
+            "order_class": "bracket",
+            "take_profit": take_profit_leg,
+            "stop_loss": stop_loss_leg,
+            "client_order_id": client_order_id,
+        }
+        if req.type == "limit":
+            body["limit_price"] = _px(req.limit_price)
+
+        with span(
+            "broker.alpaca.submit_bracket",
+            {"symbol": req.symbol, "side": req.side, "qty": req.qty},
+        ):
+            r = await self._client.post(f"{self.base_url}/v2/orders", json=body)
+            if r.status_code >= 300:
+                raise BrokerError(
+                    f"alpaca bracket {r.status_code}: {r.text[:200]}"
+                )
+            data: dict[str, Any] = r.json()
+            return OrderAck(
+                broker=self.name,
+                broker_order_id=data["id"],
+                status=data.get("status", "unknown"),
+                submitted_at=data.get("submitted_at", ""),
+            )
 
     async def liquidate_all(self, cancel_orders: bool = True) -> dict[str, Any]:
         """Cancel open orders and close every open position at market.

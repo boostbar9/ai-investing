@@ -131,6 +131,22 @@ class AutonomyConfig:
     fast_loop_seconds: int = int(
         os.environ.get("AUTONOMY_FAST_LOOP_S") or 60
     )
+    # Phase 35 — adaptive cadence. When any open position is "hot"
+    # (peak >= trail_arm_pct), fire the next fast tick after this many
+    # seconds instead of ``fast_loop_seconds``. Closer to the wire =
+    # faster profit-take/trailing-stop execution. 10s is roughly the
+    # round-trip cost of a paper-Alpaca quote + exit decision, leaving
+    # plenty of headroom under the API rate limits.
+    fast_loop_hot_seconds: int = int(
+        os.environ.get("AUTONOMY_FAST_LOOP_HOT_S") or 10
+    )
+
+
+# Phase 35 — autonomy watchdog threshold (module-level so curiosity
+# can import it without pulling the whole config object). If the most
+# recent fast-tick heartbeat is older than this during market hours,
+# something has stalled the loop and curiosity should narrate it.
+FAST_LOOP_STALE_S: int = 300
 
 
 @dataclass
@@ -162,6 +178,14 @@ class AutonomyState:
     last_fast_tick_dip: dict[str, Any] | None = None
     # Phase 28-R step 2 — last EOD-flatten result.
     last_fast_tick_eod_flatten: dict[str, Any] | None = None
+    # Phase 35 — hot-position flag drives adaptive fast-loop cadence.
+    # Set True when any open position's peak >= trail_arm_pct so the
+    # next fast tick fires in ``fast_loop_hot_seconds`` instead of
+    # ``fast_loop_seconds``. Reset by run_tick every cycle.
+    any_position_hot: bool = False
+    # Phase 35 — autonomy watchdog: ISO ts of the last successful
+    # fast tick. Stale > FAST_LOOP_STALE_S during market hours → alert.
+    last_fast_tick_heartbeat_at: str | None = None
 
 
 # Module-level singleton. The cockpit owns at most one autonomy loop.
@@ -582,6 +606,9 @@ async def run_fast_tick() -> dict[str, Any]:
     STATE.last_fast_tick_dip = dip_result
     STATE.last_fast_tick_eod_flatten = eod_flatten_result
     STATE.last_fast_tick_status = "ok"
+    # Phase 35 — watchdog heartbeat. Curiosity inspects this to detect
+    # a stalled fast loop and narrate the blocker.
+    STATE.last_fast_tick_heartbeat_at = now_iso
     return {
         "skipped": False,
         "ok": True,
@@ -930,8 +957,16 @@ async def _fast_loop() -> None:  # pragma: no cover — exercised via run_fast_t
             backoff = min(backoff * 2, 600)
             await asyncio.sleep(backoff)
             continue
+        # Phase 35 — adaptive cadence. exit_rules.run_tick() sets the
+        # any_position_hot flag whenever any open position's peak has
+        # crossed trail_arm_pct. When hot, we drop the interval from
+        # 60s to ~10s so a profit-take or trailing-stop fires within a
+        # tick of the spike instead of waiting up to a minute.
+        hot = bool(STATE.any_position_hot)
+        hot_interval = max(1, int(cfg.fast_loop_hot_seconds or 0)) if hot else 0
+        effective_interval = hot_interval if (hot and hot_interval > 0) else interval
         try:
-            await asyncio.sleep(interval)
+            await asyncio.sleep(effective_interval)
         except asyncio.CancelledError:
             raise
 
@@ -1036,4 +1071,7 @@ def reset_for_tests() -> None:
     STATE.last_fast_tick_exit = None
     STATE.last_fast_tick_dip = None
     STATE.last_fast_tick_eod_flatten = None
+    # Phase 35 fields.
+    STATE.any_position_hot = False
+    STATE.last_fast_tick_heartbeat_at = None
     STATE._config = AutonomyConfig()

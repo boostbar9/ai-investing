@@ -44,6 +44,7 @@ from packages.execution.broker import (
     BrokerError,
     OrderRequest,
 )
+from packages.execution.bracket_attach import attach_bracket_after_entry
 from packages.paper.streak import compute_paper_streak
 from packages.persistence import connect as _db_connect
 from packages.persistence import insert_cycle as _db_insert_cycle
@@ -1347,7 +1348,21 @@ async def run(
 
         submitted = []
         errors = []
+        # Phase 35 — collect bracket-attach results per entry for the
+        # cycle audit record. Each row gets the outcome of
+        # ``attach_bracket_after_entry`` so the operator can see whether
+        # the broker-side OCO armed for every long.
+        brackets_attached: list[dict[str, Any]] = []
         if not dry_run:
+            # Resolve active exit thresholds ONCE per cycle so every
+            # entry's bracket uses the same policy snapshot.
+            try:
+                from packages.cockpit.web.exit_rules import (
+                    current_thresholds as _exit_thresholds,
+                )
+                _bracket_th = _exit_thresholds()
+            except Exception:  # pragma: no cover — defensive
+                _bracket_th = None
             for po in planned:
                 try:
                     req = OrderRequest(
@@ -1366,6 +1381,45 @@ async def run(
                         "status": ack.status,
                     })
                     log.info("submitted %s %s %.4f -> %s", po.side, po.symbol, po.qty, ack.status)
+                    # Phase 35 — attach OCO bracket on successful long
+                    # entries so exits run at exchange speed even if
+                    # our loop hangs. Best-effort: any failure here
+                    # must never unwind the parent fill.
+                    if (
+                        _bracket_th is not None
+                        and not _bracket_th.is_off()
+                        and po.side == "buy"
+                        and po.last_price
+                    ):
+                        try:
+                            br = await attach_bracket_after_entry(
+                                broker=broker,
+                                symbol=po.symbol,
+                                qty=po.qty,
+                                side=po.side,
+                                entry_price=float(po.last_price),
+                                take_profit_pct=_bracket_th.take_profit_pct,
+                                hard_stop_pct=_bracket_th.hard_stop_pct,
+                            )
+                        except Exception as bx:  # pragma: no cover
+                            log.warning(
+                                "bracket attach unexpectedly raised for %s: %s",
+                                po.symbol,
+                                bx,
+                            )
+                            br = {
+                                "attached": False,
+                                "reason": "exception",
+                                "error": str(bx)[:200],
+                            }
+                        brackets_attached.append({"symbol": po.symbol, **br})
+                        if br.get("attached"):
+                            log.info(
+                                "bracket armed %s tp=%.2f sl=%.2f",
+                                po.symbol,
+                                br.get("take_profit_price", 0.0),
+                                br.get("stop_loss_stop_price", 0.0),
+                            )
                 except BrokerError as e:
                     log.warning("order failed %s %s: %s", po.side, po.symbol, e)
                     errors.append({"symbol": po.symbol, "side": po.side, "error": str(e)})
@@ -1388,6 +1442,8 @@ async def run(
             ],
             "orders_submitted": submitted,
             "errors": errors,
+            # Phase 35 — per-entry OCO bracket attach outcomes.
+            "brackets_attached": brackets_attached,
             "agent_decision_id": str(agent_result.decision_id),
             "agent_sentiment": agent_result.research.sentiment,
             "agent_regime": _live_regime,

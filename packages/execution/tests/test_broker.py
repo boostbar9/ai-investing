@@ -285,3 +285,118 @@ def test_base_url_strips_trailing_v2(monkeypatch):
         monkeypatch.setenv("ALPACA_BASE_URL", raw)
         b = AlpacaPaperBroker()
         assert b.base_url == "https://paper-api.alpaca.markets", f"failed for {raw!r}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 35 — bracket OCO submission
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_alpaca_submit_bracket_sends_oco_payload():
+    """submit_bracket POSTs order_class=bracket with both legs populated."""
+    from packages.execution.broker import BracketOrderRequest
+
+    captured: dict[str, object] = {}
+
+    class _T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.method == "POST" and request.url.path.endswith("/v2/orders"):
+                captured["body"] = json.loads(request.content.decode())
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "br-1",
+                        "status": "accepted",
+                        "submitted_at": "2026-06-03T14:30:00Z",
+                    },
+                )
+            return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=_T(), base_url="http://x")
+    broker = AlpacaPaperBroker(key_id="k", secret="s", base_url="http://x", client=client)
+    try:
+        req = BracketOrderRequest(
+            symbol="AAPL",
+            side="buy",
+            qty=10,
+            take_profit_price=210.50,
+            stop_loss_stop_price=190.25,
+            stop_loss_limit_price=189.50,
+        )
+        ack = await broker.submit_bracket(req)
+        assert ack.broker_order_id == "br-1"
+        body = captured["body"]
+        assert isinstance(body, dict)
+        assert body["order_class"] == "bracket"
+        assert body["symbol"] == "AAPL"
+        assert body["qty"] == "10"
+        assert body["side"] == "buy"
+        # Both legs serialised with 2-decimal Alpaca prices.
+        assert body["take_profit"] == {"limit_price": "210.50"}
+        assert body["stop_loss"]["stop_price"] == "190.25"
+        assert body["stop_loss"]["limit_price"] == "189.50"
+        # bracket parents default to market.
+        assert body["type"] == "market"
+    finally:
+        await broker.aclose()
+
+
+@pytest.mark.asyncio
+async def test_alpaca_submit_bracket_omits_stop_limit_when_none():
+    """When stop_loss_limit_price is None the leg becomes a plain stop."""
+    from packages.execution.broker import BracketOrderRequest
+
+    captured: dict[str, object] = {}
+
+    class _T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content.decode())
+            return httpx.Response(
+                200, json={"id": "br-2", "status": "accepted", "submitted_at": ""}
+            )
+
+    client = httpx.AsyncClient(transport=_T(), base_url="http://x")
+    broker = AlpacaPaperBroker(key_id="k", secret="s", base_url="http://x", client=client)
+    try:
+        await broker.submit_bracket(
+            BracketOrderRequest(
+                symbol="MSFT",
+                side="buy",
+                qty=5,
+                take_profit_price=420.0,
+                stop_loss_stop_price=400.0,
+            )
+        )
+        body = captured["body"]
+        assert isinstance(body, dict)
+        assert body["stop_loss"] == {"stop_price": "400.00"}
+        assert "limit_price" not in body["stop_loss"]
+    finally:
+        await broker.aclose()
+
+
+@pytest.mark.asyncio
+async def test_alpaca_submit_bracket_raises_on_http_error():
+    """4xx / 5xx from Alpaca surface as BrokerError so callers can audit."""
+    from packages.execution.broker import BracketOrderRequest
+
+    class _T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(422, json={"error": "qty_too_small"})
+
+    client = httpx.AsyncClient(transport=_T(), base_url="http://x")
+    broker = AlpacaPaperBroker(key_id="k", secret="s", base_url="http://x", client=client)
+    try:
+        with pytest.raises(BrokerError):
+            await broker.submit_bracket(
+                BracketOrderRequest(
+                    symbol="AAPL",
+                    side="buy",
+                    qty=1,
+                    take_profit_price=200.0,
+                    stop_loss_stop_price=180.0,
+                )
+            )
+    finally:
+        await broker.aclose()

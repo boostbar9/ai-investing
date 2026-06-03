@@ -58,6 +58,14 @@ WATCHLIST_STALE_S = 2 * 60 * 60  # 2 hours
 # relaxations until the operator resets via the cockpit.
 MAX_CUMULATIVE_RELAXATION = 0.30
 
+# Phase 35 — fast-loop watchdog. If the cockpit's price-sensitive
+# heartbeat is older than this during market hours the loop has stalled
+# (e.g. a transport hang) and curiosity should narrate a blocker so the
+# operator sees the stall instead of silent inaction. Mirrors
+# ``packages.cockpit.web.autonomy.FAST_LOOP_STALE_S`` so the two
+# definitions stay in lockstep.
+FAST_LOOP_STALE_S: int = 300
+
 # Default action log path. Overridable for tests.
 _DEFAULT_ACTION_LOG = Path("data") / "learning" / "curiosity_actions.jsonl"
 
@@ -117,6 +125,18 @@ class CuriosityInput:
     """Seconds since the last non-warming-up reflection. Long stretches
     of "warming up" trigger narrate_blockers."""
 
+    last_fast_tick_age_s: float | None = None
+    """Phase 35 — seconds since the last successful fast-tick heartbeat.
+    ``None`` means we have no signal (loop disabled or never started),
+    which the watchdog treats as benign. Anything above
+    ``FAST_LOOP_STALE_S`` during market hours triggers a high-priority
+    narrate_blockers so the operator sees the stall."""
+
+    market_open: bool = True
+    """Phase 35 — whether the US equity market is open right now. The
+    watchdog only fires during market hours — a stale heartbeat
+    overnight is expected behaviour, not a stall."""
+
 
 def _resolved_log() -> Path:
     """Resolve the action log path lazily so tests can isolate."""
@@ -143,6 +163,32 @@ def decide(state: CuriosityInput, *, rng: random.Random | None = None) -> Curios
     responsible for honouring (or vetoing) the returned action.
     """
     r = rng or random.Random()
+
+    # 0. Phase 35 — fast-loop watchdog. Highest priority because if the
+    # price-sensitive loop has stalled we can't trust any of the other
+    # signals (idle streak, watchlist age) to mean what they normally
+    # mean. Only fires during market hours; an overnight stale heart
+    # beat is expected.
+    if (
+        state.market_open
+        and state.last_fast_tick_age_s is not None
+        and state.last_fast_tick_age_s >= FAST_LOOP_STALE_S
+    ):
+        return CuriosityAction(
+            kind="narrate_blockers",
+            rationale=(
+                "fast loop heartbeat stale for "
+                f"{state.last_fast_tick_age_s / 60:.1f} min during market "
+                "hours; exit-rules and dip-watch may be wedged"
+            ),
+            payload={
+                "reason": "fast_loop_stale",
+                "last_fast_tick_age_s": round(
+                    float(state.last_fast_tick_age_s), 2
+                ),
+                "threshold_s": FAST_LOOP_STALE_S,
+            },
+        )
 
     # 1. Stale watchlist -> wildcard scan.
     if state.watchlist_age_s >= WATCHLIST_STALE_S and state.wildcard_pool:

@@ -93,7 +93,9 @@ def test_take_profit_does_not_fire_below_threshold(
     tmp_peaks: exit_rules._PeakStore,
 ) -> None:
     th = _th(take_profit=0.03)
-    d = exit_rules.evaluate_position("AAPL", 0.028, th, peaks=tmp_peaks)
+    # +1.8% is below both take_profit AND trail_arm (default 0.02) so
+    # neither full exit nor Phase 35 scale_out fires.
+    d = exit_rules.evaluate_position("AAPL", 0.018, th, peaks=tmp_peaks)
     assert d.action == "hold"
 
 
@@ -114,15 +116,23 @@ def test_hard_stop_does_not_fire_on_minor_loss(
 
 def test_trailing_stop_armed_then_fires(tmp_peaks: exit_rules._PeakStore) -> None:
     th = _th(take_profit=0.10, arm=0.02, giveback=0.012)
-    # Climb: peak set to +2.5%
-    d1 = exit_rules.evaluate_position("AAPL", 0.025, th, peaks=tmp_peaks)
+    # Climb: peak set to +2.5%. With Phase 35 scale-out, the FIRST tick
+    # past the arm threshold fires a partial exit. Suppress that here
+    # via already_scaled_out=True so we can isolate the trailing-stop
+    # path (scale-out has its own dedicated tests below).
+    d1 = exit_rules.evaluate_position(
+        "AAPL", 0.025, th, peaks=tmp_peaks, already_scaled_out=True
+    )
     assert d1.action == "hold"
     assert d1.peak_pct == 0.025
     # Pullback: down to +1.2% — giveback = 0.013 ≥ 0.012 → SELL
-    d2 = exit_rules.evaluate_position("AAPL", 0.012, th, peaks=tmp_peaks)
+    d2 = exit_rules.evaluate_position(
+        "AAPL", 0.012, th, peaks=tmp_peaks, already_scaled_out=True
+    )
     assert d2.action == "sell"
     assert d2.reason == "trailing_stop"
     assert d2.peak_pct == 0.025  # peak preserved
+    assert d2.qty_fraction == 1.0  # full exit, not partial
 
 
 def test_trailing_stop_not_armed_below_arm_level(
@@ -472,3 +482,225 @@ def test_peak_store_weekend_rollover_resets(tmp_path: Path) -> None:
 
     clock.now = _et_dt(2026, 6, 8, 9, 30)  # Monday open
     assert store.get("AMZN") == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Phase 35 — scale-out partial exits + adaptive hot flag
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tmp_scaleout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> exit_rules._ScaleOutStore:
+    """Fresh scale-out store backed by a tmp file. Patches the singleton
+    so run_tick uses the isolated copy too."""
+    store = exit_rules._ScaleOutStore(path=tmp_path / "scaleout.json")
+    monkeypatch.setattr(exit_rules, "SCALED_OUT", store)
+    return store
+
+
+def test_scale_out_fires_first_time_peak_crosses_arm(
+    tmp_peaks: exit_rules._PeakStore, tmp_scaleout: exit_rules._ScaleOutStore
+) -> None:
+    """First tick at or above trail_arm_pct with take_profit above arm
+    triggers a scale_out partial sell."""
+    th = _th(take_profit=0.05, arm=0.02, giveback=0.012)
+    d = exit_rules.evaluate_position("AAPL", 0.022, th, peaks=tmp_peaks)
+    assert d.action == "sell"
+    assert d.reason == "scale_out"
+    assert d.qty_fraction == exit_rules.SCALE_OUT_FRACTION
+    assert d.qty_fraction == pytest.approx(0.5)
+
+
+def test_scale_out_does_not_repeat_when_already_scaled(
+    tmp_peaks: exit_rules._PeakStore,
+) -> None:
+    """already_scaled_out=True suppresses the partial exit branch."""
+    th = _th(take_profit=0.05, arm=0.02, giveback=0.012)
+    d = exit_rules.evaluate_position(
+        "AAPL", 0.022, th, peaks=tmp_peaks, already_scaled_out=True
+    )
+    assert d.action == "hold"
+    assert d.reason == "hold"
+
+
+def test_scale_out_suppressed_when_take_profit_at_or_below_arm(
+    tmp_peaks: exit_rules._PeakStore,
+) -> None:
+    """When take_profit <= arm the full-exit branch handles it; no partial."""
+    # arm == take_profit: the take_profit branch claims pnl=0.02 first.
+    th = _th(take_profit=0.02, arm=0.02, giveback=0.005)
+    d = exit_rules.evaluate_position("AAPL", 0.022, th, peaks=tmp_peaks)
+    assert d.action == "sell"
+    assert d.reason == "take_profit"
+
+
+def test_trailing_stop_still_fires_after_scale_out(
+    tmp_peaks: exit_rules._PeakStore,
+) -> None:
+    """After a scale-out the trailing stop must still trigger on giveback."""
+    th = _th(take_profit=0.10, arm=0.02, giveback=0.012)
+    # Establish a peak above arm via the scale-out tick.
+    d1 = exit_rules.evaluate_position("AAPL", 0.025, th, peaks=tmp_peaks)
+    assert d1.reason == "scale_out"
+    # Now pretend the partial fired (caller would call SCALED_OUT.add).
+    # Pullback to +1.2% — giveback 0.013 >= 0.012 triggers trailing.
+    d2 = exit_rules.evaluate_position(
+        "AAPL", 0.012, th, peaks=tmp_peaks, already_scaled_out=True
+    )
+    assert d2.action == "sell"
+    assert d2.reason == "trailing_stop"
+    assert d2.qty_fraction == 1.0
+
+
+def test_run_tick_executes_scale_out_partial_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_tick should:
+      * sell only HALF the position when scale_out triggers,
+      * record SCALED_OUT for that symbol,
+      * keep the peak (position is still open).
+    """
+    peaks = exit_rules._PeakStore(path=tmp_path / "p.json")
+    scaleout = exit_rules._ScaleOutStore(path=tmp_path / "s.json")
+    monkeypatch.setattr(exit_rules, "PEAKS", peaks)
+    monkeypatch.setattr(exit_rules, "SCALED_OUT", scaleout)
+    monkeypatch.setattr(exit_rules, "EXIT_AUDIT_PATH", tmp_path / "audit.jsonl")
+
+    sells: list[tuple[str, float]] = []
+
+    async def _positions():
+        # 10 shares, +2.2% PnL — past arm but below take_profit (0.05).
+        return [_FakePos("AAPL", qty=10, pnl_pct=0.022, last_price=102.2)]
+
+    async def _submit(symbol: str, qty: float):
+        sells.append((symbol, qty))
+
+        class _Ack:
+            broker_order_id = "ack-1"
+
+        return _Ack()
+
+    th = _th(take_profit=0.05, arm=0.02, giveback=0.012)
+    r = asyncio.run(
+        exit_rules.run_tick(
+            positions_getter=_positions, submit_sell=_submit, thresholds=th
+        )
+    )
+    assert r.sells_triggered == 1
+    assert r.sells_executed == 1
+    # Whole-share floor of 10 * 0.5 = 5 shares.
+    assert sells == [("AAPL", 5.0)]
+    # Position is STILL open — peak preserved, scale-out marker set.
+    assert "AAPL" in peaks.snapshot()
+    assert "AAPL" in scaleout.snapshot()
+
+
+def test_run_tick_skips_scale_out_when_floor_would_be_full_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Single-share positions: floor(1 * 0.5) == 0 → bumped to 1 → would
+    be a full exit. The partial is skipped so the trail logic still runs."""
+    peaks = exit_rules._PeakStore(path=tmp_path / "p.json")
+    scaleout = exit_rules._ScaleOutStore(path=tmp_path / "s.json")
+    monkeypatch.setattr(exit_rules, "PEAKS", peaks)
+    monkeypatch.setattr(exit_rules, "SCALED_OUT", scaleout)
+    monkeypatch.setattr(exit_rules, "EXIT_AUDIT_PATH", tmp_path / "audit.jsonl")
+
+    sells: list[tuple[str, float]] = []
+
+    async def _positions():
+        return [_FakePos("ZZZ", qty=1, pnl_pct=0.022, last_price=10.0)]
+
+    async def _submit(symbol: str, qty: float):
+        sells.append((symbol, qty))
+
+        class _Ack:
+            broker_order_id = "x"
+
+        return _Ack()
+
+    th = _th(take_profit=0.05, arm=0.02, giveback=0.012)
+    r = asyncio.run(
+        exit_rules.run_tick(
+            positions_getter=_positions, submit_sell=_submit, thresholds=th
+        )
+    )
+    # Triggered but skipped (no actual sell), so executed stays 0.
+    assert r.sells_triggered == 1
+    assert sells == []
+    # And the scale-out marker is NOT set — we'll try again next tick.
+    assert "ZZZ" not in scaleout.snapshot()
+
+
+def test_run_tick_sets_any_position_hot_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When any position's peak >= arm, autonomy.STATE.any_position_hot
+    becomes True so the fast loop drops to its hot cadence."""
+    from packages.cockpit.web import autonomy
+
+    autonomy.STATE.any_position_hot = False
+    peaks = exit_rules._PeakStore(path=tmp_path / "p.json")
+    scaleout = exit_rules._ScaleOutStore(path=tmp_path / "s.json")
+    monkeypatch.setattr(exit_rules, "PEAKS", peaks)
+    monkeypatch.setattr(exit_rules, "SCALED_OUT", scaleout)
+    monkeypatch.setattr(exit_rules, "EXIT_AUDIT_PATH", tmp_path / "audit.jsonl")
+
+    async def _positions():
+        return [_FakePos("AAPL", qty=10, pnl_pct=0.025, last_price=102.5)]
+
+    th = _th(take_profit=0.10, arm=0.02, giveback=0.012)
+    asyncio.run(
+        exit_rules.run_tick(
+            positions_getter=_positions, submit_sell=None, thresholds=th
+        )
+    )
+    assert autonomy.STATE.any_position_hot is True
+    # Reset for downstream tests.
+    autonomy.STATE.any_position_hot = False
+
+
+def test_run_tick_clears_hot_flag_when_no_position_armed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All positions below arm → flag reset to False even if it was True."""
+    from packages.cockpit.web import autonomy
+
+    autonomy.STATE.any_position_hot = True
+    peaks = exit_rules._PeakStore(path=tmp_path / "p.json")
+    scaleout = exit_rules._ScaleOutStore(path=tmp_path / "s.json")
+    monkeypatch.setattr(exit_rules, "PEAKS", peaks)
+    monkeypatch.setattr(exit_rules, "SCALED_OUT", scaleout)
+    monkeypatch.setattr(exit_rules, "EXIT_AUDIT_PATH", tmp_path / "audit.jsonl")
+
+    async def _positions():
+        return [_FakePos("AAPL", qty=10, pnl_pct=0.005, last_price=100.5)]
+
+    th = _th(take_profit=0.10, arm=0.02, giveback=0.012)
+    asyncio.run(
+        exit_rules.run_tick(
+            positions_getter=_positions, submit_sell=None, thresholds=th
+        )
+    )
+    assert autonomy.STATE.any_position_hot is False
+
+
+# ---- _ScaleOutStore persistence -------------------------------------------
+
+
+def test_scale_out_store_persists_across_instances(tmp_path: Path) -> None:
+    p = tmp_path / "s.json"
+    s1 = exit_rules._ScaleOutStore(path=p)
+    s1.add("AAPL")
+    assert s1.contains("AAPL")
+
+    s2 = exit_rules._ScaleOutStore(path=p)
+    assert s2.contains("AAPL")
+
+
+def test_scale_out_store_reset_session_clears(tmp_path: Path) -> None:
+    s = exit_rules._ScaleOutStore(path=tmp_path / "s.json")
+    s.add("AAPL")
+    s.add("MSFT")
+    s.reset_session()
+    assert s.snapshot() == []

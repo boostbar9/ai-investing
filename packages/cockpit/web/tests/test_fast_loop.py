@@ -348,3 +348,82 @@ async def test_slow_loop_skips_phase25_when_market_closed(
     assert out["exit_rules"] is None
     assert out["dip_watch"] is None
     assert fired["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 35 — adaptive cadence + watchdog heartbeat
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_fast_tick_writes_heartbeat_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fast tick must stamp last_fast_tick_heartbeat_at on success
+    so the curiosity watchdog can detect a stalled loop."""
+    _force_market_open(monkeypatch, open_=True)
+    monkeypatch.setattr(autonomy, "_default_pause_check", lambda: False)
+
+    async def exit_hook() -> dict[str, Any]:
+        return {"ok": True}
+
+    autonomy.configure(exit_rules_tick=exit_hook, dip_watch_tick=None)
+    assert autonomy.STATE.last_fast_tick_heartbeat_at is None
+    out = await autonomy.run_fast_tick()
+    assert out["ok"] is True
+    assert autonomy.STATE.last_fast_tick_heartbeat_at is not None
+    # Heartbeat matches the tick timestamp.
+    assert autonomy.STATE.last_fast_tick_heartbeat_at == autonomy.STATE.last_fast_tick_at
+
+
+@pytest.mark.asyncio
+async def test_run_fast_tick_skips_do_not_advance_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A market-closed skip should NOT advance the heartbeat — the watchdog
+    must still see staleness if the loop hasn't actually run."""
+    _force_market_open(monkeypatch, open_=False)
+    monkeypatch.setattr(autonomy, "_default_pause_check", lambda: False)
+
+    async def exit_hook() -> dict[str, Any]:
+        return {}
+
+    autonomy.configure(exit_rules_tick=exit_hook, dip_watch_tick=None)
+    autonomy.STATE.last_fast_tick_heartbeat_at = None
+    out = await autonomy.run_fast_tick()
+    assert out["skipped"] is True
+    # Heartbeat must remain None (no successful tick happened).
+    assert autonomy.STATE.last_fast_tick_heartbeat_at is None
+
+
+def test_autonomy_config_has_hot_cadence_default() -> None:
+    """fast_loop_hot_seconds defaults to 10s — fast enough to catch a
+    sub-minute price spike without slamming the broker API."""
+    cfg = autonomy.AutonomyConfig()
+    assert cfg.fast_loop_hot_seconds == 10
+    # And the regular interval is 60s by default.
+    assert cfg.fast_loop_seconds == 60
+    # FAST_LOOP_STALE_S is exposed for the curiosity watchdog.
+    assert autonomy.FAST_LOOP_STALE_S == 300
+
+
+def test_autonomy_config_hot_cadence_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator can tune the hot cadence via AUTONOMY_FAST_LOOP_HOT_S."""
+    monkeypatch.setenv("AUTONOMY_FAST_LOOP_HOT_S", "3")
+    # AutonomyConfig reads env at default-eval time, so we have to
+    # rebuild the dataclass to see the override.
+    import importlib
+
+    import packages.cockpit.web.autonomy as autonomy_mod
+
+    importlib.reload(autonomy_mod)
+    try:
+        cfg = autonomy_mod.AutonomyConfig()
+        assert cfg.fast_loop_hot_seconds == 3
+    finally:
+        # Reload again WITHOUT the env override so downstream tests see
+        # the default and the patched module references stay sane.
+        monkeypatch.delenv("AUTONOMY_FAST_LOOP_HOT_S", raising=False)
+        importlib.reload(autonomy_mod)

@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from packages.agents.curiosity import (
+    FAST_LOOP_STALE_S,
     IDLE_STREAK_THRESHOLD,
     MAX_CUMULATIVE_RELAXATION,
     WATCHLIST_STALE_S,
@@ -259,3 +260,58 @@ def test_log_action_creates_parent_dir(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("CURIOSITY_ACTION_LOG", str(target))
     log_action(CuriosityAction(kind="noop", rationale="x", payload={}))
     assert target.exists()
+
+
+# --- Phase 35: fast-loop autonomy watchdog -----------------------------------
+
+
+def test_fast_loop_stale_triggers_watchdog() -> None:
+    """Stale fast-loop heartbeat during market hours fires the watchdog."""
+    state = _baseline(
+        last_fast_tick_age_s=FAST_LOOP_STALE_S + 1,
+        market_open=True,
+    )
+    action = decide(state, rng=random.Random(0))
+    assert action.kind == "narrate_blockers"
+    assert action.payload["reason"] == "fast_loop_stale"
+    assert action.payload["threshold_s"] == FAST_LOOP_STALE_S
+    assert action.payload["last_fast_tick_age_s"] >= FAST_LOOP_STALE_S
+
+
+def test_fast_loop_stale_ignored_when_market_closed() -> None:
+    """Outside market hours, a stale heartbeat is not actionable."""
+    state = _baseline(
+        last_fast_tick_age_s=FAST_LOOP_STALE_S + 60,
+        market_open=False,
+    )
+    action = decide(state, rng=random.Random(0))
+    # Should fall through to a non-watchdog branch (noop / other).
+    assert not (
+        action.kind == "narrate_blockers"
+        and action.payload.get("reason") == "fast_loop_stale"
+    )
+
+
+def test_fast_loop_stale_ignored_when_age_none() -> None:
+    """If we have no heartbeat sample yet, do not falsely fire."""
+    state = _baseline(
+        last_fast_tick_age_s=None,
+        market_open=True,
+    )
+    action = decide(state, rng=random.Random(0))
+    assert not (
+        action.kind == "narrate_blockers"
+        and action.payload.get("reason") == "fast_loop_stale"
+    )
+
+
+def test_watchdog_priority_over_wildcard_scan() -> None:
+    """Watchdog is highest priority — beats a stale watchlist."""
+    state = _baseline(
+        last_fast_tick_age_s=FAST_LOOP_STALE_S + 1,
+        market_open=True,
+        watchlist_age_s=WATCHLIST_STALE_S + 1,  # would normally trigger wildcard_scan
+    )
+    action = decide(state, rng=random.Random(0))
+    assert action.kind == "narrate_blockers"
+    assert action.payload["reason"] == "fast_loop_stale"

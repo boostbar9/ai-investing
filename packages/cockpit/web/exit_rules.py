@@ -65,6 +65,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = REPO_ROOT / "data" / "cockpit"
 EXIT_AUDIT_PATH = DATA_DIR / "exit_rules_audit.jsonl"
 EXIT_PEAKS_PATH = DATA_DIR / "exit_peaks.json"
+# Phase 35 — tracks which symbols have already done a scale-out partial
+# exit this session so we don't keep slicing the position. Cleared on
+# session rollover and when a position fully closes.
+EXIT_SCALEOUT_PATH = DATA_DIR / "exit_scaleout.json"
+
+# Phase 35 — default fraction of position sold at scale-out trigger.
+SCALE_OUT_FRACTION: float = 0.5
 
 MAX_AUDIT_ROWS = 5000
 
@@ -291,6 +298,119 @@ PEAKS = _PeakStore()
 
 
 # ---------------------------------------------------------------------------
+# Phase 35 — scale-out tracking (which symbols have done their partial)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ScaleOutStore:
+    """Set of symbols that have already done their partial exit today.
+
+    Mirrors ``_PeakStore`` in spirit — lazy-loaded, atomically flushed,
+    session-scoped (wiped when the ET trading date rolls over). Lives
+    in its own JSON file so we can swap it out independently of peaks.
+    """
+
+    path: Path = EXIT_SCALEOUT_PATH
+    _cache: set[str] = field(default_factory=set)
+    _session_date: date | None = None
+    _loaded: bool = False
+    _now_fn: Any = None
+
+    def _now_session(self) -> date:
+        if self._now_fn is not None:
+            return _current_session_date(self._now_fn())
+        return _current_session_date()
+
+    def _ensure(self) -> None:
+        current_session = self._now_session()
+        if not self._loaded:
+            self._loaded = True
+            self._session_date = current_session
+            if self.path.exists():
+                try:
+                    with self.path.open("r", encoding="utf-8") as f:
+                        data = json.load(f) or {}
+                    if isinstance(data, dict):
+                        stored_raw = data.get("__session_date__")
+                        stored: date | None = None
+                        if isinstance(stored_raw, str):
+                            try:
+                                stored = date.fromisoformat(stored_raw)
+                            except ValueError:
+                                stored = None
+                        if stored is not None and stored == current_session:
+                            syms = data.get("symbols") or []
+                            self._cache = {
+                                str(s) for s in syms if isinstance(s, str)
+                            }
+                        else:
+                            self._cache = set()
+                            self._flush()
+                except (OSError, ValueError, json.JSONDecodeError):
+                    self._cache = set()
+            return
+        if self._session_date != current_session:
+            self._cache = set()
+            self._session_date = current_session
+            self._flush()
+
+    def contains(self, symbol: str) -> bool:
+        self._ensure()
+        return symbol in self._cache
+
+    def add(self, symbol: str) -> None:
+        self._ensure()
+        if symbol not in self._cache:
+            self._cache.add(symbol)
+            self._flush()
+
+    def forget(self, symbol: str) -> None:
+        self._ensure()
+        if symbol in self._cache:
+            self._cache.discard(symbol)
+            self._flush()
+
+    def prune(self, keep_symbols: set[str]) -> None:
+        self._ensure()
+        before = set(self._cache)
+        for sym in before - keep_symbols:
+            self._cache.discard(sym)
+        if before != self._cache:
+            self._flush()
+
+    def snapshot(self) -> list[str]:
+        self._ensure()
+        return sorted(self._cache)
+
+    def reset_session(self) -> None:
+        self._loaded = True
+        self._session_date = self._now_session()
+        self._cache = set()
+        self._flush()
+
+    def _flush(self) -> None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        try:
+            payload: dict[str, Any] = {
+                "symbols": sorted(self._cache),
+            }
+            if self._session_date is not None:
+                payload["__session_date__"] = self._session_date.isoformat()
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            tmp.replace(self.path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                if tmp.exists():
+                    tmp.unlink()
+
+
+SCALED_OUT = _ScaleOutStore()
+
+
+# ---------------------------------------------------------------------------
 # Decision logic — pure, easy to test
 # ---------------------------------------------------------------------------
 
@@ -299,26 +419,43 @@ PEAKS = _PeakStore()
 class ExitDecision:
     symbol: str
     action: str  # "hold" | "sell"
-    reason: str  # "take_profit" | "trailing_stop" | "hard_stop" | "hold"
+    # Phase 35: "scale_out" added — sell only ``qty_fraction`` of the
+    # position, leave the rest to ride the trail. Locks in real money
+    # at the arm threshold without giving up upside.
+    reason: str  # "take_profit" | "trailing_stop" | "hard_stop" | "scale_out" | "hold"
     pnl_pct: float
     peak_pct: float
     threshold: float
+    # Phase 35 — fraction of the position to sell (1.0 == full exit).
+    qty_fraction: float = 1.0
 
 
 def evaluate_position(
     symbol: str,
     pnl_pct: float,
     thresholds: ExitThresholds,
-    peaks: _PeakStore = PEAKS,
+    peaks: _PeakStore | None = None,
+    *,
+    already_scaled_out: bool = False,
 ) -> ExitDecision:
     """Pure decision function: should we sell this position right now?
 
     ``pnl_pct`` is the unrealized PnL as a fraction (e.g. 0.03 == +3%).
     Updates the peak before deciding.
+
+    ``already_scaled_out`` — set True when this symbol has already had
+    its Phase 35 partial exit so we don't keep slicing the position.
+    The caller is responsible for tracking that flag (see
+    ``_ScaleOutStore`` / ``run_tick``).
     """
     if thresholds.is_off():
         return ExitDecision(symbol, "hold", "rules_off", pnl_pct, pnl_pct, 0.0)
 
+    # Resolve PEAKS lazily so monkeypatch.setattr(exit_rules, "PEAKS", ...)
+    # in tests is honoured (default args bind once at def-time and would
+    # otherwise hold a stale reference to the original singleton).
+    if peaks is None:
+        peaks = PEAKS
     peak = peaks.update(symbol, pnl_pct)
 
     # 1. Hard stop — catches positions that never went green.
@@ -344,6 +481,34 @@ def evaluate_position(
                 pnl_pct,
                 peak,
                 peak - thresholds.trail_giveback_pct,
+            )
+
+        # 4. Phase 35 scale-out — once peak crosses trail_arm_pct AND
+        # we are still riding within the giveback envelope, lock in
+        # SCALE_OUT_FRACTION of the position. Fires exactly once per
+        # symbol per session; the remainder keeps the trailing stop.
+        # Suppressed when take_profit is below or equal to arm (the
+        # take-profit branch already handled the full exit) and when
+        # we are already past the arm by enough to trigger a real
+        # exit (handled above).
+        if (
+            not already_scaled_out
+            and thresholds.trail_arm_pct > 0
+            and peak >= thresholds.trail_arm_pct
+            and pnl_pct >= thresholds.trail_arm_pct
+            and (
+                thresholds.take_profit_pct <= 0
+                or thresholds.trail_arm_pct < thresholds.take_profit_pct
+            )
+        ):
+            return ExitDecision(
+                symbol,
+                "sell",
+                "scale_out",
+                pnl_pct,
+                peak,
+                thresholds.trail_arm_pct,
+                qty_fraction=SCALE_OUT_FRACTION,
             )
 
     return ExitDecision(symbol, "hold", "hold", pnl_pct, peak, 0.0)
@@ -425,15 +590,28 @@ def _push_chatter(decision: ExitDecision, *, executed: bool) -> None:
         "take_profit": "take-profit",
         "trailing_stop": "trailing-stop",
         "hard_stop": "hard-stop",
+        "scale_out": "scale-out partial",
     }
     label = reason_labels.get(decision.reason, decision.reason)
     pnl_str = f"{decision.pnl_pct * 100:+.2f}%"
     if executed:
-        msg = (
-            f"Exit {label} fired on {decision.symbol} at {pnl_str} "
-            f"(peak {decision.peak_pct * 100:+.2f}%). Sell submitted."
+        if decision.reason == "scale_out":
+            pct = int(round(decision.qty_fraction * 100))
+            msg = (
+                f"Exit {label} fired on {decision.symbol} at {pnl_str} "
+                f"(peak {decision.peak_pct * 100:+.2f}%). Sold {pct}% "
+                f"— rest rides the trail."
+            )
+        else:
+            msg = (
+                f"Exit {label} fired on {decision.symbol} at {pnl_str} "
+                f"(peak {decision.peak_pct * 100:+.2f}%). Sell submitted."
+            )
+        status = (
+            "win"
+            if decision.reason in ("take_profit", "trailing_stop", "scale_out")
+            else "warn"
         )
-        status = "win" if decision.reason in ("take_profit", "trailing_stop") else "warn"
     else:
         msg = (
             f"Exit {label} signaled on {decision.symbol} at {pnl_str} "
@@ -478,15 +656,20 @@ async def run_tick(
     th = thresholds or current_thresholds()
 
     if th.is_off():
+        # Phase 35 — still publish a hot=False signal so the fast loop
+        # falls back to its idle cadence when rules are disabled.
+        _publish_hot_flag(False)
         return result
 
     try:
         positions = await positions_getter()
     except Exception as exc:
         result.errors.append(f"positions fetch failed: {exc}")
+        _publish_hot_flag(False)
         return result
 
     live_symbols: set[str] = set()
+    any_hot = False
     for pos in positions or []:
         # BrokerPosition-like: .symbol, .qty, .pnl_pct, .last_price
         symbol = getattr(pos, "symbol", None) or (
@@ -516,18 +699,51 @@ async def run_tick(
         live_symbols.add(symbol)
         result.evaluated += 1
 
-        decision = evaluate_position(symbol, pnl_pct, th)
+        already_partial = SCALED_OUT.contains(symbol)
+        decision = evaluate_position(
+            symbol, pnl_pct, th, peaks=PEAKS, already_scaled_out=already_partial
+        )
         result.decisions.append(decision)
+
+        # Phase 35 — the position is "hot" if its peak has armed the
+        # trail. That's the trigger to drop fast-loop interval to
+        # ``fast_loop_hot_seconds`` so the next exit-rules tick fires
+        # within seconds of a giveback.
+        if th.trail_arm_pct > 0 and decision.peak_pct >= th.trail_arm_pct:
+            any_hot = True
 
         if decision.action != "sell":
             continue
 
         result.sells_triggered += 1
+        is_partial = decision.reason == "scale_out" and 0 < decision.qty_fraction < 1
+        # Compute the actual share count to sell. Round DOWN for
+        # partials so we never over-sell, but enforce >=1 share when
+        # holding a whole-share position so the order is non-zero.
+        sell_qty: float
+        abs_qty = abs(qty)
+        if is_partial:
+            raw = abs_qty * float(decision.qty_fraction)
+            # If the position is whole-share, floor to int >= 1.
+            if abs_qty == int(abs_qty):
+                sell_qty = float(max(1, int(raw)))
+                # If flooring would sell the entire position, skip the
+                # partial — it's effectively a full exit and we'd lose
+                # the "keep riding the trail" benefit. Wait for the
+                # trailing-stop branch instead.
+                if sell_qty >= abs_qty:
+                    _publish_hot_flag(any_hot)
+                    continue
+            else:
+                sell_qty = raw
+        else:
+            sell_qty = abs_qty
+
         executed = False
         broker_msg = ""
-        if submit_sell is not None:
+        if submit_sell is not None and sell_qty > 0:
             try:
-                ack = await submit_sell(symbol, abs(qty))
+                ack = await submit_sell(symbol, sell_qty)
                 executed = True
                 broker_msg = (
                     getattr(ack, "broker_order_id", "")
@@ -535,12 +751,21 @@ async def run_tick(
                     or "submitted"
                 )
                 result.sells_executed += 1
-                # Wipe peak — position is closing.
-                PEAKS.forget(symbol)
-                # Notify dip_watch (optional callback).
+                if is_partial:
+                    # Position is still open — keep the peak, mark the
+                    # scale-out as done so we don't keep slicing.
+                    SCALED_OUT.add(symbol)
+                else:
+                    # Full exit — wipe peak + any scale-out marker.
+                    PEAKS.forget(symbol)
+                    SCALED_OUT.forget(symbol)
+                # Notify dip_watch (optional callback). Scale-out counts
+                # as a profitable exit — the dip-watch buy-back hook
+                # should arm on partial wins too.
                 if on_profit_taken is not None and decision.reason in (
                     "take_profit",
                     "trailing_stop",
+                    "scale_out",
                 ):
                     last_price = getattr(pos, "last_price", None)
                     if last_price is None and isinstance(pos, dict):
@@ -556,9 +781,25 @@ async def run_tick(
         record_audit(decision, executed=executed, broker_msg=broker_msg)
         _push_chatter(decision, executed=executed)
 
-    # Prune peaks for symbols we no longer hold.
+    # Prune peaks + scale-out markers for symbols we no longer hold.
     PEAKS.prune(live_symbols)
+    SCALED_OUT.prune(live_symbols)
+    # Phase 35 — publish the adaptive-cadence signal.
+    _publish_hot_flag(any_hot)
     return result
+
+
+def _publish_hot_flag(hot: bool) -> None:
+    """Mirror the hot-position flag into ``autonomy.STATE`` for the fast loop.
+
+    Lazy import to avoid a circular dependency: ``autonomy`` already
+    depends on this module via the exit_tick wiring.
+    """
+    try:
+        from packages.cockpit.web import autonomy as _autonomy  # noqa: WPS433
+        _autonomy.STATE.any_position_hot = bool(hot)
+    except Exception:  # pragma: no cover — import-time safety net
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -579,8 +820,10 @@ def snapshot() -> dict[str, Any]:
             "is_off": th.is_off(),
         },
         "peaks": PEAKS.snapshot(),
+        "scaled_out": SCALED_OUT.snapshot(),
         "recent_audit": read_audit(limit=25),
         "audit_path": str(EXIT_AUDIT_PATH),
         "peaks_path": str(EXIT_PEAKS_PATH),
+        "scaleout_path": str(EXIT_SCALEOUT_PATH),
         "as_of": datetime.now(UTC).isoformat(timespec="seconds"),
     }
