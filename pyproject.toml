@@ -33,6 +33,7 @@ dependencies = [
   # ML / LLM
   "scikit-learn>=1.5",
   "hmmlearn>=0.3",
+  "lightgbm>=4.0",          # Phase 34: supervised candidate ranker
   "ollama>=0.3",
   "langgraph>=0.2",
   "temporalio>=1.7",

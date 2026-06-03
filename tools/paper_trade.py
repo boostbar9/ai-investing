@@ -1422,6 +1422,35 @@ async def run(
                 log.info("wrote %d predictions for shadow reconciliation", n_pred)
         except Exception as exc:  # pragma: no cover - defensive only
             log.warning("prediction-log write failed: %s", exc)
+        # Phase 34: persist the candidate feature vectors keyed by this
+        # cycle's decision_id so the nightly LightGBM trainer has a
+        # training table to join against outcomes. Best-effort — a
+        # snapshot write failure must never poison a real cycle.
+        try:
+            from packages.learning.feature_snapshot import append_snapshots
+
+            target_syms = {
+                str(s).upper() for s, w in (target or {}).items()
+                if abs(float(w or 0.0)) >= 1e-6
+            }
+            snap_rows = [
+                c for c in (sweep_candidates or [])
+                if isinstance(c, dict)
+                and str(c.get("symbol") or "").upper() in target_syms
+            ]
+            if snap_rows:
+                n_snap = append_snapshots(
+                    decision_id=str(agent_result.decision_id),
+                    regime=_live_regime,
+                    rows=snap_rows,
+                    ts=started.isoformat(),
+                )
+                if n_snap:
+                    log.info(
+                        "wrote %d feature snapshots for ranker training", n_snap
+                    )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("feature snapshot write failed: %s", exc)
         log_run(record)
         # Phase 33: narrate the happy path + run curiosity meta-agent
         # so the cockpit's AGENT STATUS panel reflects this sweep.

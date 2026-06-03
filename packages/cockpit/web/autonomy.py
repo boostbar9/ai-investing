@@ -224,6 +224,7 @@ FEATURE_LABELS: tuple[str, ...] = (
     "insider",
     "stocktwits",
     "yahoo_news",
+    "ranker",         # Phase 34: supervised LightGBM probability arm
 )
 
 
@@ -318,6 +319,24 @@ def _score_candidate(
         reasons.append(f"{yc} fresh headlines")
         features.append("yahoo_news")
 
+    # Phase 34: supervised LightGBM ranker as a contribution arm.
+    # P(EOD >= +0.5%) is in [0, 1]; we center on 0.5 so a neutral
+    # prediction contributes nothing, and a strongly confident model
+    # tilts the score by up to ±0.20 before bandit/regime modulation.
+    # ``ranker_proba`` is plumbed in by the live caller (paper_trade
+    # populates it after computing inference); if absent we skip
+    # gracefully so unit tests and synthetic candidates still work.
+    try:
+        proba = c.get("ranker_proba")
+        if proba is not None:
+            tilt = (float(proba) - 0.5) * 0.40   # ±0.20 at extremes
+            if abs(tilt) > 1e-4:
+                score += gain("ranker", tilt)
+                reasons.append(f"ranker {float(proba):.2f}")
+                features.append("ranker")
+    except (TypeError, ValueError):
+        pass
+
     return (round(score, 4), reasons, features)
 
 
@@ -345,11 +364,38 @@ def pick_focus(
     """
     if not candidates:
         return ([], [])
+
+    # Phase 34: load the supervised ranker once per sweep and inject
+    # ``ranker_proba`` into each candidate dict so ``_score_candidate``
+    # picks it up. Cached on disk; load_model returns None when no
+    # model is fitted yet or when lightgbm is unavailable — in that
+    # case the scorer's ranker arm contributes nothing.
+    try:
+        from packages.learning.ranker import load_model as _load_ranker
+
+        _ranker_model = _load_ranker()
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("ranker load failed: %s", exc)
+        _ranker_model = None
+
     scored: list[tuple[float, str, list[str], list[str], dict[str, Any]]] = []
     for c in candidates[:top_n]:
         sym = str(c.get("symbol") or "").upper().strip()
         if not sym:
             continue
+        # Inject ranker probability before scoring (idempotent: if
+        # already present, e.g. unit-test seeded, we leave it alone).
+        if _ranker_model is not None and "ranker_proba" not in c:
+            try:
+                from packages.learning.feature_snapshot import (
+                    extract_features_from_candidate,
+                )
+
+                c["ranker_proba"] = _ranker_model.predict_proba(
+                    extract_features_from_candidate(c)
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug("ranker inference failed for %s: %s", sym, exc)
         s, r, feats = _score_candidate(c, weights=weights, multipliers=multipliers)
         scored.append((s, sym, r, feats, c))
     # Highest score first; ties broken alphabetically for determinism.

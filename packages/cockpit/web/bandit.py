@@ -65,6 +65,7 @@ DEFAULT_ARMS: tuple[str, ...] = (
     "insider",
     "stocktwits",
     "yahoo_news",
+    "ranker",          # Phase 34: supervised LightGBM probability
 )
 
 GAMMA = 0.10  # exploration rate — 10% uniform mass
