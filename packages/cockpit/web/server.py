@@ -2336,6 +2336,9 @@ def api_trading_start(req: StartTradingRequest) -> dict[str, Any]:
     state.paper_loop_intended = True
     state.paper_loop_strategy = req.strategy
     state.paper_loop_dry_run = req.dry_run
+    # Phase 36b: mark that the user has explicitly touched the controls
+    # so future boots use the resume path, not the first-boot auto-start.
+    state.paper_loop_user_touched = True
     state = record_action(state, f"Paper loop started ({req.strategy}, dry_run={req.dry_run})")
     save_state(state)
     return info.to_dict()
@@ -2348,6 +2351,8 @@ def api_trading_stop() -> dict[str, Any]:
     # re-spawn the loop the user just chose to stop.
     state = load_state()
     state.paper_loop_intended = False
+    # Phase 36b: also mark touched so we don't auto-start on next boot.
+    state.paper_loop_user_touched = True
     state = record_action(state, "Paper loop stopped")
     save_state(state)
     return info
@@ -4027,49 +4032,111 @@ async def _autopilot_startup() -> None:  # pragma: no cover
         _start_autopilot_task()
 
 
+def _decide_paper_loop_autostart(
+    cstate: Any,
+    *,
+    job_is_running: bool,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Pure decision function for paper-loop auto-start / auto-resume on boot.
+
+    Returns a dict ``{"action": str, "strategy": str|None, "dry_run": bool,
+    "reason": str}`` where ``action`` is one of ``"start"`` (first-boot
+    auto-start path), ``"resume"`` (operator had it running before), or
+    ``"skip"`` (do nothing — ``reason`` explains why).
+
+    Extracted so the startup hook stays a thin wrapper around testable
+    logic. Honors ``COCKPIT_AUTO_RESUME_LOOP`` (gates both branches) and
+    ``COCKPIT_AUTO_START_LOOP`` (gates only the first-boot auto-start).
+    """
+    env = env if env is not None else dict(os.environ)
+    if env.get("COCKPIT_AUTO_RESUME_LOOP", "1") not in ("1", "true", "True"):
+        return {"action": "skip", "strategy": None, "dry_run": False, "reason": "COCKPIT_AUTO_RESUME_LOOP off"}
+    if getattr(cstate, "paused", False):
+        return {"action": "skip", "strategy": None, "dry_run": False, "reason": "cockpit paused"}
+    if job_is_running:
+        return {"action": "skip", "strategy": None, "dry_run": False, "reason": "already running"}
+
+    is_resume = bool(getattr(cstate, "paper_loop_intended", False))
+    if is_resume:
+        return {
+            "action": "resume",
+            "strategy": getattr(cstate, "paper_loop_strategy", None) or "ensemble",
+            "dry_run": bool(getattr(cstate, "paper_loop_dry_run", False)),
+            "reason": "resume prior intent",
+        }
+
+    if env.get("COCKPIT_AUTO_START_LOOP", "1") not in ("1", "true", "True"):
+        return {"action": "skip", "strategy": None, "dry_run": False, "reason": "COCKPIT_AUTO_START_LOOP off"}
+    if getattr(cstate, "paper_loop_user_touched", False):
+        return {"action": "skip", "strategy": None, "dry_run": False, "reason": "user has touched controls"}
+    if not (env.get("ALPACA_PAPER_KEY_ID") and env.get("ALPACA_PAPER_SECRET")):
+        return {"action": "skip", "strategy": None, "dry_run": False, "reason": "alpaca paper keys missing"}
+    return {
+        "action": "start",
+        "strategy": "ensemble",
+        "dry_run": False,
+        "reason": "first-boot auto-start",
+    }
+
+
 @app.on_event("startup")
 async def _paper_loop_auto_resume() -> None:  # pragma: no cover
-    """If the paper loop was intended to be running when the cockpit shut
-    down, re-spawn it now with the same strategy/dry_run combo.
+    """Auto-start / auto-resume the paper-trade loop on cockpit boot.
 
-    Honors COCKPIT_AUTO_RESUME_LOOP (default on). Skipped when the bot is
-    paused or when a job is already alive (PID still valid).
+    Thin wrapper around :func:`_decide_paper_loop_autostart` — see that
+    function for the policy. Honors ``COCKPIT_AUTO_RESUME_LOOP`` (gates
+    both branches) and ``COCKPIT_AUTO_START_LOOP`` (gates only the
+    Phase 36b first-boot auto-start path).
     """
-    if os.environ.get("COCKPIT_AUTO_RESUME_LOOP", "1") not in ("1", "true", "True"):
-        return
     try:
         cstate = load_state()
     except Exception as e:
         log.warning("auto-resume: state load failed: %s", e)
         return
-    if not cstate.paper_loop_intended:
-        return
-    if cstate.paused:
-        log.info("auto-resume: paper loop intent set but cockpit is paused; skipping")
-        return
     existing = job_mgr.status(PAPER_LOOP_KIND)
-    if existing.is_running():
-        log.info("auto-resume: paper loop already running (pid=%s)", existing.pid)
+    decision = _decide_paper_loop_autostart(
+        cstate, job_is_running=existing.is_running()
+    )
+    if decision["action"] == "skip":
+        log.info("auto-resume: skipping (%s)", decision["reason"])
         return
+
+    strategy = decision["strategy"] or "ensemble"
+    dry_run = bool(decision["dry_run"])
+
+    if decision["action"] == "start":
+        # First-boot auto-start: persist intent so reboots resume.
+        cstate.paper_loop_intended = True
+        cstate.paper_loop_strategy = strategy
+        cstate.paper_loop_dry_run = dry_run
+        cstate = record_action(
+            cstate,
+            f"Auto-started paper loop ({strategy}, LIVE PAPER) on first boot",
+        )
+        save_state(cstate)
+        log.info("auto-start: first-boot auto-start — strategy=%s LIVE PAPER", strategy)
+
     cmd = [
         _python_exe(),
         "tools/paper_trade.py",
         "--strategy",
-        cstate.paper_loop_strategy,
+        strategy,
         "--loop",
     ]
-    if cstate.paper_loop_dry_run:
+    if dry_run:
         cmd.append("--dry-run")
     try:
         info = job_mgr.start(PAPER_LOOP_KIND, cmd)
         log.info(
-            "auto-resume: paper loop respawned pid=%s strategy=%s dry_run=%s",
+            "auto-%s: paper loop spawned pid=%s strategy=%s dry_run=%s",
+            decision["action"],
             info.pid,
-            cstate.paper_loop_strategy,
-            cstate.paper_loop_dry_run,
+            strategy,
+            dry_run,
         )
     except Exception as e:
-        log.warning("auto-resume: failed to respawn loop: %s", e)
+        log.warning("auto-resume/start: failed to spawn loop: %s", e)
 
 
 # Background pre-warm so the first Run on /agents doesn't pay a 30-90s

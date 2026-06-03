@@ -224,12 +224,20 @@
       </div>
     </section>
 
-    <section class="card p-5">
+    <section class="card p-5" id="logs-card">
       <div class="flex items-center justify-between mb-3">
-        <div class="text-sm font-medium">Live log <span class="tt" data-tt="Streamed stdout from the paper_loop process. Useful for debugging.">?</span></div>
-        <button id="clear-log" class="btn btn-ghost btn-sm">Clear view</button>
+        <div class="text-sm font-medium">Live log <span class="tt" data-tt="Streamed stdout from the paper_loop process. The cockpit also auto-starts the loop on boot when Alpaca paper keys are present and you have not touched Start/Stop, so logs begin filling as soon as the page loads.">?</span></div>
+        <div class="flex items-center gap-2">
+          <span id="log-meta" class="text-xs text-gray-500"></span>
+          <a id="log-download" href="/api/jobs/paper_loop/log?download=1" class="btn btn-ghost btn-sm" download>Download full log</a>
+          <button id="log-refresh" class="btn btn-ghost btn-sm" type="button">Refresh tail</button>
+          <button id="clear-log" class="btn btn-ghost btn-sm" type="button">Clear view</button>
+        </div>
       </div>
-      <div id="log" class="log-box">Click Start loop to begin. Logs will stream here.</div>
+      <div class="text-xs text-gray-400 mb-2">
+        Path on disk: <code>data/cockpit/logs/paper_loop.log</code>. Streams live via Server-Sent Events while the loop is running; otherwise shows the most recent tail.
+      </div>
+      <div id="log" class="log-box">Loading recent log tail…</div>
     </section>
   </div>
 
@@ -376,6 +384,31 @@
         refreshStatus();
         source.close();
       });
+      const meta = document.getElementById('log-meta');
+      if (meta) meta.textContent = 'streaming live';
+    }
+
+    // Phase 36b — load the most recent tail of the on-disk log so the operator
+    // sees context even when the loop is paused or just booted. Uses the same
+    // /api/jobs/paper_loop/log JSON endpoint that powers the download button.
+    async function loadLogTail() {
+      const logEl = document.getElementById('log');
+      const meta = document.getElementById('log-meta');
+      try {
+        const j = await Cockpit.api.get('/api/jobs/paper_loop/log');
+        const tail = (j && j.tail) ? j.tail : '';
+        if (tail) {
+          logEl.textContent = tail;
+          logEl.scrollTop = logEl.scrollHeight;
+          if (meta) meta.textContent = `${tail.split('\n').length} lines (tail)`;
+        } else {
+          logEl.textContent = '(no log on disk yet — start the loop or wait for auto-start)';
+          if (meta) meta.textContent = 'empty';
+        }
+      } catch (e) {
+        logEl.textContent = '(failed to load log tail: ' + (e.message || e) + ')';
+        if (meta) meta.textContent = 'error';
+      }
     }
 
     function applyModeUI(j) {
@@ -482,10 +515,14 @@
       document.getElementById('stop-btn').addEventListener('click', stop);
       document.getElementById('liquidate-btn').addEventListener('click', liquidate);
       document.getElementById('clear-log').addEventListener('click', () => { document.getElementById('log').textContent = ''; });
+      const refreshBtn = document.getElementById('log-refresh');
+      if (refreshBtn) refreshBtn.addEventListener('click', loadLogTail);
       document.getElementById('shortcuts-btn').addEventListener('click', () => Cockpit.showShortcuts());
 
       refreshStatus();
-      attachStream();
+      // Phase 36b: load on-disk tail first so the panel is never empty,
+      // then attach the SSE stream which will overlay live updates.
+      loadLogTail().finally(() => attachStream());
       loadMode();
       refreshTopbar();
       refreshCycles();
