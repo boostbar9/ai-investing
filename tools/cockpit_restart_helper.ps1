@@ -150,7 +150,8 @@ try {
     if ($NoPull) {
         Log "Skipping pull (-NoPull)"
     } else {
-        $dirty = & git status --porcelain 2>$null
+        # Ignore untracked files -- pull only touches tracked content.
+        $dirty = & git status --porcelain --untracked-files=no 2>$null
         if ($LASTEXITCODE -ne 0) {
             Log "git status failed; skipping pull."
         } elseif ($dirty) {

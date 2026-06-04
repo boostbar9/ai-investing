@@ -112,7 +112,9 @@ if ($NoPull) {
     try {
         # 0a. Refuse to pull if there are uncommitted changes -- pulling
         #     would either fail or risk a stash dance we don't want.
-        $dirty = & git status --porcelain 2>$null
+        #     Ignore untracked files (data/learning/, tools/bin/, etc.)
+        #     since pull only touches tracked files.
+        $dirty = & git status --porcelain --untracked-files=no 2>$null
         if ($LASTEXITCODE -ne 0) {
             Write-Host "git status failed (not a repo or git missing?); skipping pull." -ForegroundColor Yellow
         } elseif ($dirty) {

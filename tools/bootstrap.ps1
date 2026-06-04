@@ -33,7 +33,10 @@ Write-Host "Repo: $RepoRoot" -ForegroundColor DarkGray
 Section "Step 1: Pull latest from origin"
 Push-Location $RepoRoot
 try {
-    $dirty = & git status --porcelain 2>$null
+    # Use --untracked-files=no so runtime-generated dirs like data/learning/
+    # and tools/bin/cloudflared.exe don't trigger a false-positive prompt.
+    # Pull only touches tracked files, so untracked content is irrelevant.
+    $dirty = & git status --porcelain --untracked-files=no 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "git status failed; aborting bootstrap." -ForegroundColor Red
         Pop-Location
