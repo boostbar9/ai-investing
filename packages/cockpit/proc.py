@@ -502,37 +502,101 @@ def _watch(kind: str) -> None:
             pass
 
 
+def _kill_pid_os(pid: int) -> bool:
+    """Kill ``pid`` via the OS, no Popen handle required. True on success.
+
+    Used for the "orphaned PID" case: a child started by an earlier
+    cockpit process, where the Popen handle is gone but the OS process
+    is still alive (e.g. cockpit was restarted, child is hung).
+    """
+    if pid is None or pid <= 0:
+        return False
+    if _psutil is not None:
+        try:
+            proc = _psutil.Process(pid)
+        except (_psutil.NoSuchProcess, _psutil.AccessDenied, ValueError, OverflowError):
+            return False
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except _psutil.TimeoutExpired:
+                proc.kill()
+                with contextlib.suppress(_psutil.TimeoutExpired, _psutil.NoSuchProcess):
+                    proc.wait(timeout=3.0)
+            return not proc.is_running() or proc.status() == _psutil.STATUS_ZOMBIE
+        except (_psutil.NoSuchProcess, _psutil.AccessDenied):
+            return True  # already gone
+    # POSIX fallback when psutil is unavailable.
+    try:
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(2.0)
+        if _pid_is_running(pid):
+            os.kill(pid, signal.SIGKILL)
+        return not _pid_is_running(pid)
+    except (OSError, ProcessLookupError, PermissionError):
+        return False
+
+
 def stop(kind: str, timeout: float = 5.0) -> JobInfo:
-    """Politely terminate a job; escalate to kill if it doesn't exit."""
+    """Politely terminate a job; escalate to kill if it doesn't exit.
+
+    Handles three cases:
+    1. Live Popen handle: terminate, grace, then kill.
+    2. Orphaned PID (Popen lost across cockpit restart, OS proc still
+       alive): kill via OS, mark exit code -1.
+    3. Already dead: clear stale state.
+    """
     with _lock:
         info = _jobs.get(kind)
         proc = _procs.get(kind)
 
-    if info is None or not info.is_running() or proc is None:
-        return info or JobInfo(kind=kind)
+    if info is None:
+        return JobInfo(kind=kind)
 
-    try:
-        if sys.platform.startswith("win"):
-            proc.terminate()
+    # Case 1: we have a live Popen handle.
+    if proc is not None and info.is_running():
+        try:
+            if sys.platform.startswith("win"):
+                proc.terminate()
+            else:
+                proc.send_signal(signal.SIGTERM)
+        except OSError:
+            pass
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
         else:
-            proc.send_signal(signal.SIGTERM)
-    except OSError:
-        pass
+            with contextlib.suppress(OSError):
+                proc.kill()
 
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            break
-        time.sleep(0.1)
-    else:
-        with contextlib.suppress(OSError):
-            proc.kill()
+        with _lock:
+            info = _jobs.get(kind, JobInfo(kind=kind))
+            info.finished_at = datetime.now(UTC).isoformat(timespec="seconds")
+            info.exit_code = proc.returncode if proc.returncode is not None else -15
+            _persist()
+            return info
 
+    # Case 2: orphaned PID (Popen lost, OS process still alive).
+    if info.pid and _pid_is_running(info.pid):
+        killed = _kill_pid_os(info.pid)
+        with _lock:
+            info = _jobs.get(kind, JobInfo(kind=kind))
+            info.finished_at = datetime.now(UTC).isoformat(timespec="seconds")
+            info.exit_code = -9 if killed else info.exit_code
+            _persist()
+            return info
+
+    # Case 3: already dead, just clean up stale fields.
     with _lock:
         info = _jobs.get(kind, JobInfo(kind=kind))
-        info.finished_at = datetime.now(UTC).isoformat(timespec="seconds")
-        info.exit_code = proc.returncode if proc.returncode is not None else -15
-        _persist()
+        if info.finished_at is None:
+            info.finished_at = datetime.now(UTC).isoformat(timespec="seconds")
+            info.exit_code = info.exit_code if info.exit_code is not None else 0
+            _persist()
         return info
 
 
