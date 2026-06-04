@@ -180,48 +180,49 @@ Write-Host "Wrote $HandlePath" -ForegroundColor Green
 # --------------------------------------------------------------------
 if (-not $NoPublish) {
     Write-Section "Step 6: Publish handle to GitHub"
+    # Git writes progress lines to stderr; PowerShell's `Stop` policy treats
+    # those as terminating errors. Temporarily relax it for this block and
+    # rely on $LASTEXITCODE for real failure detection.
+    $prevErrPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     Push-Location $RepoRoot
+    $publishOk = $false
     try {
-        # Use a detached worktree so we don't touch your current branch state.
         $tmpWorktree = Join-Path $env:TEMP ("cockpit-handle-" + [Guid]::NewGuid().ToString("N"))
         $branchName = "cockpit-handle"
 
-        # Make sure we have a fresh ref to push against (orphan-style).
-        & git worktree add --detach $tmpWorktree 2>&1 | Out-Null
+        & git worktree add --detach $tmpWorktree *> $null
         if ($LASTEXITCODE -ne 0) {
             Write-Host "git worktree add failed; skipping publish. Handle is local only." -ForegroundColor Yellow
         } else {
             Push-Location $tmpWorktree
             try {
-                # Build a single-file orphan commit.
-                & git checkout --orphan $branchName 2>&1 | Out-Null
-                & git rm -rf . 2>&1 | Out-Null
+                & git checkout --orphan $branchName *> $null
+                & git rm -rf . *> $null
                 $remoteHandleDir = Join-Path $tmpWorktree "data\cockpit"
                 New-Item -ItemType Directory -Force -Path $remoteHandleDir | Out-Null
                 Copy-Item $HandlePath (Join-Path $remoteHandleDir "remote_handle.json") -Force
 
-                & git add data/cockpit/remote_handle.json 2>&1 | Out-Null
-                & git -c user.email=devfarinsky@gmail.com -c user.name="Devin Farinsky" commit -m "cockpit: publish handle $(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')" 2>&1 | Out-Null
-                # NOTE: --force-with-lease isn't useful here because the branch
-                # is an orphan single-file state ref that we intentionally rewrite
-                # on every cockpit launch. We use plain -f and gate it behind the
-                # -NoPublish opt-out flag for safety.
-                $pushOut = & git push --force origin "HEAD:refs/heads/$branchName" 2>&1
+                & git add data/cockpit/remote_handle.json *> $null
+                $commitMsg = "cockpit: publish handle " + (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+                & git -c user.email=devfarinsky@gmail.com -c user.name="Devin Farinsky" commit -m $commitMsg *> $null
+                # Orphan single-file state ref, rewritten every launch on purpose.
+                & git push --force origin ("HEAD:refs/heads/" + $branchName) *> $null
                 if ($LASTEXITCODE -eq 0) {
                     Write-Host "Published handle to origin/$branchName" -ForegroundColor Green
+                    $publishOk = $true
                 } else {
-                    Write-Host "Publish failed:" -ForegroundColor Yellow
-                    Write-Host $pushOut -ForegroundColor DarkGray
+                    Write-Host "Publish to origin failed (exit=$LASTEXITCODE)." -ForegroundColor Yellow
                     Write-Host "Handle is still available locally at $HandlePath" -ForegroundColor Yellow
                 }
             } finally {
                 Pop-Location
             }
-            # Clean up worktree.
-            & git worktree remove --force $tmpWorktree 2>&1 | Out-Null
+            & git worktree remove --force $tmpWorktree *> $null
         }
     } finally {
         Pop-Location
+        $ErrorActionPreference = $prevErrPref
     }
 }
 
