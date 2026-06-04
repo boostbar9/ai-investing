@@ -14,17 +14,21 @@ Or double-click `tools\start_cockpit.cmd` from File Explorer.
 
 The single launcher will:
 
-1. Ensure `COCKPIT_REMOTE_TOKEN` exists (generates one if missing).
-2. Start uvicorn (cockpit) in a fresh PowerShell window with the token
+1. **Auto-pull latest code from `origin/main`** (fast-forward only),
+   then `pip install -e .` if anything changed. Skipped if you have
+   uncommitted local changes or the repo is dirty. This is how agent
+   pushes reach your bot on every restart.
+2. Ensure `COCKPIT_REMOTE_TOKEN` exists (generates one if missing).
+3. Start uvicorn (cockpit) in a fresh PowerShell window with the token
    already in its environment.
-3. Wait until the cockpit is reachable on 127.0.0.1:8000.
-4. Download `cloudflared.exe` to `tools\bin\` if missing.
-5. Start a Cloudflare quick-tunnel and parse the public URL.
-6. Write the URL+token to `data/cockpit/remote_handle.json`.
-7. Force-push that handle to the `cockpit-handle` branch on GitHub so
+4. Wait until the cockpit is reachable on 127.0.0.1:8000.
+5. Download `cloudflared.exe` to `tools\bin\` if missing.
+6. Start a Cloudflare quick-tunnel and parse the public URL.
+7. Write the URL+token to `data/cockpit/remote_handle.json`.
+8. Force-push that handle to the `cockpit-handle` branch on GitHub so
    the agent can auto-discover the current URL without you pasting
    anything.
-8. Block on the tunnel. Ctrl+C in this window stops the tunnel; the
+9. Block on the tunnel. Ctrl+C in this window stops the tunnel; the
    cockpit keeps running in its own window.
 
 After launch, just say to the agent: *"connect to my cockpit"* — it
@@ -34,6 +38,7 @@ Flags:
 
 - `-NewToken` rotates the remote token (use if you suspect a leak).
 - `-NoPublish` skips the GitHub publish step (URL stays local only).
+- `-NoPull` skips the auto-pull step (boots whatever is on disk).
 
 ## Legacy / manual flow (Phase 36c)
 
