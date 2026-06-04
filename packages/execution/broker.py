@@ -292,6 +292,54 @@ class AlpacaPaperBroker(Broker):
                 "positions_response": closed,
             }
 
+    async def open_orders(self) -> list[dict[str, Any]]:
+        """Phase 36g — list every open (un-filled) order on the account.
+
+        Returns the raw JSON from ``GET /v2/orders?status=open``. Each row
+        contains at minimum ``symbol``, ``side``, ``qty``, and ``filled_qty``;
+        we deliberately don't dataclass-wrap it so the planner can compute
+        in-flight notional with whatever fields Alpaca actually returns.
+
+        This is what unblocks the buying-power 403 cascade: if the planner
+        knows about pending orders, it can avoid re-queueing duplicates and
+        subtract their reserved cash from the buying-power budget.
+        """
+        with span("broker.alpaca.open_orders"):
+            r = await self._client.get(
+                f"{self.base_url}/v2/orders",
+                params={"status": "open", "limit": 500, "nested": "true"},
+            )
+            if r.status_code >= 300:
+                raise BrokerError(
+                    f"alpaca open_orders {r.status_code}: {r.text[:200]}"
+                )
+            data = r.json()
+            return data if isinstance(data, list) else []
+
+    async def cancel_all_orders(self) -> dict[str, Any]:
+        """Phase 36g — cancel every open order WITHOUT closing positions.
+
+        ``liquidate_all`` is too aggressive when the problem is just stuck
+        pending orders eating buying power. This is the surgical version:
+        DELETE /v2/orders only, leave positions untouched.
+
+        Returns a summary dict like :meth:`liquidate_all`.
+        """
+        with span("broker.alpaca.cancel_all_orders"):
+            r = await self._client.delete(f"{self.base_url}/v2/orders")
+            if r.status_code >= 400:
+                raise BrokerError(
+                    f"alpaca cancel-orders {r.status_code}: {r.text[:200]}"
+                )
+            try:
+                rows = r.json() if r.text else []
+            except ValueError:
+                rows = []
+            return {
+                "cancelled_orders": len(rows) if isinstance(rows, list) else 0,
+                "orders_response": rows,
+            }
+
     async def aclose(self) -> None:
         await self._client.aclose()
 

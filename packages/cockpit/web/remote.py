@@ -344,6 +344,48 @@ def build_router() -> APIRouter:
             stop_info = {"running": False, "error": str(e)}
         return {"state": state.to_dict(), "job": stop_info}
 
+    @router.post("/cancel_orders")
+    def remote_cancel_orders(
+        authorization: Optional[str] = Header(default=None),
+        x_cockpit_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        """Phase 36g — cancel every open Alpaca order; positions untouched.
+
+        Surgical recovery for the buying-power 403 cascade: pre-market
+        orders held buying power, the planner kept re-queueing the same
+        symbols, every cycle 403'd. Cancelling open orders releases the
+        reserved cash without disturbing any holdings.
+
+        Unlike /liquidate, this is reversible (the bot will simply
+        re-plan the same orders on the next cycle if state still calls
+        for them) so we don't require a confirm token.
+        """
+        require_remote_auth(authorization, x_cockpit_token)
+        import asyncio
+        from packages.execution.broker import AlpacaPaperBroker, BrokerError
+
+        async def _run() -> dict[str, Any]:
+            broker = AlpacaPaperBroker()
+            try:
+                return await broker.cancel_all_orders()
+            finally:
+                await broker.aclose()
+
+        try:
+            result = asyncio.run(_run())
+        except BrokerError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e:  # pragma: no cover — defensive
+            raise HTTPException(status_code=500, detail=f"cancel failed: {e}")
+
+        state = load_state()
+        state = record_action(
+            state,
+            f"Cancel-all-orders via remote bridge ({result.get('cancelled_orders', 0)} cancelled)",
+        )
+        save_state(state)
+        return {"ok": True, "result": result, "state": state.to_dict()}
+
     @router.post("/liquidate")
     def remote_liquidate(
         body: RemoteLiquidate,

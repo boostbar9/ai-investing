@@ -985,9 +985,32 @@ async def plan_orders(
     broker: AlpacaPaperBroker,
     equity: float,
 ) -> list[PlannedOrder]:
-    """Diff target weights against current positions; size in shares."""
+    """Diff target weights against current positions; size in shares.
+
+    Phase 36g — pending-order guard. Before sizing, we fetch every
+    open (un-filled) order on the account and SKIP planning for any
+    symbol that already has an in-flight order on the same side. This
+    prevents the 403 cascade we saw on 2026-06-04 where pre-market
+    orders held buying power, the next cycle still saw zero positions,
+    re-planned the same 10 buys, and Alpaca rejected every one with
+    'insufficient buying power'.
+    """
     positions = await broker.positions()
     pos_by_sym = {p.symbol: p for p in positions}
+
+    # Phase 36g: pending-order guard. Best-effort — if Alpaca's
+    # /v2/orders is down we'd rather plan than block, so we swallow
+    # broker errors and log them. A working call returns a list of
+    # raw order rows; we collapse to a set keyed by (symbol, side).
+    pending_keys: set[tuple[str, str]] = set()
+    try:
+        for row in await broker.open_orders():
+            sym = str(row.get("symbol", "")).upper()
+            side = str(row.get("side", "")).lower()
+            if sym and side in ("buy", "sell"):
+                pending_keys.add((sym, side))
+    except Exception as e:  # pragma: no cover — defensive
+        log.warning("open_orders fetch failed; skipping pending-order guard: %s", e)
 
     # Current weights = position market value / equity
     current_weights: dict[str, float] = {}
@@ -1011,11 +1034,26 @@ async def plan_orders(
 
     all_symbols = set(target_weights) | set(current_weights)
     planned: list[PlannedOrder] = []
+    skipped_pending = 0
     for sym in sorted(all_symbols):
         tw = target_weights.get(sym, 0.0)
         cw = current_weights.get(sym, 0.0)
         delta = tw - cw
         if abs(delta) * 10000 < MIN_REBALANCE_BPS:
+            continue
+        side = "buy" if delta > 0 else "sell"
+        # Phase 36g — if there's already an open order for this
+        # (symbol, side), the broker has already reserved buying
+        # power for it; submitting again would just get a 403. Check
+        # this BEFORE pricing so we still log the skip even when
+        # market data is unavailable.
+        if (sym, side) in pending_keys:
+            skipped_pending += 1
+            log.info(
+                "skipping %s %s: pending order already in flight",
+                side,
+                sym,
+            )
             continue
         px = last_price.get(sym)
         if px is None or px <= 0:
@@ -1027,7 +1065,6 @@ async def plan_orders(
         qty = round(qty, 4)
         if qty <= 0:
             continue
-        side = "buy" if delta > 0 else "sell"
         # Don't sell more than we hold; cap to current qty.
         if side == "sell":
             current_qty = pos_by_sym[sym].qty if sym in pos_by_sym else 0.0
@@ -1044,6 +1081,11 @@ async def plan_orders(
                 delta_weight=delta,
                 last_price=px,
             )
+        )
+    if skipped_pending:
+        log.info(
+            "pending-order guard: skipped %d symbol(s) with in-flight orders",
+            skipped_pending,
         )
     return planned
 
