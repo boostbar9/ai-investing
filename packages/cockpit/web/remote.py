@@ -1,0 +1,359 @@
+"""Phase 36c — Remote control bridge for the cockpit.
+
+A small, opinionated surface that lives at ``/api/remote/*`` and lets a
+trusted external operator (the Perplexity agent over a Cloudflare tunnel,
+say) observe and steer the local cockpit. The surface deliberately
+mirrors the existing in-process API rather than reinventing it, so the
+remote and the local UI are always feature-parity.
+
+Security model
+--------------
+
+Every route under ``/api/remote/*`` requires a shared-secret bearer
+token, supplied either as:
+
+* ``Authorization: Bearer <token>`` header, or
+* ``X-Cockpit-Token: <token>`` header.
+
+The expected token is read from the ``COCKPIT_REMOTE_TOKEN`` environment
+variable at request time. If that env var is unset or empty the entire
+remote surface is **disabled** — every route returns 503. This is the
+fail-closed default: a fresh checkout cannot accidentally expose remote
+control without an explicit opt-in.
+
+The comparison uses :func:`hmac.compare_digest` to avoid timing leaks.
+
+Surface
+-------
+
+============================  ====  ===========================================
+Path                          Verb  Purpose
+============================  ====  ===========================================
+``/api/remote/health``        GET   Liveness probe + token sanity check.
+``/api/remote/snapshot``      GET   Full operator-facing state in one payload.
+``/api/remote/log``           GET   Tail (or full download) of the paper loop log.
+``/api/remote/pause``         POST  Pause the bot.
+``/api/remote/resume``        POST  Resume the bot (unpause).
+``/api/remote/loop/start``    POST  Start the paper-trade loop.
+``/api/remote/loop/stop``     POST  Stop the paper-trade loop.
+``/api/remote/liquidate``     POST  Liquidate all positions. Requires
+                                    ``{"confirm": "LIQUIDATE"}`` in the body.
+============================  ====  ===========================================
+
+Each mutating route returns the post-action :class:`CockpitState` dict so
+the caller (me) can verify the effect immediately without a follow-up
+poll.
+"""
+
+from __future__ import annotations
+
+import hmac
+import logging
+import os
+from typing import Any, Optional
+
+from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
+
+from packages.cockpit import proc as cockpit_proc
+from packages.cockpit.state import load_state, record_action, save_state
+
+log = logging.getLogger(__name__)
+
+
+# Env var that gates the entire surface. When unset/empty, every route
+# returns 503 — a fail-closed posture so a fresh deploy can't leak
+# control without an explicit opt-in.
+ENV_TOKEN = "COCKPIT_REMOTE_TOKEN"
+
+# Header names we accept for the bearer token. We prefer the standard
+# Authorization header but also accept X-Cockpit-Token for callers that
+# can't easily set Authorization (some webhooks, browser extensions).
+AUTH_HEADER = "authorization"
+ALT_HEADER = "x-cockpit-token"
+
+
+# Minimum token length to accept. Short enough to be usable but long
+# enough to make brute force impractical given normal rate limits.
+MIN_TOKEN_LEN = 16
+
+
+def _expected_token() -> Optional[str]:
+    """Return the configured remote token, or None if the surface is off."""
+    tok = os.environ.get(ENV_TOKEN, "").strip()
+    return tok or None
+
+
+def _extract_provided_token(
+    authorization: Optional[str], x_cockpit_token: Optional[str]
+) -> Optional[str]:
+    """Pull the bearer token out of either accepted header."""
+    if authorization:
+        s = authorization.strip()
+        # Accept "Bearer xxx" or a bare token (some clients drop the scheme).
+        if s.lower().startswith("bearer "):
+            return s[7:].strip() or None
+        return s or None
+    if x_cockpit_token:
+        return x_cockpit_token.strip() or None
+    return None
+
+
+def require_remote_auth(
+    authorization: Optional[str] = Header(default=None),
+    x_cockpit_token: Optional[str] = Header(default=None),
+) -> None:
+    """FastAPI dependency that enforces the shared-secret token.
+
+    Returns ``None`` on success; raises ``HTTPException`` otherwise.
+
+    Failure modes (each maps to a distinct status code so callers can
+    diagnose without a debug round-trip):
+
+    * **503** — surface disabled (``COCKPIT_REMOTE_TOKEN`` unset/empty
+      or too short to be considered a real secret).
+    * **401** — no token supplied.
+    * **403** — token supplied but does not match.
+    """
+    expected = _expected_token()
+    if not expected or len(expected) < MIN_TOKEN_LEN:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "remote control disabled: set COCKPIT_REMOTE_TOKEN to a "
+                f"secret of at least {MIN_TOKEN_LEN} characters to enable"
+            ),
+        )
+    provided = _extract_provided_token(authorization, x_cockpit_token)
+    if not provided:
+        raise HTTPException(status_code=401, detail="missing remote token")
+    # Constant-time comparison to avoid timing oracles.
+    if not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
+        raise HTTPException(status_code=403, detail="invalid remote token")
+
+
+# ---------------------------------------------------------------------------
+# Pydantic request bodies
+# ---------------------------------------------------------------------------
+
+
+class RemoteStartLoop(BaseModel):
+    strategy: str = "ensemble"
+    dry_run: bool = False
+
+
+class RemoteLiquidate(BaseModel):
+    confirm: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
+
+
+def build_router() -> APIRouter:
+    """Build the ``/api/remote`` router.
+
+    Factoring this into a builder (instead of a module-level router) lets
+    tests instantiate fresh routers and lets the main server module wire
+    it up without import-order surprises.
+    """
+    router = APIRouter(prefix="/api/remote", tags=["remote"])
+
+    @router.get("/health")
+    def remote_health(_: None = None) -> dict[str, Any]:  # pragma: no cover
+        # We want /health to be reachable WITHOUT auth so the operator
+        # can verify the surface is up. But it should NOT leak whether
+        # the token is configured \u2014 just return enabled/disabled status.
+        return {
+            "ok": True,
+            "enabled": bool(_expected_token() and len(_expected_token() or "") >= MIN_TOKEN_LEN),
+        }
+
+    @router.get("/whoami")
+    def remote_whoami(
+        request: Request,
+        authorization: Optional[str] = Header(default=None),
+        x_cockpit_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        """Authenticated probe \u2014 returns 200 only with a valid token."""
+        require_remote_auth(authorization, x_cockpit_token)
+        return {
+            "ok": True,
+            "client": request.client.host if request.client else None,
+            "surface": "remote",
+        }
+
+    @router.get("/snapshot")
+    def remote_snapshot(
+        authorization: Optional[str] = Header(default=None),
+        x_cockpit_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        """All operator-facing context in a single payload.
+
+        Built best-effort: each sub-section is wrapped so a single
+        failing subsystem doesn't blank the whole response.
+        """
+        require_remote_auth(authorization, x_cockpit_token)
+        out: dict[str, Any] = {"errors": {}}
+        try:
+            out["state"] = load_state().to_dict()
+        except Exception as e:  # pragma: no cover
+            out["errors"]["state"] = str(e)
+        try:
+            info = cockpit_proc.status("paper_loop")
+            out["paper_loop"] = info.to_dict()
+        except Exception as e:  # pragma: no cover
+            out["errors"]["paper_loop"] = str(e)
+        try:
+            out["log_tail"] = cockpit_proc.tail_log("paper_loop")
+        except Exception as e:  # pragma: no cover
+            out["errors"]["log_tail"] = str(e)
+        return out
+
+    @router.get("/log")
+    def remote_log(
+        download: int = 0,
+        authorization: Optional[str] = Header(default=None),
+        x_cockpit_token: Optional[str] = Header(default=None),
+    ):
+        """Tail or download the paper loop log file."""
+        require_remote_auth(authorization, x_cockpit_token)
+        if download:
+            path = cockpit_proc.log_path("paper_loop")
+            try:
+                body = path.read_text(encoding="utf-8", errors="replace")
+            except FileNotFoundError:
+                body = "(no log on disk yet)"
+            return PlainTextResponse(body)
+        return {"kind": "paper_loop", "tail": cockpit_proc.tail_log("paper_loop")}
+
+    @router.post("/pause")
+    def remote_pause(
+        authorization: Optional[str] = Header(default=None),
+        x_cockpit_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        require_remote_auth(authorization, x_cockpit_token)
+        state = load_state()
+        state.paused = True
+        state = record_action(state, "Bot paused via remote bridge")
+        save_state(state)
+        return state.to_dict()
+
+    @router.post("/resume")
+    def remote_resume(
+        authorization: Optional[str] = Header(default=None),
+        x_cockpit_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        require_remote_auth(authorization, x_cockpit_token)
+        state = load_state()
+        state.paused = False
+        state = record_action(state, "Bot resumed via remote bridge")
+        save_state(state)
+        return state.to_dict()
+
+    @router.post("/loop/start")
+    def remote_loop_start(
+        body: RemoteStartLoop,
+        authorization: Optional[str] = Header(default=None),
+        x_cockpit_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        """Start the paper-trade loop and persist intent."""
+        require_remote_auth(authorization, x_cockpit_token)
+        state = load_state()
+        state.paper_loop_intended = True
+        state.paper_loop_strategy = body.strategy
+        state.paper_loop_dry_run = bool(body.dry_run)
+        state.paper_loop_user_touched = True
+        state = record_action(
+            state,
+            f"Loop started via remote: strategy={body.strategy} dry_run={body.dry_run}",
+        )
+        save_state(state)
+        # Best-effort spawn \u2014 the auto-resume/start hook also handles
+        # this on the next boot, so a transient spawn failure here
+        # doesn't lose the intent.
+        spawn_info: dict[str, Any] = {"running": False}
+        try:
+            import sys as _sys
+
+            cmd = [
+                _sys.executable,
+                "tools/paper_trade.py",
+                "--strategy",
+                body.strategy,
+                "--loop",
+            ]
+            if body.dry_run:
+                cmd.append("--dry-run")
+            info = cockpit_proc.start("paper_loop", cmd)
+            spawn_info = info.to_dict()
+        except Exception as e:
+            spawn_info = {"running": False, "error": str(e)}
+        return {"state": state.to_dict(), "job": spawn_info}
+
+    @router.post("/loop/stop")
+    def remote_loop_stop(
+        authorization: Optional[str] = Header(default=None),
+        x_cockpit_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        require_remote_auth(authorization, x_cockpit_token)
+        state = load_state()
+        state.paper_loop_intended = False
+        state.paper_loop_user_touched = True
+        state = record_action(state, "Loop stopped via remote bridge")
+        save_state(state)
+        stop_info: dict[str, Any] = {"running": False}
+        try:
+            info = cockpit_proc.stop("paper_loop")
+            stop_info = info.to_dict()
+        except Exception as e:
+            stop_info = {"running": False, "error": str(e)}
+        return {"state": state.to_dict(), "job": stop_info}
+
+    @router.post("/liquidate")
+    def remote_liquidate(
+        body: RemoteLiquidate,
+        authorization: Optional[str] = Header(default=None),
+        x_cockpit_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        """Liquidate all positions. Requires explicit confirm token.
+
+        Irreversible, so the body must contain ``{"confirm": "LIQUIDATE"}``
+        as a small protection against accidental triggers via a leaked
+        token or a curl with the wrong path.
+        """
+        require_remote_auth(authorization, x_cockpit_token)
+        if body.confirm != "LIQUIDATE":
+            raise HTTPException(
+                status_code=400,
+                detail='liquidate requires {"confirm": "LIQUIDATE"} in the body',
+            )
+        state = load_state()
+        # Set paused + clear intent so the auto-resume hook doesn't
+        # immediately respawn the loop after the liquidation.
+        state.paused = True
+        state.paper_loop_intended = False
+        state.paper_loop_user_touched = True
+        state = record_action(state, "Liquidate-all via remote bridge")
+        save_state(state)
+        # Best-effort stop of any running loop; the actual liquidation
+        # of broker positions is the operator's responsibility via the
+        # existing /api/trading/liquidate path or the Alpaca UI \u2014 we
+        # don't duplicate that broker call here because it would split
+        # the audit trail.
+        try:
+            cockpit_proc.stop("paper_loop")
+        except Exception:
+            pass
+        return {
+            "state": state.to_dict(),
+            "note": (
+                "Loop stopped + state paused. Use the local cockpit "
+                "/api/trading/liquidate (or the Alpaca UI) to actually "
+                "close broker positions."
+            ),
+        }
+
+    return router

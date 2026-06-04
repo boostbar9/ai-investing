@@ -451,6 +451,14 @@ def equity_curve_points(window: int = 90) -> list[dict[str, Any]]:
 
 app = FastAPI(title="ai-investing cockpit", version="0.1.0")
 
+# Phase 36c — remote-control bridge. The router is fail-closed: every
+# /api/remote/* route returns 503 unless COCKPIT_REMOTE_TOKEN is set to
+# a secret of at least 16 characters. See packages/cockpit/web/remote.py
+# for the security model and full surface description.
+from packages.cockpit.web import remote as _remote_module  # noqa: E402
+
+app.include_router(_remote_module.build_router())
+
 # Mount static assets (shared CSS/JS for every page).
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
