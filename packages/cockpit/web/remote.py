@@ -148,6 +148,19 @@ class RemoteLiquidate(BaseModel):
     confirm: str = ""
 
 
+class RemoteRestart(BaseModel):
+    """Body for /restart.
+
+    ``pull``: whether the detached helper should pull from origin before
+    relaunching uvicorn. Default True (the whole point of restart).
+    ``delay_sec``: how long the helper waits before killing uvicorn so
+    this HTTP response can flush. Default 2s. Bounded [1, 10].
+    """
+
+    pull: bool = True
+    delay_sec: int = 2
+
+
 class RemoteUpdate(BaseModel):
     """Body for /update/apply.
 
@@ -503,6 +516,114 @@ def build_router() -> APIRouter:
             "update": update_result,
             "state": state.to_dict(),
             "job": spawn_info,
+        }
+
+    @router.post("/restart")
+    def remote_restart(
+        body: RemoteRestart,
+        authorization: Optional[str] = Header(default=None),
+        x_cockpit_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        """Spawn a detached helper that kills this cockpit and relaunches.
+
+        Returns immediately (before the kill happens) so the HTTP
+        response can flush. The helper waits ``delay_sec`` seconds,
+        kills uvicorn (this process), optionally git pulls, pip
+        installs, then relaunches uvicorn in a new window with the same
+        token.
+
+        Windows-only by design \u2014 uses powershell.exe + Start-Process
+        for true detachment. On non-Windows hosts we return 501.
+        """
+        require_remote_auth(authorization, x_cockpit_token)
+
+        import os as _os
+        import subprocess as _sp
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        if _sys.platform != "win32":
+            raise HTTPException(
+                status_code=501,
+                detail="remote restart is Windows-only (uses powershell.exe Start-Process)",
+            )
+
+        # Resolve repo root from this file's location: packages/cockpit/web/remote.py
+        # -> parents[3] == repo root.
+        repo_root = _Path(__file__).resolve().parents[3]
+        helper = repo_root / "tools" / "cockpit_restart_helper.ps1"
+        if not helper.exists():
+            raise HTTPException(
+                status_code=500,
+                detail=f"helper script missing at {helper}",
+            )
+
+        venv_python = repo_root / ".venv" / "Scripts" / "python.exe"
+        token = _os.environ.get(ENV_TOKEN, "")
+        delay = max(1, min(10, int(body.delay_sec)))
+        # PID 0 means "this process" \u2014 the helper resolves it.
+        my_pid = _os.getpid()
+
+        ps_args = [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(helper),
+            "-UvicornPid",
+            str(my_pid),
+            "-RepoRoot",
+            str(repo_root),
+            "-VenvPython",
+            str(venv_python),
+            "-Token",
+            token,
+            "-DelaySec",
+            str(delay),
+        ]
+        if not body.pull:
+            ps_args.append("-NoPull")
+
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        # so the helper survives our death. close_fds + no stdio so we
+        # don't hold pipes back into a dying parent.
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        try:
+            _sp.Popen(
+                ps_args,
+                cwd=str(repo_root),
+                stdin=_sp.DEVNULL,
+                stdout=_sp.DEVNULL,
+                stderr=_sp.DEVNULL,
+                close_fds=True,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            )
+        except Exception as e:  # pragma: no cover - hard to simulate in CI
+            raise HTTPException(
+                status_code=500,
+                detail=f"failed to spawn restart helper: {e}",
+            )
+
+        state = load_state()
+        state = record_action(
+            state,
+            f"Restart helper spawned via remote (pull={body.pull}, delay={delay}s)",
+        )
+        save_state(state)
+
+        return {
+            "ok": True,
+            "helper": "spawned",
+            "delay_sec": delay,
+            "pull": body.pull,
+            "pid_to_kill": my_pid,
+            "note": (
+                "Cockpit will go down in ~{0}s, then come back up in "
+                "~10-30s. Poll /api/remote/version to confirm new SHA.".format(delay)
+            ),
+            "state": state.to_dict(),
         }
 
     return router
