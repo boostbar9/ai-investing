@@ -37,7 +37,7 @@ def fetch_handle(owner: str, repo: str, branch: str = "cockpit-handle") -> dict[
     payload = json.loads(proc.stdout)
     if "content" not in payload:
         raise RuntimeError(f"unexpected payload (no content field): keys={list(payload)}")
-    raw = base64.b64decode(payload["content"]).decode("utf-8")
+    raw = base64.b64decode(payload["content"]).decode("utf-8-sig")  # tolerate BOM from PS
     return json.loads(raw)
 
 
