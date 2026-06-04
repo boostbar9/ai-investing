@@ -175,7 +175,9 @@ Write-Host "Public URL : $publicUrl" -ForegroundColor Green
 Write-Host "Token      : $token" -ForegroundColor Green
 Write-Host ""
 Write-Host "Verify with:" -ForegroundColor Yellow
-Write-Host "  curl -H `"Authorization: Bearer $token`" $publicUrl/api/remote/whoami"
+$dq = [char]34
+$verifyCmd = "  curl -H ${dq}Authorization: Bearer ${token}${dq} ${publicUrl}/api/remote/whoami"
+Write-Host $verifyCmd
 Write-Host ""
 Write-Host "Tell the agent:" -ForegroundColor Yellow
 Write-Host "  My cockpit is at $publicUrl with token $token"
