@@ -1,10 +1,10 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     One-click Cloudflare tunnel launcher for the ai-investing cockpit.
 
 .DESCRIPTION
-    Phase 36c — exposes your locally running cockpit (default
+    Phase 36c -- exposes your locally running cockpit (default
     http://127.0.0.1:8000) to a public *.trycloudflare.com URL using
     Cloudflare's free quick-tunnel feature (no Cloudflare account
     required for testing). Designed for the Windows PC that runs the
@@ -41,7 +41,7 @@
     Rotates the remote token and starts a fresh tunnel.
 
 .NOTES
-    Quick tunnels (*.trycloudflare.com) are ephemeral — the URL
+    Quick tunnels (*.trycloudflare.com) are ephemeral -- the URL
     changes every restart. For a stable hostname, log into Cloudflare
     and create a named tunnel; the script will use it automatically if
     CLOUDFLARED_TUNNEL_NAME is set in the environment.
@@ -83,7 +83,7 @@ function New-RemoteToken {
 
 function Install-Cloudflared {
     if (Test-Path $CloudflaredExe) { return $CloudflaredExe }
-    Write-Host "cloudflared not found — downloading to $BinDir ..." -ForegroundColor Yellow
+    Write-Host "cloudflared not found -- downloading to $BinDir ..." -ForegroundColor Yellow
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
     $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
     Invoke-WebRequest -Uri $url -OutFile $CloudflaredExe -UseBasicParsing
