@@ -57,6 +57,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from packages.cockpit import proc as cockpit_proc
+from packages.cockpit import updater as cockpit_updater
 from packages.cockpit.state import load_state, record_action, save_state
 
 log = logging.getLogger(__name__)
@@ -145,6 +146,24 @@ class RemoteStartLoop(BaseModel):
 
 class RemoteLiquidate(BaseModel):
     confirm: str = ""
+
+
+class RemoteUpdate(BaseModel):
+    """Body for /update/apply.
+
+    ``restart_loop``: after a successful pull+pip, stop and respawn the
+    paper-trade loop so the new code is actually running. Default True
+    because that's the whole point of a remote update; the operator can
+    pass False to apply code changes that don't affect the loop (UI,
+    docs, tests).
+    ``dry_run``: when the loop is restarted, pass through the dry-run
+    flag. Defaults to False to match the operator's current intent.
+    ``strategy``: strategy name for the respawn. Defaults to ensemble.
+    """
+
+    restart_loop: bool = True
+    dry_run: bool = False
+    strategy: str = "ensemble"
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +373,136 @@ def build_router() -> APIRouter:
                 "/api/trading/liquidate (or the Alpaca UI) to actually "
                 "close broker positions."
             ),
+        }
+
+    @router.get("/version")
+    def remote_version(
+        authorization: Optional[str] = Header(default=None),
+        x_cockpit_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        """Local HEAD commit \u2014 lets the agent verify what's running.
+
+        Wraps :func:`updater.current_commit`. Always returns 200 with the
+        best-effort fields the underlying git calls produce; if git is
+        unavailable the fields are empty strings rather than an error.
+        """
+        require_remote_auth(authorization, x_cockpit_token)
+        try:
+            return {"ok": True, "current": cockpit_updater.current_commit()}
+        except Exception as e:  # pragma: no cover - defensive
+            return {"ok": False, "error": str(e)}
+
+    @router.get("/update/check")
+    def remote_update_check(
+        authorization: Optional[str] = Header(default=None),
+        x_cockpit_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        """Fetch origin and report how far behind HEAD is.
+
+        Read-only: runs ``git fetch`` + ``git rev-list --count`` but never
+        moves HEAD. Safe to poll from a watchdog.
+        """
+        require_remote_auth(authorization, x_cockpit_token)
+        try:
+            return cockpit_updater.check_updates()
+        except Exception as e:  # pragma: no cover - defensive
+            return {"ok": False, "error": str(e)}
+
+    @router.post("/update/apply")
+    def remote_update_apply(
+        body: RemoteUpdate,
+        authorization: Optional[str] = Header(default=None),
+        x_cockpit_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        """Pull origin (fast-forward only), reinstall, optionally restart loop.
+
+        The flow is:
+
+        1. Call :func:`updater.apply_update` which does ``git pull --ff-only``
+           then ``pip install -e .``. Both are bounded by timeouts inside
+           the helper. If either step fails the response is ``ok=False``
+           with the captured log; the running loop is left untouched.
+        2. If ``restart_loop`` is True (default), stop the existing
+           paper_loop process and spawn a new one using the body's
+           strategy + dry_run. State intent is set so the auto-resume
+           hook respects the new config across cockpit restarts.
+
+        Returns a dict with three top-level keys:
+
+        * ``update``  \u2014 the updater result (ok/log/current).
+        * ``state``   \u2014 the post-action cockpit state.
+        * ``job``     \u2014 the post-action paper_loop process info
+          (or ``{"skipped": True}`` if restart_loop was False).
+        """
+        require_remote_auth(authorization, x_cockpit_token)
+        # Step 1: pull + pip. This is the only step that can fail in a
+        # way that should abort the rest \u2014 we don't want to restart
+        # the loop into a half-applied state.
+        try:
+            update_result = cockpit_updater.apply_update()
+        except Exception as e:
+            update_result = {"ok": False, "step": "exception", "log": str(e)}
+        if not update_result.get("ok"):
+            # Leave the running loop alone, return the failure log.
+            return {
+                "update": update_result,
+                "state": load_state().to_dict(),
+                "job": {"skipped": True, "reason": "update failed"},
+            }
+
+        # Step 2: optional restart. Mirrors loop_start logic so the
+        # surface stays consistent.
+        if not body.restart_loop:
+            return {
+                "update": update_result,
+                "state": load_state().to_dict(),
+                "job": {"skipped": True, "reason": "restart_loop=False"},
+            }
+
+        # Best-effort stop of any existing loop. We don't bail on stop
+        # failure \u2014 start() will detect a still-running process and
+        # surface it in the returned info dict.
+        try:
+            cockpit_proc.stop("paper_loop")
+        except Exception:
+            pass
+
+        state = load_state()
+        state.paper_loop_intended = True
+        state.paper_loop_strategy = body.strategy
+        state.paper_loop_dry_run = bool(body.dry_run)
+        state.paper_loop_user_touched = True
+        state = record_action(
+            state,
+            (
+                "Loop restarted via remote update: "
+                f"strategy={body.strategy} dry_run={body.dry_run}"
+            ),
+        )
+        save_state(state)
+
+        spawn_info: dict[str, Any] = {"running": False}
+        try:
+            import sys as _sys
+
+            cmd = [
+                _sys.executable,
+                "tools/paper_trade.py",
+                "--strategy",
+                body.strategy,
+                "--loop",
+            ]
+            if body.dry_run:
+                cmd.append("--dry-run")
+            info = cockpit_proc.start("paper_loop", cmd)
+            spawn_info = info.to_dict()
+        except Exception as e:
+            spawn_info = {"running": False, "error": str(e)}
+
+        return {
+            "update": update_result,
+            "state": state.to_dict(),
+            "job": spawn_info,
         }
 
     return router
