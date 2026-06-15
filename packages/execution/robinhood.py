@@ -25,6 +25,7 @@ ourselves.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -152,6 +153,102 @@ def load_shadow_trades(path: Path | None = None) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# MCP payload normalization
+#
+# The MCP spec wraps every ``tools/call`` result in a list of content
+# blocks, e.g. ``[{"type": "text", "text": "<json string>"}]`` or a
+# structured ``{"type": "json", "json": {...}}``. Robinhood's tools
+# return their domain payload inside that envelope, and the exact shape
+# varies by tool + server version. These helpers unwrap the envelope so
+# the broker's parsing code can treat results as plain dicts / lists
+# regardless of how the server framed them.
+# ---------------------------------------------------------------------------
+
+
+def _unwrap_content(content: Any) -> Any:
+    """Best-effort unwrap of an MCP content payload to a Python object.
+
+    Handles three layouts:
+      1. Already a dict / list -> returned as-is (unless it's a list of
+         content blocks, which we drill into).
+      2. A list of content blocks ``[{"type": "text", "text": ...}, ...]``
+         -> the first block carrying a ``text`` (JSON-decoded when it
+         parses) or ``json`` field wins.
+      3. A JSON string -> decoded.
+    Returns the original value when nothing better can be extracted.
+    """
+    if content is None:
+        return None
+    if isinstance(content, str):
+        try:
+            return json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            return content
+    if isinstance(content, dict):
+        # A single content block masquerading as the whole payload.
+        if "json" in content and isinstance(content.get("json"), (dict, list)):
+            return content["json"]
+        if "text" in content and isinstance(content.get("text"), str):
+            return _unwrap_content(content["text"])
+        return content
+    if isinstance(content, list):
+        # MCP content-block list: prefer json blocks, then text blocks.
+        for block in content:
+            if isinstance(block, dict) and isinstance(
+                block.get("json"), (dict, list)
+            ):
+                return block["json"]
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                unwrapped = _unwrap_content(block["text"])
+                if isinstance(unwrapped, (dict, list)):
+                    return unwrapped
+        # Otherwise it may already be a list of domain rows.
+        return content
+    return content
+
+
+def _normalize_rows(content: Any, *, keys: tuple[str, ...]) -> list[Any]:
+    """Normalize an MCP payload to a list of rows.
+
+    Unwraps content blocks, then if the result is a dict, pulls the
+    first matching ``keys`` entry that holds a list. Returns ``[]`` when
+    no list can be found.
+    """
+    obj = _unwrap_content(content)
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        for key in keys:
+            val = obj.get(key)
+            if isinstance(val, list):
+                return val
+    return []
+
+
+def _normalize_obj(content: Any) -> dict[str, Any]:
+    """Normalize an MCP payload to a single dict (``{}`` when not a dict)."""
+    obj = _unwrap_content(content)
+    if isinstance(obj, dict):
+        return obj
+    # Some tools return a single-element list wrapping the object.
+    if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+        return obj[0]
+    return {}
+
+
+def _first_float(obj: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    """Return the first key in ``keys`` that parses to a float, else None."""
+    for key in keys:
+        if key in obj and obj[key] is not None:
+            try:
+                return float(obj[key])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Broker
 # ---------------------------------------------------------------------------
 
@@ -256,10 +353,15 @@ class RobinhoodAgenticBroker(Broker):
 
     async def positions(self) -> list[BrokerPosition]:
         """Read positions from Robinhood. Safe in shadow mode because
-        this is read-only -- no orders submitted, no cap concern."""
+        this is read-only -- no orders submitted, no cap concern.
+
+        Uses the real Robinhood MCP tool name ``get_equity_positions``
+        (the agentic-trading server exposes ``get_equity_positions``,
+        not the legacy ``list_positions`` guess).
+        """
         try:
             client = await self._client()
-            result = await client.call_tool("list_positions", {})
+            result = await client.call_tool("get_equity_positions", {})
         except BrokerError:
             return []  # no token yet -- caller treats as empty portfolio
         except McpError as exc:
@@ -267,10 +369,11 @@ class RobinhoodAgenticBroker(Broker):
             return []
 
         # The server is the source of truth on payload shape. We accept
-        # a flexible structure and skip rows we can't parse.
-        items = result.content or []
-        if isinstance(items, dict):  # some MCP servers wrap in {"items": ...}
-            items = items.get("positions") or items.get("items") or []
+        # a flexible structure and skip rows we can't parse. MCP wraps
+        # tool results in content blocks, so normalize first.
+        items = _normalize_rows(
+            result.content, keys=("positions", "equity_positions", "items", "results")
+        )
         out: list[BrokerPosition] = []
         for row in items if isinstance(items, list) else []:
             if not isinstance(row, dict):
@@ -296,6 +399,128 @@ class RobinhoodAgenticBroker(Broker):
             except (KeyError, ValueError, TypeError):
                 continue
         return out
+
+    async def account_snapshot(self) -> dict[str, Any]:
+        """Read a live, read-only snapshot of the connected Robinhood
+        account so the AI has real account context (buying power,
+        cash, total equity, and current positions) when reasoning
+        about the market.
+
+        This is ALWAYS read-only and therefore safe in shadow mode --
+        it never submits, reviews, or cancels an order. It calls the
+        real Robinhood agentic-trading read tools:
+
+          * ``get_accounts``  -> account list (cash / buying power)
+          * ``portfolio``     -> portfolio equity + day change
+          * ``get_equity_positions`` (via :meth:`positions`)
+
+        Returns a plain dict (never raises) shaped for the cockpit +
+        agent context. On any failure the relevant section is left
+        empty / ``None`` and ``connected`` reflects whether we have a
+        usable token, so the UI can degrade gracefully:
+
+            {
+              "connected": bool,
+              "mode": "shadow" | "live",
+              "as_of": ISO-8601 str,
+              "accounts": [ {...}, ... ],
+              "portfolio": {...} | None,
+              "positions": [ {position dict}, ... ],
+              "buying_power": float | None,
+              "cash": float | None,
+              "total_equity": float | None,
+              "errors": [ str, ... ],
+            }
+        """
+        snap: dict[str, Any] = {
+            "connected": is_connected(),
+            "mode": "shadow" if self._is_shadow() else "live",
+            "as_of": datetime.now(UTC).isoformat(timespec="seconds"),
+            "accounts": [],
+            "portfolio": None,
+            "positions": [],
+            "buying_power": None,
+            "cash": None,
+            "total_equity": None,
+            "errors": [],
+        }
+        if not snap["connected"]:
+            return snap
+
+        try:
+            client = await self._client()
+        except BrokerError as exc:
+            # No usable token / refresh failed -- report, don't raise.
+            snap["connected"] = False
+            snap["errors"].append(f"client: {exc}")
+            return snap
+        except McpError as exc:  # pragma: no cover -- defensive
+            snap["errors"].append(f"client: {exc}")
+            return snap
+
+        # ---- accounts (cash + buying power) -----------------------------
+        try:
+            res = await client.call_tool("get_accounts", {})
+            accounts = _normalize_rows(
+                res.content, keys=("accounts", "results", "items")
+            )
+            if isinstance(accounts, list):
+                snap["accounts"] = [a for a in accounts if isinstance(a, dict)]
+        except McpError as exc:
+            snap["errors"].append(f"get_accounts: {exc}")
+
+        # Derive top-line cash / buying power from the first account that
+        # exposes them (field names vary across server versions).
+        for acct in snap["accounts"]:
+            if snap["buying_power"] is None:
+                snap["buying_power"] = _first_float(
+                    acct, ("buying_power", "buyingPower", "buying_power_usd")
+                )
+            if snap["cash"] is None:
+                snap["cash"] = _first_float(
+                    acct, ("cash", "cash_balance", "cashBalance", "uncleared_deposits")
+                )
+
+        # ---- portfolio (total equity + day change) ----------------------
+        try:
+            res = await client.call_tool("portfolio", {})
+            portfolio = _normalize_obj(res.content)
+            if portfolio:
+                snap["portfolio"] = portfolio
+                snap["total_equity"] = _first_float(
+                    portfolio,
+                    (
+                        "equity",
+                        "total_equity",
+                        "market_value",
+                        "extended_hours_equity",
+                        "portfolio_value",
+                    ),
+                )
+                if snap["buying_power"] is None:
+                    snap["buying_power"] = _first_float(
+                        portfolio, ("buying_power", "buyingPower")
+                    )
+        except McpError as exc:
+            snap["errors"].append(f"portfolio: {exc}")
+
+        # ---- positions (reuse the parsed BrokerPosition path) -----------
+        try:
+            snap["positions"] = [p.to_dict() for p in await self.positions()]
+        except Exception as exc:  # pragma: no cover -- positions() is defensive
+            snap["errors"].append(f"positions: {exc}")
+
+        return snap
+
+    async def aclose(self) -> None:
+        """Close the cached MCP client if we own one. Safe to call
+        multiple times and when no client was ever built. The injected
+        override client is left alone -- its owner is responsible for it.
+        """
+        if self._mcp is not None:
+            with contextlib.suppress(Exception):
+                await self._mcp.aclose()
+            self._mcp = None
 
     async def submit(self, req: OrderRequest) -> OrderAck:
         """Submit an order, gated by mode + float cap.
@@ -363,7 +588,7 @@ class RobinhoodAgenticBroker(Broker):
         client = await self._client()
         try:
             result = await client.call_tool(
-                "submit_order",
+                "place_equity_order",
                 {
                     "symbol": req.symbol,
                     "side": side,
@@ -381,7 +606,7 @@ class RobinhoodAgenticBroker(Broker):
                 f"robinhood rejected order: {result.content!r}"
             )
 
-        content = result.content if isinstance(result.content, dict) else {}
+        content = _normalize_obj(result.content)
         return OrderAck(
             broker=self.name,
             broker_order_id=str(content.get("order_id") or content.get("id") or ""),
@@ -577,6 +802,49 @@ def build_broker_from_settings() -> RobinhoodAgenticBroker:
     return RobinhoodAgenticBroker(mode=mode)
 
 
+async def robinhood_account_snapshot() -> dict[str, Any]:
+    """Convenience wrapper used by the cockpit + agent context.
+
+    Builds a broker honoring the user's onboarding mode and returns a
+    read-only :meth:`RobinhoodAgenticBroker.account_snapshot`. Always
+    closes the MCP client afterwards and never raises -- on any failure
+    it returns a snapshot with ``connected=False`` and an ``errors``
+    entry so callers (UI / agent) can degrade gracefully.
+    """
+    if not is_connected():
+        return {
+            "connected": False,
+            "mode": "shadow",
+            "as_of": datetime.now(UTC).isoformat(timespec="seconds"),
+            "accounts": [],
+            "portfolio": None,
+            "positions": [],
+            "buying_power": None,
+            "cash": None,
+            "total_equity": None,
+            "errors": [],
+        }
+    broker = build_broker_from_settings()
+    try:
+        return await broker.account_snapshot()
+    except Exception as exc:  # pragma: no cover -- account_snapshot is defensive
+        return {
+            "connected": is_connected(),
+            "mode": "shadow" if broker._is_shadow() else "live",
+            "as_of": datetime.now(UTC).isoformat(timespec="seconds"),
+            "accounts": [],
+            "portfolio": None,
+            "positions": [],
+            "buying_power": None,
+            "cash": None,
+            "total_equity": None,
+            "errors": [f"snapshot: {exc}"],
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            await broker.aclose()
+
+
 # Re-export the audit-log writer for tests / debugging tools.
 __all__ = [
     "ABSOLUTE_MAX_FLOAT_USD",
@@ -591,4 +859,5 @@ __all__ = [
     "load_shadow_trades",
     "pending_auth",
     "resolve_float_cap",
+    "robinhood_account_snapshot",
 ]

@@ -345,6 +345,60 @@ def latest_account_snapshot() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Live Robinhood account snapshot (read-only) for the AI agent context.
+#
+# Robinhood reads are async (MCP-over-HTTP) but the agent-context + UI
+# readers here are sync, so we keep a small in-memory cache refreshed on
+# the autonomy loop's quote-warmup tick. Always read-only -- never places
+# or cancels an order, so it is safe in shadow mode.
+# ---------------------------------------------------------------------------
+
+_RH_SNAPSHOT_CACHE: dict[str, Any] = {"snapshot": None, "ts": None}
+
+
+def latest_robinhood_snapshot() -> dict[str, Any] | None:
+    """Return the most recently cached live Robinhood account snapshot.
+
+    Sync + fast: returns whatever the async warmup tick last fetched
+    (or ``None`` before the first refresh / when not connected). The
+    agent context + dashboard read this so the AI knows the user's real
+    buying power, cash, equity, and current positions when reasoning
+    about the market.
+    """
+    return _RH_SNAPSHOT_CACHE.get("snapshot")
+
+
+async def _refresh_robinhood_snapshot() -> dict[str, Any] | None:
+    """Fetch a fresh read-only Robinhood snapshot and update the cache.
+
+    Never raises -- on any failure the cache is left untouched and the
+    previous value (possibly ``None``) is returned. Safe to call from
+    the autonomy loop on every warmup tick.
+    """
+    try:
+        from packages.execution.robinhood import (
+            is_connected as _rh_is_connected,
+        )
+        from packages.execution.robinhood import (
+            robinhood_account_snapshot as _rh_snapshot,
+        )
+
+        if not _rh_is_connected():
+            # Not connected -> clear any stale snapshot so the UI/agent
+            # don't show data for a disconnected account.
+            _RH_SNAPSHOT_CACHE["snapshot"] = None
+            _RH_SNAPSHOT_CACHE["ts"] = None
+            return None
+        snap = await _rh_snapshot()
+        _RH_SNAPSHOT_CACHE["snapshot"] = snap
+        _RH_SNAPSHOT_CACHE["ts"] = snap.get("as_of")
+        return snap
+    except Exception as exc:  # pragma: no cover — defensive
+        log.debug("robinhood snapshot refresh failed: %s", exc)
+        return _RH_SNAPSHOT_CACHE.get("snapshot")
+
+
 def latest_positions() -> list[dict[str, Any]]:
     """Derive an approximate positions view from the latest run's planned weights.
 
@@ -2076,6 +2130,43 @@ def api_rh_status() -> dict[str, Any]:
     }
 
 
+@app.get("/api/onboarding/robinhood/snapshot")
+async def api_rh_snapshot(refresh: bool = True) -> dict[str, Any]:
+    """Live, read-only snapshot of the connected Robinhood account.
+
+    Surfaces buying power, cash, total equity, and current positions so
+    the dashboard can show the user's real account and the AI agent has
+    live account context when reasoning about the market.
+
+    ALWAYS read-only -- this never places, reviews, or cancels an order,
+    so it is safe even while the bot runs in shadow mode. When
+    ``refresh=true`` (default) it fetches fresh data from Robinhood and
+    updates the in-memory cache the agent reads; ``refresh=false``
+    returns the last cached snapshot without a network call.
+    """
+    if refresh:
+        snap = await _refresh_robinhood_snapshot()
+    else:
+        snap = latest_robinhood_snapshot()
+    if snap is None:
+        # Not connected / never fetched -- report a stable empty shape.
+        from packages.execution.robinhood import is_connected
+
+        return {
+            "connected": is_connected(),
+            "mode": "shadow",
+            "as_of": None,
+            "accounts": [],
+            "portfolio": None,
+            "positions": [],
+            "buying_power": None,
+            "cash": None,
+            "total_equity": None,
+            "errors": [],
+        }
+    return snap
+
+
 # ---------------------------------------------------------------------------
 # /api/research-sweep -- Phase 1D
 #
@@ -2596,6 +2687,7 @@ async def api_trading_unified_snapshot(
         "decisions": None,
         "window": None,
         "streak": None,
+        "robinhood": None,
         "errors": {},
     }
 
@@ -2604,6 +2696,14 @@ async def api_trading_unified_snapshot(
         out["account"] = latest_account_snapshot()
     except Exception as exc:  # pragma: no cover — defensive
         out["errors"]["account"] = f"{exc.__class__.__name__}: {exc}"
+
+    # Live Robinhood account snapshot (read-only) -- gives the agent the
+    # user's REAL buying power / cash / equity / positions when connected.
+    # Cached by the autonomy warmup tick; None when not connected.
+    try:
+        out["robinhood"] = latest_robinhood_snapshot()
+    except Exception as exc:  # pragma: no cover — defensive
+        out["errors"]["robinhood"] = f"{exc.__class__.__name__}: {exc}"
     try:
         out["positions"] = latest_positions()
     except Exception as exc:  # pragma: no cover
@@ -3739,11 +3839,22 @@ async def _autonomy_startup() -> None:  # pragma: no cover
             except Exception as exc:  # pragma: no cover — defensive
                 log.debug("finnhub_ws: set_symbols failed: %s", exc)
                 ws_result = {"error": str(exc)[:240]}
+        # Keep the live Robinhood account snapshot warm so the agent
+        # context + dashboard read fresh buying-power / equity / positions
+        # without a per-request network call. Read-only; no-op when the
+        # user hasn't connected Robinhood.
+        rh_ok = False
+        try:
+            rh_snap = await _refresh_robinhood_snapshot()
+            rh_ok = bool(rh_snap and rh_snap.get("connected"))
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("robinhood snapshot warmup failed: %s", exc)
         return {
             "refreshed": ok,
             "attempted": len(symbols),
             "primary": quote_cache.status()["primary_provider"],
             "ws": ws_result,
+            "robinhood": rh_ok,
         }
 
     # Phase 28-R step 2 — EOD flattener. Closes everything at 15:55-16:05
