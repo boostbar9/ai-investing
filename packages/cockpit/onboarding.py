@@ -59,6 +59,29 @@ VALID_RH_MODES: tuple[RhMode, ...] = ("shadow", "live")
 # Can be raised after 14 days of positive shadow-trading PnL (Phase 6).
 DEFAULT_FLOAT_CAP_USD = 300.0
 
+# Hard upper bound on the user-configurable float cap. Mirrors
+# ``packages.execution.robinhood.ABSOLUTE_MAX_FLOAT_USD`` -- duplicated here
+# (not imported) to keep the onboarding layer free of an execution-layer
+# dependency. Any value the user sets is clamped into ``[0, this]``.
+ABSOLUTE_MAX_FLOAT_USD = 10_000.0
+
+
+def clamp_float_cap(value: float) -> float:
+    """Clamp a requested float cap into ``[0, ABSOLUTE_MAX_FLOAT_USD]``.
+
+    Rejects non-finite input (NaN / inf) by falling back to the safe
+    default -- a NaN cap would otherwise make every comparison False and
+    silently disable the ceiling."""
+    import math
+
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_FLOAT_CAP_USD
+    if not math.isfinite(v):
+        return DEFAULT_FLOAT_CAP_USD
+    return max(0.0, min(v, ABSOLUTE_MAX_FLOAT_USD))
+
 
 @dataclass
 class OnboardingState:

@@ -35,7 +35,7 @@ import asyncio
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable, Optional
 
@@ -312,17 +312,6 @@ def reset_default_cache_for_tests() -> None:
 # ---------------------------------------------------------------------------
 # High-level helpers consumed by server.py
 # ---------------------------------------------------------------------------
-
-
-async def build_finnhub_fetcher() -> QuoteFetcher | None:
-    """Construct an async ``QuoteFetcher`` over a shared FinnhubAdapter.
-
-    Returns ``None`` when no API key is configured (so the cache
-    transparently falls back to yfinance). The returned closure owns
-    the adapter lifecycle — callers should call ``aclose()`` on the
-    adapter at shutdown via the returned `(fetcher, adapter)` tuple.
-    """
-    raise NotImplementedError  # see make_finnhub_fetcher below
 
 
 def make_finnhub_fetcher(adapter: Any) -> QuoteFetcher:

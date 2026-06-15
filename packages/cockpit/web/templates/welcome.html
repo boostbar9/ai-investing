@@ -196,10 +196,10 @@
 
       <div class="bg-gray-900 border border-gray-800 rounded-lg p-5 mb-6">
         <label class="block text-sm text-gray-400 mb-2">Live float cap (USD)</label>
-        <input id="float_cap" class="input mb-2" type="number" min="0" step="50" value="300" />
+        <input id="float_cap" class="input mb-2" type="number" min="0" max="10000" step="50" value="300" />
         <div class="text-xs text-gray-500">
           Robinhood shadow-mode stays on by default — no real orders until you
-          flip it from the dashboard.
+          flip it from the dashboard. Hard maximum is $10,000.
         </div>
       </div>
 
@@ -414,7 +414,7 @@
     });
     document.getElementById("btn-next-3").addEventListener("click", () => {
       const v = parseFloat(document.getElementById("float_cap").value);
-      state.live_float_cap_usd = isFinite(v) && v >= 0 ? v : 300;
+      state.live_float_cap_usd = isFinite(v) && v >= 0 ? Math.min(v, 10000) : 300;
       document.getElementById("summary-name").textContent = state.display_name || "(none)";
       document.getElementById("summary-rh").textContent = ({
         unknown: "Not checked",

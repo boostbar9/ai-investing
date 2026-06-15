@@ -1937,6 +1937,75 @@ def api_onboarding_reset() -> dict[str, Any]:
     return {"ok": True, "state": load_onboarding().to_dict()}
 
 
+class _FloatCapBody(BaseModel):
+    """Payload for setting the Robinhood live float cap."""
+
+    cap_usd: float
+
+
+@app.get("/api/onboarding/robinhood/cap")
+def api_robinhood_cap_get() -> dict[str, Any]:
+    """Return the active Robinhood live float cap and its absolute max.
+
+    The cap is the user's hard blast-radius limit on live deployment.
+    Reads through the onboarding store so it stays the single source of
+    truth (defaults to $300 when unset)."""
+    from packages.cockpit.onboarding import (
+        ABSOLUTE_MAX_FLOAT_USD,
+        clamp_float_cap,
+        load_onboarding,
+    )
+
+    state = load_onboarding()
+    return {
+        "cap_usd": clamp_float_cap(state.live_float_cap_usd),
+        "absolute_max_usd": ABSOLUTE_MAX_FLOAT_USD,
+        "default_usd": 300.0,
+    }
+
+
+@app.post("/api/onboarding/robinhood/cap")
+def api_robinhood_cap_set(body: _FloatCapBody) -> dict[str, Any]:
+    """Set the Robinhood live float cap, clamped server-side.
+
+    The cap is clamped into ``[0, ABSOLUTE_MAX_FLOAT_USD]``; NaN / inf /
+    non-numeric values are rejected with 400. We never persist a value
+    that could disable the ceiling. Persisted via the onboarding store so
+    ``resolve_float_cap`` (the broker's enforcement path) picks it up."""
+    import math
+
+    from packages.cockpit.onboarding import (
+        ABSOLUTE_MAX_FLOAT_USD,
+        clamp_float_cap,
+        load_onboarding,
+        save_onboarding,
+    )
+
+    try:
+        requested = float(body.cap_usd)
+    except (TypeError, ValueError) as err:
+        raise HTTPException(
+            status_code=400, detail="cap_usd must be a number"
+        ) from err
+    if not math.isfinite(requested):
+        raise HTTPException(
+            status_code=400, detail="cap_usd must be a finite number"
+        )
+    if requested < 0:
+        raise HTTPException(status_code=400, detail="cap_usd must be >= 0")
+
+    clamped = clamp_float_cap(requested)
+    state = load_onboarding()
+    state.live_float_cap_usd = clamped
+    save_onboarding(state)
+    return {
+        "cap_usd": clamped,
+        "requested_usd": requested,
+        "clamped": clamped != requested,
+        "absolute_max_usd": ABSOLUTE_MAX_FLOAT_USD,
+    }
+
+
 # ---------------------------------------------------------------------------
 # /api/onboarding/robinhood/* -- the "Connect your agent" OAuth flow
 #

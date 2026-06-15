@@ -35,14 +35,17 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from packages.execution import daily_notional
 from packages.execution.broker import (
     Broker,
     BrokerError,
     BrokerPosition,
     OrderAck,
     OrderRequest,
+    deterministic_client_order_id,
+    reconcile_fill_via_poll,
 )
-from packages.execution.modes import ExecutionMode
+from packages.execution.modes import ExecutionMode, resolve_mode
 from packages.execution.robinhood_mcp import (
     McpError,
     RobinhoodMcpClient,
@@ -77,6 +80,11 @@ SHADOW_TRADES_PATH = Path(
 # fat-finger the wizard. The Phase 6 auto-greenlight respects this.
 ABSOLUTE_MAX_FLOAT_USD = 10_000.0
 
+# Robinhood live trading is gated by the SAME resolve_mode promotion gate
+# that guards the Alpaca/ENABLE_LIVE_TRADING path (P0-5). We resolve the
+# mode under this strategy key so the cockpit's mode store stays coherent.
+ROBINHOOD_STRATEGY_KEY = os.getenv("ROBINHOOD_STRATEGY_KEY", "robinhood_agentic")
+
 
 # ---------------------------------------------------------------------------
 # Cap resolution -- pulls from OnboardingState so the cockpit is the
@@ -106,6 +114,45 @@ def resolve_float_cap() -> float:
 
         cap = DEFAULT_FLOAT_CAP_USD
     return max(0.0, min(cap, ABSOLUTE_MAX_FLOAT_USD))
+
+
+# ---------------------------------------------------------------------------
+# Live-promotion gate bridge (P0-5)
+# ---------------------------------------------------------------------------
+
+
+def _live_promotion_passed() -> bool:
+    """Best-effort read of the live-readiness verdict.
+
+    Reuses ``packages.backtests.live_promotion.live_readiness_gate`` over
+    the cockpit's paper equity curve -- the SAME gate the Alpaca live path
+    consults. Fails safe: ANY error (missing curve, import failure, too
+    few paper days) returns ``False`` so we never accidentally greenlight
+    live trading on an exception.
+
+    Env override ``ROBINHOOD_FORCE_LIVE_GATE=true`` exists ONLY for tests
+    and explicit operator override; it cannot enable live without
+    ``ENABLE_LIVE_TRADING`` also being set (resolve_mode enforces that).
+    """
+    forced = os.getenv("ROBINHOOD_FORCE_LIVE_GATE", "").strip().lower()
+    if forced in {"true", "1", "yes", "on"}:
+        return True
+    try:
+        import pandas as pd
+
+        from packages.backtests import live_promotion as lp
+        from packages.cockpit.web.server import equity_curve_points
+
+        points = equity_curve_points(window=200)
+        series = pd.Series([float(p.get("equity", 0.0)) for p in points])
+        verdict = lp.live_readiness_gate(series)
+        return bool(verdict.ready)
+    except Exception as exc:
+        logger.warning(
+            "live-promotion read failed (%s) -- treating gate as not passed",
+            exc.__class__.__name__,
+        )
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +329,47 @@ class RobinhoodAgenticBroker(Broker):
     def _is_shadow(self) -> bool:
         # PAPER is treated as SHADOW for Robinhood -- there is no
         # 'paper Robinhood'. Anything that isn't explicit LIVE is logged.
-        return self._mode is not ExecutionMode.LIVE
+        # An explicit-LIVE request is ALSO treated as shadow unless the
+        # resolve_mode promotion gate clears it (P0-5): the float cap is a
+        # blast-radius limiter, not a readiness gate.
+        if self._mode is not ExecutionMode.LIVE:
+            return True
+        return not self._live_gate_clears()
+
+    def _live_gate_clears(self) -> bool:
+        """Route the Robinhood live path through the SAME promotion gate
+        that guards the Alpaca/ENABLE_LIVE_TRADING path.
+
+        Robinhood live requires BOTH ``ENABLE_LIVE_TRADING=true`` AND a
+        passed live-promotion gate. We fail safe: any error resolving the
+        gate downgrades to shadow. We never auto-upgrade shadow->live --
+        only an explicit ``ExecutionMode.LIVE`` request reaches here.
+        """
+        try:
+            # Pin the strategy mode to LIVE for this resolution so
+            # resolve_mode evaluates the gates (it reads get_mode, which
+            # defaults to PAPER otherwise). We mirror the operator's
+            # explicit LIVE intent here.
+            from packages.execution import modes as modes_mod
+
+            modes_mod.set_mode(ROBINHOOD_STRATEGY_KEY, ExecutionMode.LIVE)
+            decision = resolve_mode(
+                ROBINHOOD_STRATEGY_KEY,
+                live_gate_passed=_live_promotion_passed(),
+            )
+            if decision.effective is not ExecutionMode.LIVE:
+                logger.warning(
+                    "robinhood live gate downgraded to %s: %s",
+                    decision.effective.value,
+                    decision.reason,
+                )
+            return decision.effective is ExecutionMode.LIVE
+        except Exception as exc:  # pragma: no cover - fail safe
+            logger.warning(
+                "robinhood live gate resolution failed (%s) -- staying shadow",
+                exc.__class__.__name__,
+            )
+            return False
 
     def _require_token(self) -> TokenSet:
         tokens = self._token_loader()
@@ -542,23 +629,37 @@ class RobinhoodAgenticBroker(Broker):
         if side not in {"buy", "sell"}:
             raise BrokerError(f"robinhood: bad side {req.side!r}")
 
+        is_shadow = self._is_shadow()
+
         # ---- (2) float cap ----
         cap = resolve_float_cap()
         # Sell orders generate cash; the cap is a *deployment* ceiling so
         # we only enforce on buys. (Sells of held shares can't increase
         # net exposure; refusing them would lock the user out of risk
         # reduction.)
+        notional = self._estimate_notional(req) if side == "buy" else 0.0
         if side == "buy":
-            notional = self._estimate_notional(req)
             if notional > cap:
                 raise BrokerError(
                     f"robinhood: notional ${notional:.2f} exceeds float "
                     f"cap ${cap:.2f} -- raise the cap in Settings after "
                     f"14 days of positive shadow PnL"
                 )
+            # Cumulative daily-notional gate (P0-4). Shadow buys are
+            # recorded but NEVER blocked; only a *live* buy is rejected
+            # when today's aggregate would breach the cap.
+            if not is_shadow:
+                exceeds, projected = daily_notional.would_exceed_cap(notional, cap)
+                if exceeds:
+                    raise BrokerError(
+                        f"robinhood: today's deployed buy notional "
+                        f"${projected:.2f} (incl. this ${notional:.2f} order) "
+                        f"exceeds daily float cap ${cap:.2f} -- the cap is a "
+                        f"per-day aggregate, not per-order"
+                    )
 
         # ---- (3) shadow ----
-        if self._is_shadow():
+        if is_shadow:
             ack = OrderAck(
                 broker=self.name,
                 broker_order_id=f"shadow-{uuid4()}",
@@ -577,15 +678,28 @@ class RobinhoodAgenticBroker(Broker):
                     "limit_price": req.limit_price,
                     "time_in_force": req.time_in_force,
                     "mode": "shadow",
-                    "notional_estimate": self._estimate_notional(req)
-                    if side == "buy"
-                    else None,
+                    "notional_estimate": notional if side == "buy" else None,
                 }
             )
+            if side == "buy":
+                daily_notional.record_buy(
+                    symbol=req.symbol, notional=notional, mode="shadow"
+                )
             return ack
 
         # ---- (4) live ----
         client = await self._client()
+        # Deterministic idempotency key (P0-1): a retried logical order
+        # produces the SAME key so Robinhood dedupes instead of
+        # double-filling.
+        client_order_id = deterministic_client_order_id(
+            symbol=req.symbol,
+            side=side,
+            qty=req.qty,
+            decision_id=req.decision_id,
+            bar_ts=req.bar_ts,
+            prefix="rh",
+        )
         try:
             result = await client.call_tool(
                 "place_equity_order",
@@ -596,6 +710,12 @@ class RobinhoodAgenticBroker(Broker):
                     "type": req.type,
                     "limit_price": req.limit_price,
                     "time_in_force": req.time_in_force,
+                    # TODO(robinhood-api): confirm the exact idempotency
+                    # field name place_equity_order accepts. ``client_order_id``
+                    # is our best guess and is the ONE place to rename if
+                    # their API uses a different key (e.g. ``idempotency_key``
+                    # / ``ref_id``).
+                    "client_order_id": client_order_id,
                 },
             )
         except McpError as exc:
@@ -607,7 +727,7 @@ class RobinhoodAgenticBroker(Broker):
             )
 
         content = _normalize_obj(result.content)
-        return OrderAck(
+        ack = OrderAck(
             broker=self.name,
             broker_order_id=str(content.get("order_id") or content.get("id") or ""),
             status=str(content.get("status") or "accepted"),
@@ -616,6 +736,63 @@ class RobinhoodAgenticBroker(Broker):
                 or datetime.now(UTC).isoformat(timespec="seconds")
             ),
         )
+        if side == "buy":
+            daily_notional.record_buy(
+                symbol=req.symbol, notional=notional, mode="live"
+            )
+        return ack
+
+    # ---- fill reconciliation (P0-3) -------------------------------------
+
+    async def reconcile_fill(
+        self,
+        broker_order_id: str,
+        intended_qty: float,
+        *,
+        max_polls: int = 5,
+        delay_s: float = 1.0,
+    ) -> dict[str, Any]:
+        """Poll Robinhood for an order's fill status and surface mismatches.
+
+        Reads ``get_equity_order`` a BOUNDED number of times until the
+        order reaches a terminal state or we exhaust ``max_polls``. Returns
+        a structured result describing filled vs intended qty. NEVER places
+        an order -- read-only by construction. Logs a structured warning on
+        any shortfall so a partial fill can't silently pass.
+
+        Safe in shadow mode: returns a synthetic 'matched' result without
+        touching the network (shadow fills are assumed complete).
+        """
+        if self._is_shadow():
+            return {
+                "broker_order_id": broker_order_id,
+                "intended_qty": float(intended_qty),
+                "filled_qty": float(intended_qty),
+                "status": "shadow",
+                "matched": True,
+                "polls": 0,
+            }
+        recon = await reconcile_fill_via_poll(
+            poll=lambda: self._poll_equity_order(broker_order_id),
+            broker_order_id=broker_order_id,
+            intended_qty=intended_qty,
+            max_polls=max_polls,
+            delay_s=delay_s,
+        )
+        return recon.to_dict()
+
+    async def _poll_equity_order(self, broker_order_id: str) -> dict[str, Any]:
+        """Fetch one order snapshot via the ``get_equity_order`` MCP tool.
+        Returns a dict with at least ``filled_qty`` and ``status`` keys
+        (best-effort -- shapes vary; missing fields default safely)."""
+        client = await self._client()
+        try:
+            result = await client.call_tool(
+                "get_equity_order", {"order_id": broker_order_id}
+            )
+        except McpError as exc:
+            raise BrokerError(f"robinhood get_equity_order failed: {exc}") from exc
+        return _normalize_obj(result.content)
 
     # ---- internal --------------------------------------------------------
 

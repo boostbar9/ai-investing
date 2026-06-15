@@ -35,6 +35,31 @@ from packages.execution.robinhood_token import TokenSet
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _open_live_gate_and_isolate_ledger(monkeypatch, tmp_path):
+    """Restore the historical ``LIVE == live`` semantics these tests
+    assume, post P0-5.
+
+    P0-5 routes the Robinhood live path through the same resolve_mode
+    promotion gate as Alpaca: an explicit ``ExecutionMode.LIVE`` broker
+    now downgrades to shadow unless BOTH ``ENABLE_LIVE_TRADING`` and the
+    live-promotion gate clear. The cases in this module that assert a
+    LIVE broker reaches the MCP wire predate that gate, so we open it
+    here (env-only, auto-undone by monkeypatch). The gate-routing
+    behavior itself is covered explicitly in ``test_daily_notional.py``.
+
+    We also isolate the cumulative daily-notional ledger (P0-4) to a tmp
+    file so live buys recorded during these tests never touch ``data/``.
+    """
+    from packages.execution import daily_notional as dn
+
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "true")
+    monkeypatch.setenv("ROBINHOOD_FORCE_LIVE_GATE", "true")
+    monkeypatch.setattr(
+        dn, "DAILY_NOTIONAL_PATH", tmp_path / "daily_notional.jsonl"
+    )
+
+
 @pytest.fixture
 def isolated_shadow_log(monkeypatch, tmp_path):
     """Redirect the shadow trades JSONL to a tmp file so tests don't

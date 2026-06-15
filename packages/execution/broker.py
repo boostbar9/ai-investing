@@ -6,6 +6,9 @@ process — see SECURITY.md.
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -15,6 +18,8 @@ from uuid import uuid4
 import httpx
 
 from packages.shared.otel import span
+
+logger = logging.getLogger(__name__)
 
 
 class BrokerError(RuntimeError):
@@ -29,6 +34,60 @@ class OrderRequest:
     type: str = "market"  # "market" | "limit"
     limit_price: float | None = None
     time_in_force: str = "day"
+    # Idempotency identity. When the planner can supply a stable decision
+    # id (e.g. one decision -> one order) we hash it into the broker's
+    # client_order_id so a retried submission dedupes server-side instead
+    # of placing a duplicate order. ``bar_ts`` is the bar/decision
+    # timestamp (ISO string or epoch) that, combined with symbol/side/qty,
+    # makes the identity stable across retries of the SAME logical order.
+    decision_id: str | None = None
+    bar_ts: str | None = None
+
+
+def deterministic_client_order_id(
+    *,
+    symbol: str,
+    side: str,
+    qty: float,
+    decision_id: str | None = None,
+    bar_ts: str | None = None,
+    prefix: str = "seer",
+) -> str:
+    """Derive a STABLE client_order_id from an order's identity.
+
+    The same logical order retried must produce the SAME id so the broker
+    dedupes it instead of placing a duplicate. We hash the strongest
+    identity available:
+
+      * If ``decision_id`` (and optionally ``bar_ts``) is present, the
+        hash is fully deterministic and survives process restarts.
+      * Otherwise we fall back to a hash of (symbol, side, qty, bar_ts).
+        This still dedupes identical retries within the same bar.
+      * Only when NO identity at all is available (no decision_id and no
+        bar_ts) do we fall back to a fresh uuid4 -- a retry then can't be
+        recognized, but we have nothing stable to key on. Callers that
+        care about idempotency MUST supply a decision_id or bar_ts.
+
+    Alpaca caps client_order_id at 128 chars; a hex digest plus prefix is
+    well under that and uses only URL-safe chars.
+    """
+    if decision_id is None and bar_ts is None:
+        logger.warning(
+            "order for %s %s has no decision_id/bar_ts -- falling back to "
+            "uuid4 client_order_id; retries will NOT dedupe",
+            side,
+            symbol,
+        )
+        return f"{prefix}-{uuid4()}"
+    parts = [
+        str(decision_id or ""),
+        symbol.upper(),
+        side.lower(),
+        f"{float(qty):.8f}",
+        str(bar_ts or ""),
+    ]
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+    return f"{prefix}-{digest[:32]}"
 
 
 @dataclass(frozen=True)
@@ -37,6 +96,106 @@ class OrderAck:
     broker_order_id: str
     status: str
     submitted_at: str
+
+
+@dataclass(frozen=True)
+class FillReconciliation:
+    """Outcome of comparing an order's actual fill against intent."""
+
+    broker_order_id: str
+    intended_qty: float
+    filled_qty: float
+    status: str
+    matched: bool
+    polls: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "broker_order_id": self.broker_order_id,
+            "intended_qty": self.intended_qty,
+            "filled_qty": self.filled_qty,
+            "status": self.status,
+            "matched": self.matched,
+            "polls": self.polls,
+        }
+
+
+# Order statuses that mean "this order is done; no more fills coming".
+_TERMINAL_ORDER_STATES = {
+    "filled",
+    "canceled",
+    "cancelled",
+    "rejected",
+    "expired",
+    "done_for_day",
+    "replaced",
+}
+
+
+async def reconcile_fill_via_poll(
+    *,
+    poll,
+    broker_order_id: str,
+    intended_qty: float,
+    max_polls: int = 5,
+    delay_s: float = 1.0,
+    sleep=None,
+) -> FillReconciliation:
+    """Poll an order's status a BOUNDED number of times and report fills.
+
+    ``poll`` is an async callable returning a dict snapshot with (best
+    effort) ``filled_qty`` and ``status`` keys -- the per-broker adapter
+    supplies it. We stop early once the order reaches a terminal state.
+    A shortfall (filled < intended) logs a structured warning so a partial
+    fill can NEVER silently pass. This function only READS -- it can never
+    place an order.
+    """
+    import asyncio
+
+    _sleep = sleep or asyncio.sleep
+    filled = 0.0
+    status = "unknown"
+    polls = 0
+    for i in range(max(1, max_polls)):
+        polls = i + 1
+        try:
+            snap = await poll()
+        except Exception as exc:
+            logger.warning(
+                "fill reconciliation poll failed for %s: %s",
+                broker_order_id,
+                exc.__class__.__name__,
+            )
+            break
+        snap = snap or {}
+        with contextlib.suppress(TypeError, ValueError):
+            filled = float(
+                snap.get("filled_qty", snap.get("cumulative_quantity", filled))
+                or 0.0
+            )
+        status = str(snap.get("status", status) or status).lower()
+        if status in _TERMINAL_ORDER_STATES or filled >= float(intended_qty):
+            break
+        if polls < max_polls:
+            await _sleep(delay_s)
+
+    matched = filled >= float(intended_qty)
+    if not matched:
+        logger.warning(
+            "fill mismatch: order %s filled %.6f of intended %.6f (status=%s)",
+            broker_order_id,
+            filled,
+            float(intended_qty),
+            status,
+        )
+    return FillReconciliation(
+        broker_order_id=broker_order_id,
+        intended_qty=float(intended_qty),
+        filled_qty=filled,
+        status=status,
+        matched=matched,
+        polls=polls,
+    )
 
 
 @dataclass(frozen=True)
@@ -68,6 +227,9 @@ class BracketOrderRequest:
     type: str = "market"  # parent order type
     limit_price: float | None = None  # required when type == "limit"
     time_in_force: str = "day"
+    # Idempotency identity -- see ``OrderRequest`` / ``deterministic_client_order_id``.
+    decision_id: str | None = None
+    bar_ts: str | None = None
 
 
 @dataclass(frozen=True)
@@ -140,7 +302,13 @@ class AlpacaPaperBroker(Broker):
                 return False
 
     async def submit(self, req: OrderRequest) -> OrderAck:
-        client_order_id = str(uuid4())
+        client_order_id = deterministic_client_order_id(
+            symbol=req.symbol,
+            side=req.side,
+            qty=req.qty,
+            decision_id=req.decision_id,
+            bar_ts=req.bar_ts,
+        )
         with span("broker.alpaca.submit", {"symbol": req.symbol, "side": req.side, "qty": req.qty}):
             r = await self._client.post(
                 f"{self.base_url}/v2/orders",
@@ -163,6 +331,39 @@ class AlpacaPaperBroker(Broker):
                 status=data.get("status", "unknown"),
                 submitted_at=data.get("submitted_at", ""),
             )
+
+    async def reconcile_fill(
+        self,
+        broker_order_id: str,
+        intended_qty: float,
+        *,
+        max_polls: int = 5,
+        delay_s: float = 1.0,
+    ) -> FillReconciliation:
+        """Poll an Alpaca order's status and report fills vs intent (P0-3).
+
+        Reads ``GET /v2/orders/{id}`` a BOUNDED number of times until the
+        order is terminal or fully filled. Read-only -- never places an
+        order. Surfaces a structured warning on any shortfall.
+        """
+        async def _poll() -> dict[str, Any]:
+            with span("broker.alpaca.reconcile_poll"):
+                r = await self._client.get(
+                    f"{self.base_url}/v2/orders/{broker_order_id}"
+                )
+                if r.status_code >= 300:
+                    raise BrokerError(
+                        f"alpaca order-status {r.status_code}: {r.text[:200]}"
+                    )
+                return r.json()
+
+        return await reconcile_fill_via_poll(
+            poll=_poll,
+            broker_order_id=broker_order_id,
+            intended_qty=intended_qty,
+            max_polls=max_polls,
+            delay_s=delay_s,
+        )
 
     async def positions(self) -> list[BrokerPosition]:
         with span("broker.alpaca.positions"):
@@ -200,7 +401,14 @@ class AlpacaPaperBroker(Broker):
         We treat all bracket prices as 2-decimal stock-equity prices,
         matching Alpaca's tick-size requirements.
         """
-        client_order_id = str(uuid4())
+        client_order_id = deterministic_client_order_id(
+            symbol=req.symbol,
+            side=req.side,
+            qty=req.qty,
+            decision_id=req.decision_id,
+            bar_ts=req.bar_ts,
+            prefix="seer-bracket",
+        )
         # Alpaca's stock equities require <= 2 decimal places for prices.
         def _px(p: float | None) -> str | None:
             if p is None:
