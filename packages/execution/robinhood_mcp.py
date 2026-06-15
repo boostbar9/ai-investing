@@ -18,6 +18,7 @@ the change lives in *one* place: ``RobinhoodMcpClient.call_tool``.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -67,7 +68,7 @@ class RobinhoodMcpClient:
         client = RobinhoodMcpClient(bearer_token=...)
         await client.initialize()         # one-time handshake
         tools = await client.list_tools() # discover available tools
-        ack   = await client.call_tool("submit_order", {...})
+        ack   = await client.call_tool("place_equity_order", {...})
 
     The client does NOT cache anything across calls. The broker layer
     owns retries, token refresh, and shadow-mode interception -- this
@@ -92,6 +93,10 @@ class RobinhoodMcpClient:
         # MCP servers (Robinhood included) refuse other calls until
         # initialize has succeeded.
         self._initialized = False
+        # Streamable HTTP: the server assigns a session id on the
+        # initialize response via the Mcp-Session-Id header; every
+        # follow-up request must echo it back or the server rejects it.
+        self._session_id: str | None = None
 
     # ---- internal -------------------------------------------------------
 
@@ -104,6 +109,86 @@ class RobinhoodMcpClient:
         self._request_id += 1
         return self._request_id
 
+    def _build_headers(self) -> dict[str, str]:
+        """Common headers for every POST. Streamable HTTP requires the
+        client to advertise BOTH content types it can accept; spec-
+        compliant servers return HTTP 406 without the Accept header. The
+        session id is echoed once the server has assigned one."""
+        headers = {
+            "Authorization": f"Bearer {self._bearer}",
+            "Content-Type": "application/json",
+            # Streamable HTTP: server may reply as JSON or as an SSE
+            # stream, so we must accept both on every request.
+            "Accept": "application/json, text/event-stream",
+            # MCP-over-HTTP requires this so the server can negotiate.
+            "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+        }
+        if self._session_id is not None:
+            headers["Mcp-Session-Id"] = self._session_id
+        return headers
+
+    def _capture_session_id(self, r: httpx.Response) -> None:
+        """Store the server-assigned session id if present. httpx header
+        lookups are case-insensitive, so this matches Mcp-Session-Id in
+        any casing."""
+        sid = r.headers.get("Mcp-Session-Id")
+        if sid:
+            self._session_id = sid
+
+    @staticmethod
+    def _parse_response_payload(r: httpx.Response) -> Any:
+        """Decode a JSON-RPC message from the response, handling both the
+        ``application/json`` and ``text/event-stream`` (SSE) framings the
+        Streamable HTTP transport may use.
+
+        For SSE we concatenate the payloads of all ``data:`` lines (joined
+        with newlines per the SSE spec) and JSON-parse the result, ignoring
+        comment/event/id lines.
+        """
+        content_type = r.headers.get("Content-Type", "")
+        if "text/event-stream" in content_type.lower():
+            data_lines: list[str] = []
+            for line in r.text.splitlines():
+                if line.startswith("data:"):
+                    # Strip the "data:" prefix and a single optional space.
+                    data_lines.append(line[5:].lstrip(" "))
+            if not data_lines:
+                raise McpError("mcp SSE response contained no data lines")
+            joined = "\n".join(data_lines)
+            try:
+                return json.loads(joined)
+            except ValueError as exc:
+                raise McpError("mcp SSE response had non-JSON data") from exc
+        try:
+            return r.json()
+        except ValueError as exc:
+            raise McpError("mcp response returned non-JSON body") from exc
+
+    async def _send_initialized(self) -> None:
+        """Send the ``notifications/initialized`` notification required by
+        the spec after a successful ``initialize``. A notification has no
+        ``id`` and expects no response body (servers typically return 202
+        Accepted with an empty body), so we must not treat that as an
+        error. Carries the session id captured from initialize."""
+        client = await self._ensure_client()
+        body = {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        }
+        try:
+            r = await client.post(
+                self._url, json=body, headers=self._build_headers()
+            )
+        except httpx.HTTPError as exc:
+            raise McpError(f"transport error: {exc.__class__.__name__}") from exc
+        if r.status_code >= 400:
+            raise McpError(
+                f"mcp notifications/initialized returned HTTP {r.status_code}: "
+                f"{r.text[:200] if r.text else ''}"
+            )
+        # 202 / empty body is the expected success path -- do not parse.
+
     async def _rpc(self, method: str, params: dict[str, Any]) -> Any:
         """Send a single JSON-RPC request. Returns the ``result`` field
         on success, raises ``McpError`` on any non-success path."""
@@ -114,12 +199,7 @@ class RobinhoodMcpClient:
             "method": method,
             "params": params,
         }
-        headers = {
-            "Authorization": f"Bearer {self._bearer}",
-            "Content-Type": "application/json",
-            # MCP-over-HTTP requires this so the server can negotiate.
-            "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
-        }
+        headers = self._build_headers()
         try:
             r = await client.post(self._url, json=body, headers=headers)
         except httpx.HTTPError as exc:
@@ -131,10 +211,11 @@ class RobinhoodMcpClient:
                 f"{r.text[:200] if r.text else ''}"
             )
 
-        try:
-            payload = r.json()
-        except ValueError as exc:
-            raise McpError(f"mcp {method} returned non-JSON body") from exc
+        # Capture/refresh the session id (assigned on the initialize
+        # response) before parsing the body.
+        self._capture_session_id(r)
+
+        payload = self._parse_response_payload(r)
 
         if "error" in payload:
             err = payload["error"]
@@ -169,11 +250,16 @@ class RobinhoodMcpClient:
             },
         )
         self._initialized = True
+        # Per the spec, the client MUST send notifications/initialized
+        # after a successful initialize. It carries the session id we just
+        # captured from the initialize response.
+        await self._send_initialized()
         return result if isinstance(result, dict) else {}
 
     async def list_tools(self) -> list[dict[str, Any]]:
         """Return the server's tool catalog. Robinhood exposes things
-        like ``submit_order``, ``list_positions``, ``get_account``."""
+        like ``place_equity_order``, ``get_equity_positions``,
+        ``get_accounts``."""
         if not self._initialized:
             await self.initialize()
         result = await self._rpc("tools/list", {})
