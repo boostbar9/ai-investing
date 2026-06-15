@@ -53,10 +53,14 @@ RH_OAUTH_REDIRECT_URI = os.getenv(
     f"http://localhost:{RH_OAUTH_REDIRECT_PORT}/callback",
 )
 
-# Scopes the agent needs. Robinhood scopes the session to the dedicated
-# Agentic sub-account at account-creation time, so we request the broad
-# trade+read set and let the server narrow it.
-RH_OAUTH_SCOPE = os.getenv("ROBINHOOD_OAUTH_SCOPE", "trade read")
+# Scopes the agent needs. Robinhood's authorization-server metadata
+# advertises a single supported scope, "internal" (verified live against
+# agent.robinhood.com's /.well-known/oauth-authorization-server). The
+# server scopes the OAuth session to the dedicated Agentic sub-account at
+# account-creation time; the granular per-tool trade/read permissions are
+# approved by the user in Robinhood's own consent screen, not via OAuth
+# scope strings. Overridable via env in case Robinhood widens the set.
+RH_OAUTH_SCOPE = os.getenv("ROBINHOOD_OAUTH_SCOPE", "internal")
 
 # Client identity for dynamic client registration (RFC 7591). Public
 # native client -> no client secret.
@@ -245,6 +249,47 @@ def _get_json(client: httpx.Client, url: str) -> dict[str, Any] | None:
         return None
 
 
+def _well_known_candidates(as_url: str) -> list[str]:
+    """Build authorization-server metadata URLs for an issuer/AS URL.
+
+    Per RFC 8414 §3.1 the well-known segment is inserted *before* any path
+    component of the issuer, i.e. ``https://host/.well-known/oauth-
+    authorization-server/mcp/trading`` -- NOT after the path. We also try
+    the OIDC convention (path appended after the well-known segment), the
+    root form (no path), and the (non-standard but common) path-suffixed
+    form for maximum compatibility. First responder wins.
+
+    Robinhood (verified live) serves the metadata at the RFC 8414
+    path-inserted form and the root form; the path-suffixed form 404s.
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(as_url.rstrip("/"))
+    origin = f"{parts.scheme}://{parts.netloc}"
+    path = parts.path.rstrip("/")  # e.g. "/mcp/trading" or ""
+    candidates: list[str] = []
+    if path:
+        # RFC 8414: /.well-known/oauth-authorization-server<PATH>
+        candidates.append(f"{origin}/.well-known/oauth-authorization-server{path}")
+        # OIDC: /.well-known/openid-configuration<PATH>
+        candidates.append(f"{origin}/.well-known/openid-configuration{path}")
+    # Root forms (issuer has no path, or as a fallback)
+    candidates.append(f"{origin}/.well-known/oauth-authorization-server")
+    candidates.append(f"{origin}/.well-known/openid-configuration")
+    if path:
+        # Non-standard path-suffixed form some servers use as a last resort.
+        candidates.append(f"{as_url.rstrip('/')}/.well-known/oauth-authorization-server")
+        candidates.append(f"{as_url.rstrip('/')}/.well-known/openid-configuration")
+    # De-dupe preserving order.
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
 def discover_endpoints(
     *,
     mcp_url: str | None = None,
@@ -255,10 +300,9 @@ def discover_endpoints(
 
     Order of attempts (first hit wins):
       1. ``{mcp_origin}/.well-known/oauth-protected-resource`` (RFC 9728)
-         -> follow its ``authorization_servers[0]`` to that server's
-         ``/.well-known/oauth-authorization-server`` (RFC 8414).
-      2. ``{oauth_base}/.well-known/oauth-authorization-server`` directly.
-      3. ``{oauth_base}/.well-known/openid-configuration`` (OIDC fallback).
+         -> follow its ``authorization_servers[0]`` and probe that server's
+         metadata using RFC 8414 path-inserted + OIDC + root candidates.
+      2. ``{oauth_base}`` metadata candidates directly.
 
     Raises ``OAuthError`` if none of the candidates yield the required
     ``authorization_endpoint`` + ``token_endpoint`` pair.
@@ -275,6 +319,16 @@ def discover_endpoints(
     client = client or httpx.Client(
         timeout=OAUTH_HTTP_TIMEOUT_S, follow_redirects=True
     )
+
+    def _probe(as_url: str) -> dict[str, Any] | None:
+        for url in _well_known_candidates(as_url):
+            meta = _get_json(client, url)
+            if meta and meta.get("authorization_endpoint") and meta.get(
+                "token_endpoint"
+            ):
+                return meta
+        return None
+
     try:
         as_meta: dict[str, Any] | None = None
 
@@ -285,24 +339,11 @@ def discover_endpoints(
         if prm:
             servers = prm.get("authorization_servers")
             if isinstance(servers, list) and servers:
-                as_url = str(servers[0]).rstrip("/")
-                as_meta = _get_json(
-                    client, f"{as_url}/.well-known/oauth-authorization-server"
-                ) or _get_json(
-                    client, f"{as_url}/.well-known/openid-configuration"
-                )
+                as_meta = _probe(str(servers[0]))
 
-        # (2) direct authorization-server metadata on the oauth base
+        # (2) direct metadata on the oauth base / mcp url
         if not as_meta:
-            as_meta = _get_json(
-                client, f"{oauth_base}/.well-known/oauth-authorization-server"
-            )
-
-        # (3) OIDC discovery fallback
-        if not as_meta:
-            as_meta = _get_json(
-                client, f"{oauth_base}/.well-known/openid-configuration"
-            )
+            as_meta = _probe(mcp_url) or _probe(oauth_base)
 
         if not as_meta:
             raise OAuthError(

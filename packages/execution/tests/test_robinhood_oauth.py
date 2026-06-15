@@ -156,6 +156,66 @@ def test_discover_raises_when_nothing_found():
         rt.discover_endpoints(client=client)
 
 
+def test_discover_matches_live_robinhood_layout():
+    """Regression for the real agent.robinhood.com contract (verified live).
+
+    PRM advertises the AS as the MCP URL itself
+    (``https://agent.robinhood.com/mcp/trading``). The AS metadata is served
+    ONLY at the RFC 8414 *path-inserted* well-known URL
+    (``/.well-known/oauth-authorization-server/mcp/trading``); the
+    path-suffixed form (``/mcp/trading/.well-known/...``) returns 404.
+    Discovery must follow the RFC 8414 layout, not the path-suffixed one.
+    """
+    mcp = "https://agent.robinhood.com/mcp/trading"
+    prm = {
+        "authorization_servers": [mcp],
+        "resource": mcp,
+        "scopes_supported": ["internal"],
+    }
+    as_meta = {
+        "issuer": mcp,
+        "authorization_endpoint": "https://robinhood.com/oauth",
+        "token_endpoint": "https://api.robinhood.com/oauth2/token/",
+        "registration_endpoint": "https://agent.robinhood.com/oauth/trading/register",
+        "scopes_supported": ["internal"],
+        "code_challenge_methods_supported": ["S256"],
+    }
+    rfc8414_url = (
+        "https://agent.robinhood.com/.well-known/"
+        "oauth-authorization-server/mcp/trading"
+    )
+    path_suffixed_url = (
+        "https://agent.robinhood.com/mcp/trading/.well-known/"
+        "oauth-authorization-server"
+    )
+    seen: list[str] = []
+
+    def fake_get(url, headers=None):
+        seen.append(url)
+        if url.endswith("/.well-known/oauth-protected-resource"):
+            return _json_response(200, prm)
+        if url == rfc8414_url:
+            return _json_response(200, as_meta)
+        # Everything else (incl. the path-suffixed form) 404s, mirroring prod.
+        return _json_response(404, None)
+
+    client = MagicMock()
+    client.get.side_effect = fake_get
+
+    eps = rt.discover_endpoints(client=client)
+    assert eps.authorization_endpoint == "https://robinhood.com/oauth"
+    assert eps.token_endpoint == "https://api.robinhood.com/oauth2/token/"
+    assert (
+        eps.registration_endpoint
+        == "https://agent.robinhood.com/oauth/trading/register"
+    )
+    # We must have probed the RFC 8414 path-inserted URL.
+    assert rfc8414_url in seen
+    # The path-suffixed form must NOT be the one that resolved (it 404s in
+    # prod); discovery should succeed without depending on it.
+    assert eps.token_endpoint != path_suffixed_url
+
+
 # ---------------------------------------------------------------------------
 # register_client
 # ---------------------------------------------------------------------------
@@ -214,6 +274,20 @@ def test_build_authorize_url_has_pkce_and_resource():
     assert "client_id=cid" in url
     assert "state=st" in url
     assert "resource=" in url
+
+
+def test_build_authorize_url_uses_internal_scope():
+    """Robinhood's AS advertises only the ``internal`` scope (verified live).
+    Requesting ``trade read`` would be rejected."""
+    assert rt.RH_OAUTH_SCOPE == "internal"
+    url = rt.build_authorize_url(
+        _endpoints(),
+        client_id="cid",
+        code_challenge="chal",
+        state="st",
+    )
+    assert "scope=internal" in url
+    assert "trade" not in url
 
 
 # ---------------------------------------------------------------------------
