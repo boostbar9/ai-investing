@@ -61,10 +61,10 @@ from packages.cockpit.web import autonomy as autonomy_brain
 from packages.cockpit.web import bandit as autonomy_bandit
 from packages.cockpit.web import brain_memory as autonomy_memory
 from packages.cockpit.web import chatter as agent_chatter
-from packages.cockpit.web import knowledge_base as autonomy_knowledge
-from packages.cockpit.web import reflection as autonomy_reflection
 from packages.cockpit.web import finnhub_ws as finnhub_ws_mod
+from packages.cockpit.web import knowledge_base as autonomy_knowledge
 from packages.cockpit.web import live_quotes as live_quotes_mod
+from packages.cockpit.web import reflection as autonomy_reflection
 from packages.cockpit.web import regime as autonomy_regime
 from packages.execution.broker import AlpacaPaperBroker, BrokerError, OrderRequest
 from packages.paper.streak import compute_paper_streak
@@ -1884,6 +1884,199 @@ def api_onboarding_reset() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# /api/onboarding/robinhood/* -- the "Connect your agent" OAuth flow
+#
+# Backed by ``packages/execution/robinhood.py`` (begin_auth / complete_auth
+# / disconnect / is_connected). The flow is OAuth 2.1 authorization-code
+# with PKCE against Robinhood's MCP server. We default the broker to
+# SHADOW mode and a $300 float cap regardless of connection state -- this
+# only wires up *auth*, never flips the user to live trading.
+#
+#   POST /api/onboarding/robinhood/connect    -> returns authorize URL
+#   GET  /callback (loopback redirect)         -> finishes the exchange
+#   POST /api/onboarding/robinhood/finish      -> manual code/state paste
+#   POST /api/onboarding/robinhood/disconnect  -> wipe tokens
+#   GET  /api/onboarding/robinhood/status      -> connected? + rh_status
+# ---------------------------------------------------------------------------
+
+
+class _RhFinishBody(BaseModel):
+    """Manual-paste fallback when the loopback redirect can't reach us
+    (some networks / the Cursor-style 403-on-loopback case). The user
+    pastes the full redirect URL or the code+state from it."""
+
+    code: str = ""
+    state: str = ""
+    redirect_url: str = ""
+
+
+@app.post("/api/onboarding/robinhood/connect")
+def api_rh_connect() -> dict[str, Any]:
+    """Start the Robinhood OAuth flow and return the authorize URL.
+
+    The cockpit opens this URL in the user's browser; Robinhood prompts
+    them to open/confirm their Agentic account and approve, then redirects
+    back to our loopback callback. Returns ``ok=False`` with a message on
+    discovery/registration failure so the UI shows a clear error instead
+    of a dead button.
+    """
+    from packages.execution.robinhood import begin_auth
+
+    try:
+        pending = begin_auth()
+    except BrokerError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "authorize_url": pending.authorize_url,
+        "redirect_uri": pending.redirect_uri,
+        "state": pending.state,
+    }
+
+
+@app.get("/callback", response_class=HTMLResponse)
+def api_rh_callback(request: Request) -> HTMLResponse:
+    """Loopback redirect target for the OAuth flow.
+
+    Robinhood redirects the browser here with ``?code=...&state=...``.
+    We finish the token exchange server-side and render a tiny
+    self-contained page telling the user to return to the cockpit.
+    """
+    from packages.execution.robinhood import complete_auth
+
+    params = request.query_params
+    code = params.get("code", "")
+    state = params.get("state", "")
+    err = params.get("error", "")
+
+    if err:
+        return HTMLResponse(
+            _rh_callback_page(
+                ok=False,
+                msg=f"Robinhood returned an error: {err}. "
+                "Close this tab and try Connect again.",
+            ),
+            status_code=400,
+        )
+    if not code:
+        return HTMLResponse(
+            _rh_callback_page(
+                ok=False, msg="Missing authorization code in callback."
+            ),
+            status_code=400,
+        )
+    try:
+        complete_auth(code=code, state=state)
+    except BrokerError as exc:
+        return HTMLResponse(
+            _rh_callback_page(ok=False, msg=str(exc)), status_code=400
+        )
+
+    # Mark onboarding status granted on a successful connect (the token
+    # check on next probe will confirm; this gives instant UI feedback).
+    try:
+        from packages.cockpit.onboarding import (
+            load_onboarding,
+            save_onboarding,
+        )
+
+        st = load_onboarding()
+        st.robinhood_status = "granted"  # type: ignore[assignment]
+        save_onboarding(st)
+    except Exception:  # pragma: no cover - UI nicety, never fatal
+        pass
+
+    return HTMLResponse(
+        _rh_callback_page(
+            ok=True,
+            msg="Your agent is connected to Robinhood. "
+            "You can close this tab and return to the cockpit.",
+        )
+    )
+
+
+def _rh_callback_page(*, ok: bool, msg: str) -> str:
+    """Minimal standalone HTML for the OAuth callback landing page."""
+    color = "#16a34a" if ok else "#dc2626"
+    icon = "&#10003;" if ok else "&#10007;"
+    title = "Connected" if ok else "Connection failed"
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>Robinhood &middot; {title}</title></head>"
+        "<body style='font-family:system-ui,sans-serif;background:#0b0b0f;"
+        "color:#e5e7eb;display:flex;min-height:100vh;align-items:center;"
+        "justify-content:center;margin:0'>"
+        "<div style='max-width:420px;text-align:center;padding:32px'>"
+        f"<div style='font-size:48px;color:{color}'>{icon}</div>"
+        f"<h1 style='font-size:20px;margin:12px 0 8px'>{title}</h1>"
+        f"<p style='color:#9ca3af;line-height:1.5'>{msg}</p>"
+        "</div></body></html>"
+    )
+
+
+@app.post("/api/onboarding/robinhood/finish")
+def api_rh_finish(body: _RhFinishBody) -> dict[str, Any]:
+    """Manual-paste completion fallback.
+
+    If the browser redirect can't reach the cockpit's loopback listener,
+    the user pastes the full redirect URL (or the code+state) here and we
+    finish the exchange. Accepts either ``code``+``state`` directly or a
+    ``redirect_url`` we parse them out of.
+    """
+    from urllib.parse import parse_qs, urlsplit
+
+    from packages.execution.robinhood import complete_auth
+
+    code, state = body.code, body.state
+    if body.redirect_url and not (code and state):
+        q = parse_qs(urlsplit(body.redirect_url).query)
+        code = code or (q.get("code", [""])[0])
+        state = state or (q.get("state", [""])[0])
+    if not code:
+        raise HTTPException(status_code=400, detail="missing code")
+    try:
+        complete_auth(code=code, state=state)
+    except BrokerError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        from packages.cockpit.onboarding import (
+            load_onboarding,
+            save_onboarding,
+        )
+
+        st = load_onboarding()
+        st.robinhood_status = "granted"  # type: ignore[assignment]
+        save_onboarding(st)
+    except Exception:  # pragma: no cover
+        pass
+    return {"ok": True}
+
+
+@app.post("/api/onboarding/robinhood/disconnect")
+def api_rh_disconnect() -> dict[str, Any]:
+    """Wipe Robinhood tokens + client_id. Backs 'Disconnect Robinhood'."""
+    from packages.execution.robinhood import disconnect
+
+    disconnect()
+    return {"ok": True, "connected": False}
+
+
+@app.get("/api/onboarding/robinhood/status")
+def api_rh_status() -> dict[str, Any]:
+    """Report whether a usable Robinhood token is stored, plus the cached
+    onboarding status. Read-only; never touches the network."""
+    from packages.cockpit.onboarding import load_onboarding
+    from packages.execution.robinhood import is_connected
+
+    return {
+        "connected": is_connected(),
+        "robinhood_status": load_onboarding().robinhood_status,
+    }
+
+
+# ---------------------------------------------------------------------------
 # /api/research-sweep -- Phase 1D
 #
 # The dashboard 'Research Candidates' tile polls these endpoints. GET
@@ -3410,7 +3603,7 @@ async def _autonomy_startup() -> None:  # pragma: no cover
         log.info(
             "finnhub_ws: client built (started=%s, max_symbols=%d)",
             ws_started,
-            ws_client._max_symbols,  # noqa: SLF001 — telemetry only
+            ws_client._max_symbols,
         )
     else:
         log.info("finnhub_ws: no API key, live tick stream disabled")

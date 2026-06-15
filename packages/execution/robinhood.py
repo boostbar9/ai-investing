@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -45,7 +46,23 @@ from packages.execution.robinhood_mcp import (
     McpError,
     RobinhoodMcpClient,
 )
-from packages.execution.robinhood_token import TokenSet, load_tokens
+from packages.execution.robinhood_token import (
+    OAuthEndpoints,
+    TokenSet,
+    build_authorize_url,
+    clear_client_id,
+    clear_tokens,
+    discover_endpoints,
+    exchange_code,
+    load_client_id,
+    load_tokens,
+    new_pkce_pair,
+    new_state,
+    refresh_access_token,
+    register_client,
+    save_client_id,
+    save_tokens,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -178,11 +195,41 @@ class RobinhoodAgenticBroker(Broker):
                 "from Settings to connect your account"
             )
         if tokens.is_stale():
-            raise BrokerError(
-                "robinhood: access token is stale -- refresh from "
-                "Settings (Phase 2 will add automatic refresh)"
-            )
+            tokens = self._refresh_or_die(tokens)
         return tokens
+
+    def _refresh_or_die(self, tokens: TokenSet) -> TokenSet:
+        """Refresh a stale access token using the stored refresh token.
+
+        On success the rotated token set is persisted and returned. On
+        any failure we raise ``BrokerError`` with a 'reconnect' hint --
+        the user must re-run the browser flow (refresh tokens can be
+        revoked or expire too).
+        """
+        if not tokens.refresh_token:
+            raise BrokerError(
+                "robinhood: access token expired and no refresh token "
+                "available -- reconnect your account from Settings"
+            )
+        client_id = load_client_id()
+        if not client_id:
+            raise BrokerError(
+                "robinhood: missing client_id for refresh -- reconnect "
+                "your account from Settings"
+            )
+        try:
+            fresh = refresh_access_token(
+                tokens.refresh_token, client_id=client_id
+            )
+        except Exception as exc:
+            raise BrokerError(
+                f"robinhood: token refresh failed ({exc.__class__.__name__}) "
+                "-- reconnect your account from Settings"
+            ) from exc
+        save_tokens(fresh)
+        # Reset the cached MCP client so the next call uses the new token.
+        self._mcp = None
+        return fresh
 
     async def _client(self) -> RobinhoodMcpClient:
         if self._mcp_client_override is not None:
@@ -359,6 +406,151 @@ class RobinhoodAgenticBroker(Broker):
 
 
 # ---------------------------------------------------------------------------
+# OAuth browser flow (loopback, PKCE) -- the "Connect your agent" path
+# ---------------------------------------------------------------------------
+#
+# Robinhood's MCP server uses the OAuth 2.1 authorization-code-with-PKCE
+# native-app flow (RFC 8252). The cockpit:
+#   1. begin_auth()    -> discover endpoints, register client, build the
+#                         authorize URL, and stash the in-flight verifier +
+#                         state in memory (NOT on disk -- OAuth 2.1 rule).
+#   2. user opens the URL, approves, Robinhood redirects to our loopback
+#      redirect_uri (http://localhost:PORT/callback?code=...&state=...).
+#   3. complete_auth() -> verify state, exchange code+verifier for tokens,
+#                         persist tokens + client_id to the OS keychain.
+#
+# The cockpit owns the actual HTTP listener (it already runs a web server),
+# so this module exposes the stateless pieces and an in-memory pending-auth
+# holder. There is at most one auth flow in flight at a time.
+
+
+@dataclass
+class PendingAuth:
+    """In-memory state for one in-flight authorization. Never persisted --
+    the code_verifier must live in memory only (OAuth 2.1 / RFC 7636)."""
+
+    state: str
+    code_verifier: str
+    client_id: str
+    endpoints: OAuthEndpoints
+    redirect_uri: str
+    authorize_url: str
+
+
+# Module-level holder for the single in-flight flow. Set by begin_auth,
+# consumed + cleared by complete_auth.
+_PENDING_AUTH: PendingAuth | None = None
+
+
+def begin_auth(*, redirect_uri: str | None = None) -> PendingAuth:
+    """Start the OAuth flow: discover, register, build authorize URL.
+
+    Returns a ``PendingAuth`` whose ``authorize_url`` the caller surfaces
+    to the user (open in browser). Stores the pending state in memory so
+    ``complete_auth`` can finish the exchange. Raises ``BrokerError`` on
+    any discovery/registration failure so the cockpit can show a clear
+    message instead of a dead 'Connect' button.
+    """
+    global _PENDING_AUTH
+    from packages.execution.robinhood_token import RH_OAUTH_REDIRECT_URI
+
+    redirect_uri = redirect_uri or RH_OAUTH_REDIRECT_URI
+    try:
+        endpoints = discover_endpoints()
+        client_id = load_client_id() or register_client(
+            endpoints, redirect_uri=redirect_uri
+        )
+        verifier, challenge = new_pkce_pair()
+        state = new_state()
+        url = build_authorize_url(
+            endpoints,
+            client_id=client_id,
+            code_challenge=challenge,
+            state=state,
+            redirect_uri=redirect_uri,
+        )
+    except Exception as exc:
+        raise BrokerError(
+            f"robinhood: could not start auth flow ({exc.__class__.__name__}: {exc})"
+        ) from exc
+
+    _PENDING_AUTH = PendingAuth(
+        state=state,
+        code_verifier=verifier,
+        client_id=client_id,
+        endpoints=endpoints,
+        redirect_uri=redirect_uri,
+        authorize_url=url,
+    )
+    return _PENDING_AUTH
+
+
+def complete_auth(*, code: str, state: str) -> TokenSet:
+    """Finish the flow: verify state, exchange code, persist tokens.
+
+    Must be called with the ``code`` and ``state`` query params Robinhood
+    sent to the loopback redirect. Raises ``BrokerError`` if there is no
+    pending flow or the state doesn't match (CSRF guard).
+    """
+    global _PENDING_AUTH
+    pending = _PENDING_AUTH
+    if pending is None:
+        raise BrokerError(
+            "robinhood: no auth flow in progress -- click Connect first"
+        )
+    if not state or state != pending.state:
+        # Do NOT clear the pending flow on a mismatch -- it may be a
+        # stray/replayed callback while the real one is still coming.
+        raise BrokerError(
+            "robinhood: OAuth state mismatch -- ignoring callback (possible "
+            "CSRF or stale tab)"
+        )
+    try:
+        tokens = exchange_code(
+            pending.endpoints,
+            code=code,
+            code_verifier=pending.code_verifier,
+            client_id=pending.client_id,
+            redirect_uri=pending.redirect_uri,
+        )
+    except Exception as exc:
+        raise BrokerError(
+            f"robinhood: code exchange failed ({exc.__class__.__name__}: {exc})"
+        ) from exc
+
+    save_tokens(tokens)
+    save_client_id(pending.client_id)
+    _PENDING_AUTH = None  # consume the one-shot flow
+    return tokens
+
+
+def pending_auth() -> PendingAuth | None:
+    """Expose the current in-flight auth (cockpit uses this to re-show the
+    authorize URL if the user closed the tab)."""
+    return _PENDING_AUTH
+
+
+def disconnect() -> None:
+    """Full Robinhood disconnect: wipe tokens + client_id + any pending
+    flow. Backs the 'Disconnect Robinhood' button."""
+    global _PENDING_AUTH
+    _PENDING_AUTH = None
+    clear_tokens()
+    clear_client_id()
+
+
+def is_connected() -> bool:
+    """True if a (possibly stale-but-refreshable) token set is stored.
+    Stale-with-refresh still counts as connected -- the broker will
+    refresh on first use."""
+    tokens = load_tokens()
+    if tokens is None:
+        return False
+    # Stale-with-refresh still counts as connected; stale-without does not.
+    return not (tokens.is_stale() and not tokens.refresh_token)
+
+
+# ---------------------------------------------------------------------------
 # Convenience factory used by the cockpit when wiring brokers
 # ---------------------------------------------------------------------------
 
@@ -389,8 +581,14 @@ def build_broker_from_settings() -> RobinhoodAgenticBroker:
 __all__ = [
     "ABSOLUTE_MAX_FLOAT_USD",
     "SHADOW_TRADES_PATH",
+    "PendingAuth",
     "RobinhoodAgenticBroker",
+    "begin_auth",
     "build_broker_from_settings",
+    "complete_auth",
+    "disconnect",
+    "is_connected",
     "load_shadow_trades",
+    "pending_auth",
     "resolve_float_cap",
 ]

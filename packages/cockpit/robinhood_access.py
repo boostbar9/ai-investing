@@ -92,16 +92,96 @@ def _probe_discovery(timeout_s: float = RH_PROBE_TIMEOUT_S) -> ProbeResult:
 
 
 def _check_granted_via_token() -> ProbeResult | None:
-    """Phase 2 stub: when a Robinhood refresh token is present in the OS
-    keychain we'll introspect it to confirm the sub-account is active.
+    """Confirm 'granted' by exercising the stored token against the MCP
+    server.
 
-    Returns ``None`` until Phase 2 lands. Wizard treats ``None`` as
-    'fall through to the discovery probe'.
+    Logic:
+      1. No token in keychain -> return ``None`` (fall through to the
+         public discovery probe; the user is still on the waitlist).
+      2. Token present (refreshing first if stale) -> run an authenticated
+         MCP ``initialize`` + ``tools/list`` handshake. If the server
+         answers with a tool catalog, the sub-account is live -> ``granted``.
+      3. Auth rejected (401/403/refresh failure) -> ``waitlist`` with a
+         detail explaining the token isn't accepted yet.
+      4. Any other transport hiccup -> ``None`` so we fall through to the
+         reachability probe rather than mislabeling the user.
+
+    This is read-only: ``initialize`` + ``tools/list`` never submit a
+    trade. Imports live inside the function so a fresh install without the
+    keyring backend never breaks cockpit boot at import time.
     """
-    # Intentional: Phase 2 (RobinhoodAgenticBroker) will add the keyring
-    # lookup + introspection call here. Stubbed so callers don't crash
-    # before that work lands.
-    return None
+    import asyncio
+
+    try:
+        from packages.execution.broker import BrokerError
+        from packages.execution.robinhood import is_connected
+        from packages.execution.robinhood_mcp import (
+            McpError,
+            RobinhoodMcpClient,
+        )
+    except Exception as exc:  # pragma: no cover - import-time safety net
+        logger.debug("rh token check unavailable: %s", exc.__class__.__name__)
+        return None
+
+    if not is_connected():
+        return None  # no usable token -> still waitlist
+
+    async def _handshake() -> ProbeResult:
+        # Reuse the broker's token-resolution + refresh logic so a stale
+        # access token is silently refreshed before we probe.
+        from packages.execution.modes import ExecutionMode
+        from packages.execution.robinhood import RobinhoodAgenticBroker
+
+        broker = RobinhoodAgenticBroker(mode=ExecutionMode.SHADOW)
+        try:
+            tokens = broker._require_token()  # refreshes if stale
+        except BrokerError as exc:
+            return ProbeResult(
+                outcome="waitlist",
+                detail=f"token present but not usable: {exc}",
+            )
+        client = RobinhoodMcpClient(
+            bearer_token=tokens.access_token,
+            timeout_s=RH_PROBE_TIMEOUT_S,
+        )
+        try:
+            await client.initialize()
+            tools = await client.list_tools()
+            return ProbeResult(
+                outcome="granted",
+                detail=f"authenticated MCP handshake ok ({len(tools)} tools)",
+                http_status=200,
+            )
+        except McpError as exc:
+            msg = str(exc)
+            # 401/403 means the token isn't authorized for the agentic
+            # account yet -- the user is approved for OAuth but the
+            # sub-account isn't live. Treat as waitlist, not granted.
+            if "401" in msg or "403" in msg:
+                return ProbeResult(
+                    outcome="waitlist",
+                    detail=f"MCP rejected token (not yet provisioned): {msg}",
+                )
+            # Other MCP errors are ambiguous -> fall through.
+            return ProbeResult(outcome="unknown", detail=f"mcp error: {msg}")
+        finally:
+            await client.aclose()
+
+    try:
+        result = asyncio.run(_handshake())
+    except RuntimeError:
+        # Already inside an event loop (e.g. called from async cockpit
+        # context). Run in a dedicated loop on a thread to stay safe.
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(lambda: asyncio.run(_handshake())).result()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("rh token handshake failed: %s", exc.__class__.__name__)
+        return None
+
+    # 'unknown' from the handshake means fall through to discovery probe.
+    return None if result.outcome == "unknown" else result
 
 
 def detect_access(
