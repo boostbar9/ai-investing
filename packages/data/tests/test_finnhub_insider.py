@@ -33,7 +33,6 @@ from packages.data.finnhub_insider import (
     seniority_weight,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -165,7 +164,7 @@ def test_cluster_three_directors_fires_buy_vp_sell_ignored():
     s = aggregate_insider_signal("AAPL", txns, now=now)
     assert s.cluster_buy is True
     assert s.label == "cluster_buy"
-    # 3 directors × 1.2 weight = 3.6 (above CLUSTER_THRESHOLD).
+    # 3 directors x 1.2 weight = 3.6 (above CLUSTER_THRESHOLD).
     assert s.cluster_score >= CLUSTER_THRESHOLD
     assert s.cluster_score == pytest.approx(3.6, rel=1e-9)
     assert s.unique_buyers == 3
@@ -235,7 +234,7 @@ def test_single_buyer_confidence_cap():
     """Even a $50M single-CEO buy stays ≤ 0.15 confidence."""
     today = date(2026, 6, 1)
     now = datetime(2026, 6, 1, tzinfo=UTC)
-    # 250k shares × $200 = $50M
+    # 250k shares x $200 = $50M
     txns = [_txn(name="CEO", title="Chief Executive Officer", when=today,
                  code="P", shares=250_000, price=200)]
     s = aggregate_insider_signal("AAPL", txns, now=now)

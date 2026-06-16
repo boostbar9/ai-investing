@@ -5367,7 +5367,7 @@ async def api_data_feed_refresh(symbol: str | None = None) -> dict[str, Any]:
     except Exception:
         pass
     results = await live_quotes_mod.refresh_symbols(cache, sorted(syms))
-    return {"refreshed": {k: v for k, v in results.items()}}
+    return {"refreshed": dict(results)}
 
 
 @app.exception_handler(Exception)

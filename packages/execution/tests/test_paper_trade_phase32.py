@@ -22,11 +22,10 @@ Three independent bugs surfaced when reading
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
-
 import pytest_asyncio  # noqa: F401  (registers asyncio mode)
-from uuid import uuid4
 
 from packages.agents.paper_bridge import make_risk_agent
 from packages.shared.schemas import RiskInput, Signal
@@ -36,7 +35,6 @@ from tools.paper_trade import (
     _is_rth,
     _to_cockpit_regime,
 )
-
 
 # --- Fix 1: auto-default strategy --------------------------------------------
 

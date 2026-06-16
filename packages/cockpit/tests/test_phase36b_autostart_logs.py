@@ -33,7 +33,6 @@ from packages.cockpit import state as st
 from packages.cockpit.state import CockpitState
 from packages.cockpit.web import server as srv
 
-
 # ---------------------------------------------------------------------------
 # Pure decision function
 # ---------------------------------------------------------------------------

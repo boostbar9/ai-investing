@@ -96,7 +96,7 @@ class AgentStatus:
     ts: str = ""
     """ISO-8601 UTC timestamp. Auto-filled on emit if blank."""
 
-    def with_ts(self, now: datetime | None = None) -> "AgentStatus":
+    def with_ts(self, now: datetime | None = None) -> AgentStatus:
         """Return a copy with ``ts`` set, leaving the original frozen."""
         stamp = (now or datetime.now(UTC)).isoformat(timespec="seconds")
         return AgentStatus(

@@ -9,14 +9,11 @@ from typing import Any
 import pytest
 
 from packages.intraday.router import (
-    MIN_NOTIONAL_USD,
-    RouteAttempt,
     RouteResult,
     route_setups,
     shares_for_notional,
 )
 from packages.intraday.setup_finder import RankedSetup
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

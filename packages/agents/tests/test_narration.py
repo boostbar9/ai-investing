@@ -26,7 +26,6 @@ from packages.agents.narration import (
     read_latest,
 )
 
-
 # --- Schema pin --------------------------------------------------------------
 
 
@@ -46,7 +45,7 @@ def test_actors_list_is_stable() -> None:
 def test_agent_status_frozen() -> None:
     """Frozen dataclass: mutation must raise. This prevents agents from\n    rewriting each other's status objects after emit."""
     s = AgentStatus(actor="research", working_on="x", waiting_on="y")
-    with pytest.raises(Exception):  # FrozenInstanceError or AttributeError
+    with pytest.raises(AttributeError):  # FrozenInstanceError subclasses AttributeError
         s.working_on = "z"  # type: ignore[misc]
 
 

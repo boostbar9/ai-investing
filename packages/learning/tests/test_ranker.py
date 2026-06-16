@@ -123,7 +123,7 @@ def _seed_dataset(
 
 
 def test_to_matrix_preserves_feature_key_order() -> None:
-    rows = [{k: 0 for k in FEATURE_KEYS}]
+    rows = [dict.fromkeys(FEATURE_KEYS, 0)]
     _, cols, _ = to_matrix(rows)
     assert cols == list(FEATURE_KEYS)
 

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -351,9 +353,6 @@ def test_run_tick_handles_dict_positions(
 # Phase 28-R step 3 — session-scoped peak reset
 # ---------------------------------------------------------------------------
 
-from datetime import UTC, datetime
-from zoneinfo import ZoneInfo
-
 _ET = ZoneInfo("America/New_York")
 
 
@@ -449,7 +448,7 @@ def test_peak_store_disk_load_missing_session_marker_treated_as_stale(
 
 def test_peak_store_reset_session_clears_and_flushes(tmp_path: Path) -> None:
     """reset_session() empties the cache and rewrites the file."""
-    store, clock = _build_store_with_clock(
+    store, _ = _build_store_with_clock(
         tmp_path, _et_dt(2026, 6, 3, 10, 0)
     )
     store.update("AMD", 0.02)

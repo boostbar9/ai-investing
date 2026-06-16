@@ -47,10 +47,11 @@ poll.
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import logging
 import os
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse
@@ -80,15 +81,15 @@ ALT_HEADER = "x-cockpit-token"
 MIN_TOKEN_LEN = 16
 
 
-def _expected_token() -> Optional[str]:
+def _expected_token() -> str | None:
     """Return the configured remote token, or None if the surface is off."""
     tok = os.environ.get(ENV_TOKEN, "").strip()
     return tok or None
 
 
 def _extract_provided_token(
-    authorization: Optional[str], x_cockpit_token: Optional[str]
-) -> Optional[str]:
+    authorization: str | None, x_cockpit_token: str | None
+) -> str | None:
     """Pull the bearer token out of either accepted header."""
     if authorization:
         s = authorization.strip()
@@ -102,8 +103,8 @@ def _extract_provided_token(
 
 
 def require_remote_auth(
-    authorization: Optional[str] = Header(default=None),
-    x_cockpit_token: Optional[str] = Header(default=None),
+    authorization: str | None = Header(default=None),
+    x_cockpit_token: str | None = Header(default=None),
 ) -> None:
     """FastAPI dependency that enforces the shared-secret token.
 
@@ -206,8 +207,8 @@ def build_router() -> APIRouter:
     @router.get("/whoami")
     def remote_whoami(
         request: Request,
-        authorization: Optional[str] = Header(default=None),
-        x_cockpit_token: Optional[str] = Header(default=None),
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """Authenticated probe \u2014 returns 200 only with a valid token."""
         require_remote_auth(authorization, x_cockpit_token)
@@ -219,8 +220,8 @@ def build_router() -> APIRouter:
 
     @router.get("/snapshot")
     def remote_snapshot(
-        authorization: Optional[str] = Header(default=None),
-        x_cockpit_token: Optional[str] = Header(default=None),
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """All operator-facing context in a single payload.
 
@@ -247,8 +248,8 @@ def build_router() -> APIRouter:
     @router.get("/log")
     def remote_log(
         download: int = 0,
-        authorization: Optional[str] = Header(default=None),
-        x_cockpit_token: Optional[str] = Header(default=None),
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
     ):
         """Tail or download the paper loop log file."""
         require_remote_auth(authorization, x_cockpit_token)
@@ -263,8 +264,8 @@ def build_router() -> APIRouter:
 
     @router.post("/pause")
     def remote_pause(
-        authorization: Optional[str] = Header(default=None),
-        x_cockpit_token: Optional[str] = Header(default=None),
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         require_remote_auth(authorization, x_cockpit_token)
         state = load_state()
@@ -275,8 +276,8 @@ def build_router() -> APIRouter:
 
     @router.post("/resume")
     def remote_resume(
-        authorization: Optional[str] = Header(default=None),
-        x_cockpit_token: Optional[str] = Header(default=None),
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         require_remote_auth(authorization, x_cockpit_token)
         state = load_state()
@@ -288,8 +289,8 @@ def build_router() -> APIRouter:
     @router.post("/loop/start")
     def remote_loop_start(
         body: RemoteStartLoop,
-        authorization: Optional[str] = Header(default=None),
-        x_cockpit_token: Optional[str] = Header(default=None),
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """Start the paper-trade loop and persist intent."""
         require_remote_auth(authorization, x_cockpit_token)
@@ -327,8 +328,8 @@ def build_router() -> APIRouter:
 
     @router.post("/loop/stop")
     def remote_loop_stop(
-        authorization: Optional[str] = Header(default=None),
-        x_cockpit_token: Optional[str] = Header(default=None),
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         require_remote_auth(authorization, x_cockpit_token)
         state = load_state()
@@ -346,8 +347,8 @@ def build_router() -> APIRouter:
 
     @router.post("/cancel_orders")
     def remote_cancel_orders(
-        authorization: Optional[str] = Header(default=None),
-        x_cockpit_token: Optional[str] = Header(default=None),
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """Phase 36g — cancel every open Alpaca order; positions untouched.
 
@@ -362,6 +363,7 @@ def build_router() -> APIRouter:
         """
         require_remote_auth(authorization, x_cockpit_token)
         import asyncio
+
         from packages.execution.broker import AlpacaPaperBroker, BrokerError
 
         async def _run() -> dict[str, Any]:
@@ -374,9 +376,9 @@ def build_router() -> APIRouter:
         try:
             result = asyncio.run(_run())
         except BrokerError as e:
-            raise HTTPException(status_code=502, detail=str(e))
+            raise HTTPException(status_code=502, detail=str(e)) from e
         except Exception as e:  # pragma: no cover — defensive
-            raise HTTPException(status_code=500, detail=f"cancel failed: {e}")
+            raise HTTPException(status_code=500, detail=f"cancel failed: {e}") from e
 
         state = load_state()
         state = record_action(
@@ -389,8 +391,8 @@ def build_router() -> APIRouter:
     @router.post("/liquidate")
     def remote_liquidate(
         body: RemoteLiquidate,
-        authorization: Optional[str] = Header(default=None),
-        x_cockpit_token: Optional[str] = Header(default=None),
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """Liquidate all positions. Requires explicit confirm token.
 
@@ -417,10 +419,8 @@ def build_router() -> APIRouter:
         # existing /api/trading/liquidate path or the Alpaca UI \u2014 we
         # don't duplicate that broker call here because it would split
         # the audit trail.
-        try:
+        with contextlib.suppress(Exception):
             cockpit_proc.stop("paper_loop")
-        except Exception:
-            pass
         return {
             "state": state.to_dict(),
             "note": (
@@ -432,8 +432,8 @@ def build_router() -> APIRouter:
 
     @router.get("/version")
     def remote_version(
-        authorization: Optional[str] = Header(default=None),
-        x_cockpit_token: Optional[str] = Header(default=None),
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """Local HEAD commit \u2014 lets the agent verify what's running.
 
@@ -449,8 +449,8 @@ def build_router() -> APIRouter:
 
     @router.get("/update/check")
     def remote_update_check(
-        authorization: Optional[str] = Header(default=None),
-        x_cockpit_token: Optional[str] = Header(default=None),
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """Fetch origin and report how far behind HEAD is.
 
@@ -466,8 +466,8 @@ def build_router() -> APIRouter:
     @router.post("/update/apply")
     def remote_update_apply(
         body: RemoteUpdate,
-        authorization: Optional[str] = Header(default=None),
-        x_cockpit_token: Optional[str] = Header(default=None),
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """Pull origin (fast-forward only), reinstall, optionally restart loop.
 
@@ -517,10 +517,8 @@ def build_router() -> APIRouter:
         # Best-effort stop of any existing loop. We don't bail on stop
         # failure \u2014 start() will detect a still-running process and
         # surface it in the returned info dict.
-        try:
+        with contextlib.suppress(Exception):
             cockpit_proc.stop("paper_loop")
-        except Exception:
-            pass
 
         state = load_state()
         state.paper_loop_intended = True
@@ -563,8 +561,8 @@ def build_router() -> APIRouter:
     @router.post("/restart")
     def remote_restart(
         body: RemoteRestart,
-        authorization: Optional[str] = Header(default=None),
-        x_cockpit_token: Optional[str] = Header(default=None),
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """Spawn a detached helper that kills this cockpit and relaunches.
 
@@ -630,8 +628,8 @@ def build_router() -> APIRouter:
         # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
         # so the helper survives our death. close_fds + no stdio so we
         # don't hold pipes back into a dying parent.
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        DETACHED_PROCESS = 0x00000008  # noqa: N806 - mirrors Windows API constant name
+        CREATE_NEW_PROCESS_GROUP = 0x00000200  # noqa: N806 - mirrors Windows API constant name
         try:
             _sp.Popen(
                 ps_args,
@@ -646,7 +644,7 @@ def build_router() -> APIRouter:
             raise HTTPException(
                 status_code=500,
                 detail=f"failed to spawn restart helper: {e}",
-            )
+            ) from e
 
         state = load_state()
         state = record_action(
@@ -662,8 +660,8 @@ def build_router() -> APIRouter:
             "pull": body.pull,
             "pid_to_kill": my_pid,
             "note": (
-                "Cockpit will go down in ~{0}s, then come back up in "
-                "~10-30s. Poll /api/remote/version to confirm new SHA.".format(delay)
+                f"Cockpit will go down in ~{delay}s, then come back up in "
+                "~10-30s. Poll /api/remote/version to confirm new SHA."
             ),
             "state": state.to_dict(),
         }

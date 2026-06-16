@@ -24,9 +24,9 @@ import httpx
 import pytest
 
 from packages.agents.reddit_trust.oauth import (
+    _EXPIRY_SLACK_S,
     REDDIT_TOKEN_URL,
     RedditOAuthClient,
-    _EXPIRY_SLACK_S,
     reset_oauth_for_tests,
 )
 

@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
             outcomes_path=args.outcomes_path,
             ledger_path=args.ledger_path,
         )
-    except Exception as exc:  # noqa: BLE001 - surfaced via exit code
+    except Exception as exc:
         log.exception("apply failed: %s", exc)
         return 1
 

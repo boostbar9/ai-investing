@@ -39,12 +39,12 @@ import pandas as pd
 
 from packages.agents.paper_bridge import advise as agent_advise
 from packages.cockpit.state import load_state as load_cockpit_state
+from packages.execution.bracket_attach import attach_bracket_after_entry
 from packages.execution.broker import (
     AlpacaPaperBroker,
     BrokerError,
     OrderRequest,
 )
-from packages.execution.bracket_attach import attach_bracket_after_entry
 from packages.paper.streak import compute_paper_streak
 from packages.persistence import connect as _db_connect
 from packages.persistence import insert_cycle as _db_insert_cycle
@@ -717,7 +717,7 @@ def compute_intraday_trend_weights() -> dict[str, float]:
                     bars = await adapter.get_intraday_bars(
                         sym, interval="5m", range_="5d"
                     )
-                except Exception as exc:  # noqa: BLE001 - skip bad ticker
+                except Exception as exc:
                     log.warning("intraday-trend: %s fetch failed: %s", sym, exc)
                     continue
                 if not bars:
@@ -1531,6 +1531,7 @@ async def run(
                 str(s).upper() for s, w in (target or {}).items()
                 if abs(float(w or 0.0)) >= 1e-6
             }
+            sweep_candidates = _load_latest_sweep_candidates()
             snap_rows = [
                 c for c in (sweep_candidates or [])
                 if isinstance(c, dict)
@@ -1657,7 +1658,7 @@ def main() -> int:
         default=None,
         help=(
             "Trading strategy to run. Default: intraday-trend during "
-            "RTH (9:30–16:00 ET, Mon–Fri), mean-reversion otherwise."
+            "RTH (9:30-16:00 ET, Mon-Fri), mean-reversion otherwise."
         ),
     )
     ap.add_argument("--dry-run", action="store_true", help="Plan orders but do not submit.")

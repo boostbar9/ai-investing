@@ -11,7 +11,6 @@ cumulative relaxation to actually bite.
 """
 from __future__ import annotations
 
-import json
 import random
 from pathlib import Path
 
@@ -29,21 +28,20 @@ from packages.agents.curiosity import (
     read_recent_actions,
 )
 
-
 # --- Helpers -----------------------------------------------------------------
 
 
 def _baseline(**overrides) -> CuriosityInput:
     """A 'quiet bot, no stall' state. Tests bend exactly one knob."""
-    base = dict(
-        idle_streak=0,
-        watchlist_age_s=0.0,
-        cumulative_relaxation=0.0,
-        dominant_rejection="",
-        universe=("AAPL", "MSFT"),
-        wildcard_pool=("NVDA", "TSLA", "AMD", "META", "GOOG", "AMZN"),
-        last_reflection_age_s=0.0,
-    )
+    base = {
+        "idle_streak": 0,
+        "watchlist_age_s": 0.0,
+        "cumulative_relaxation": 0.0,
+        "dominant_rejection": "",
+        "universe": ("AAPL", "MSFT"),
+        "wildcard_pool": ("NVDA", "TSLA", "AMD", "META", "GOOG", "AMZN"),
+        "last_reflection_age_s": 0.0,
+    }
     base.update(overrides)
     return CuriosityInput(**base)
 
@@ -84,7 +82,7 @@ def test_wildcard_skipped_if_pool_exhausted_by_universe() -> None:
 
 def test_wildcard_skipped_if_pool_empty() -> None:
     state = _baseline(
-        watchlist_age_s=WATCHLIST_STALE_S + 1, wildcard_pool=tuple()
+        watchlist_age_s=WATCHLIST_STALE_S + 1, wildcard_pool=()
     )
     action = decide(state, rng=random.Random(0))
     assert action.kind == "noop"

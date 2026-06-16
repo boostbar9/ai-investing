@@ -55,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         handle = fetch_handle(args.owner, args.repo, args.branch)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"discover failed: {exc}", file=sys.stderr)
         return 1
 

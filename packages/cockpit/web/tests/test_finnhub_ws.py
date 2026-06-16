@@ -23,13 +23,10 @@ import asyncio
 import json
 from typing import Any
 
-import pytest
-
 from packages.cockpit.web.finnhub_ws import (
     DEFAULT_MAX_SYMBOLS,
     FinnhubWebSocketClient,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fake WebSocket transport \u2014 every test drives the client through this.
@@ -132,7 +129,7 @@ async def _wait_for(predicate, timeout: float = 1.0, step: float = 0.01) -> None
 
 
 def test_no_key_start_returns_false() -> None:
-    ticks, on_tick = _collect_ticks()
+    _, on_tick = _collect_ticks()
     client = FinnhubWebSocketClient(api_key="", on_tick=on_tick)
 
     async def _go():
@@ -213,7 +210,7 @@ def test_trade_frame_coalesces_to_latest_price_per_symbol() -> None:
 
 
 def test_set_symbols_diffs_subscribe_and_unsubscribe() -> None:
-    ticks, on_tick = _collect_ticks()
+    _, on_tick = _collect_ticks()
     factory = FakeFactory()
     client = FinnhubWebSocketClient(
         api_key="TEST", on_tick=on_tick, connect_factory=factory
@@ -241,7 +238,7 @@ def test_set_symbols_diffs_subscribe_and_unsubscribe() -> None:
 
 
 def test_symbol_cap_drops_overflow() -> None:
-    ticks, on_tick = _collect_ticks()
+    _, on_tick = _collect_ticks()
     factory = FakeFactory()
     client = FinnhubWebSocketClient(
         api_key="TEST",
@@ -261,7 +258,7 @@ def test_symbol_cap_drops_overflow() -> None:
 
 
 def test_set_symbols_normalizes_and_dedupes() -> None:
-    ticks, on_tick = _collect_ticks()
+    _, on_tick = _collect_ticks()
     factory = FakeFactory()
     client = FinnhubWebSocketClient(
         api_key="TEST", on_tick=on_tick, connect_factory=factory
@@ -281,7 +278,7 @@ def test_default_max_symbols_is_50() -> None:
 
 
 def test_server_error_message_captured_in_status() -> None:
-    ticks, on_tick = _collect_ticks()
+    _, on_tick = _collect_ticks()
     factory = FakeFactory()
     client = FinnhubWebSocketClient(
         api_key="TEST", on_tick=on_tick, connect_factory=factory
@@ -303,7 +300,7 @@ def test_server_error_message_captured_in_status() -> None:
 
 
 def test_server_ping_triggers_pong() -> None:
-    ticks, on_tick = _collect_ticks()
+    _, on_tick = _collect_ticks()
     factory = FakeFactory()
     client = FinnhubWebSocketClient(
         api_key="TEST", on_tick=on_tick, connect_factory=factory
@@ -353,7 +350,7 @@ def test_bad_json_frame_is_tolerated() -> None:
 
 
 def test_reconnect_replays_subscriptions() -> None:
-    ticks, on_tick = _collect_ticks()
+    _, on_tick = _collect_ticks()
     factory = FakeFactory()
     client = FinnhubWebSocketClient(
         api_key="TEST", on_tick=on_tick, connect_factory=factory
@@ -391,7 +388,7 @@ def test_reconnect_replays_subscriptions() -> None:
 
 
 def test_stop_is_idempotent_and_closes_socket() -> None:
-    ticks, on_tick = _collect_ticks()
+    _, on_tick = _collect_ticks()
     factory = FakeFactory()
     client = FinnhubWebSocketClient(
         api_key="TEST", on_tick=on_tick, connect_factory=factory
@@ -412,7 +409,7 @@ def test_stop_is_idempotent_and_closes_socket() -> None:
 
 
 def test_status_shape_when_idle() -> None:
-    ticks, on_tick = _collect_ticks()
+    _, on_tick = _collect_ticks()
     client = FinnhubWebSocketClient(api_key="TEST", on_tick=on_tick)
     st = client.status()
     assert st["enabled"] is True

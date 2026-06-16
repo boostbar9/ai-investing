@@ -12,7 +12,6 @@ Verifies:
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from datetime import UTC, datetime
 from datetime import time as dtime
 from pathlib import Path
@@ -134,8 +133,8 @@ class TestIsInFlattenWindow:
         assert is_in_flatten_window(now) is False
 
     def test_window_constants_are_sane(self) -> None:
-        assert FLATTEN_WINDOW_START == dtime(15, 55)
-        assert FLATTEN_WINDOW_END == dtime(16, 5)
+        assert dtime(15, 55) == FLATTEN_WINDOW_START
+        assert dtime(16, 5) == FLATTEN_WINDOW_END
 
 
 class TestCurrentSessionDate:

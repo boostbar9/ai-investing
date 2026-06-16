@@ -2,17 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
-from packages.intraday import setup_finder
 from packages.intraday.setup_finder import (
-    DAILY_FLOAT_CEILING_USD,
-    DEFAULT_LIQUIDITY_FLOOR_USD,
-    DEFAULT_TOP_K,
-    EQUITY_FRACTION,
-    MIN_PER_POSITION_USD,
     WEIGHTS,
     CandidateInput,
     SetupFinderResult,
@@ -25,7 +17,6 @@ from packages.intraday.setup_finder import (
     score_orb_breakout,
     score_vwap_align,
 )
-
 
 # ---------------------------------------------------------------------------
 # Pure scorers
@@ -125,7 +116,7 @@ class TestCompositeScore:
     def test_full_components_sum_to_one(self) -> None:
         # WEIGHTS sum to 1.0, so all-ones composite = 1.0
         assert composite_score(
-            {k: 1.0 for k in WEIGHTS}
+            dict.fromkeys(WEIGHTS, 1.0)
         ) == pytest.approx(1.0)
 
     def test_only_orb_weight(self) -> None:

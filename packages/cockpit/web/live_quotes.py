@@ -35,9 +35,10 @@ import asyncio
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ DEFAULT_TTL_S = 30.0
 
 # Fallback provider type: a sync callable that returns a list of daily
 # closes (yfinance shape). The cache lifts the last element to a price.
-FallbackProvider = Callable[[str], Optional[list[float]]]
+FallbackProvider = Callable[[str], list[float] | None]
 
 # Async fetch type for the primary (Finnhub) path.
 QuoteFetcher = Callable[[str], Awaitable[float]]

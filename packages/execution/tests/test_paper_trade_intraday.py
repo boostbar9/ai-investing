@@ -15,10 +15,9 @@ contract pieces that downstream Phase 28-R work depends on:
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import pandas as pd
 import pytest
 
 from packages.data.adapters.base import Bar
@@ -80,15 +79,12 @@ def _make_bars(symbol: str, n: int = 60, *, breakout: bool = False) -> list[Bar]
     If ``breakout`` is True, prices climb after the 30-min opening range so
     the strategy should issue a long signal in the entry window.
     """
-    base = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)  # 09:30 ET
+    base = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)  # 09:30 ET
     bars: list[Bar] = []
     for i in range(n):
         ts = base + timedelta(minutes=5 * i)
-        if breakout and i >= 9:
-            # After opening range (first 6 bars = 30 min), drive price up.
-            price = 100.0 + 0.5 * (i - 5)
-        else:
-            price = 100.0 + 0.01 * i
+        # After opening range (first 6 bars = 30 min), drive price up.
+        price = 100.0 + 0.5 * (i - 5) if breakout and i >= 9 else 100.0 + 0.01 * i
         bars.append(
             Bar(
                 symbol=symbol,

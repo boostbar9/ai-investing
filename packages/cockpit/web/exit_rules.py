@@ -41,7 +41,7 @@ import contextlib
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -596,7 +596,7 @@ def _push_chatter(decision: ExitDecision, *, executed: bool) -> None:
     pnl_str = f"{decision.pnl_pct * 100:+.2f}%"
     if executed:
         if decision.reason == "scale_out":
-            pct = int(round(decision.qty_fraction * 100))
+            pct = round(decision.qty_fraction * 100)
             msg = (
                 f"Exit {label} fired on {decision.symbol} at {pnl_str} "
                 f"(peak {decision.peak_pct * 100:+.2f}%). Sold {pct}% "
@@ -796,7 +796,7 @@ def _publish_hot_flag(hot: bool) -> None:
     depends on this module via the exit_tick wiring.
     """
     try:
-        from packages.cockpit.web import autonomy as _autonomy  # noqa: WPS433
+        from packages.cockpit.web import autonomy as _autonomy
         _autonomy.STATE.any_position_hot = bool(hot)
     except Exception:  # pragma: no cover — import-time safety net
         return
