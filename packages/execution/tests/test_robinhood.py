@@ -287,7 +287,86 @@ async def test_buy_within_cap_passes_through_to_mcp(
     assert len(fake.calls) == 1
     # Real Robinhood agentic-trading tool name (not the legacy guess).
     assert fake.calls[0][0] == "place_equity_order"
-    assert fake.calls[0][1]["symbol"] == "SPY"
+    args = fake.calls[0][1]
+    assert args["symbol"] == "SPY"
+    # Confirmed Robinhood idempotency field is ref_id (UUID), NOT the
+    # previously-guessed client_order_id.
+    assert "client_order_id" not in args
+    assert "ref_id" in args
+    import uuid
+
+    assert str(uuid.UUID(args["ref_id"])) == args["ref_id"]
+
+
+@pytest.mark.asyncio
+async def test_ref_id_is_deterministic_across_retries(
+    isolated_shadow_log, isolated_onboarding
+):
+    """A retry of the SAME logical order (same identity) must re-send the
+    SAME ref_id so Robinhood dedupes the transient retry. ref_id must be
+    UUID-formatted."""
+    import uuid
+
+    _write_onboarding(isolated_onboarding, cap=10_000.0)
+    fake = _FakeMcpClient(
+        call_tool_result=McpCallResult(
+            tool="place_equity_order",
+            content={"order_id": "rh-r", "status": "accepted"},
+            is_error=False,
+        )
+    )
+    broker = RobinhoodAgenticBroker(
+        mode=ExecutionMode.LIVE,
+        mcp_client=fake,
+        token_loader=_good_tokens,
+    )
+    req = OrderRequest(
+        symbol="SPY", side="buy", qty=2, limit_price=100.0,
+        decision_id="dec-1", bar_ts="2026-06-16T10:00",
+    )
+    await broker.submit(req)
+    await broker.submit(req)  # transient-failure retry of the SAME order
+
+    assert len(fake.calls) == 2
+    rid0 = fake.calls[0][1]["ref_id"]
+    rid1 = fake.calls[1][1]["ref_id"]
+    assert rid0 == rid1
+    assert str(uuid.UUID(rid0)) == rid0  # valid, canonical UUID
+
+
+@pytest.mark.asyncio
+async def test_ref_id_differs_for_different_orders(
+    isolated_shadow_log, isolated_onboarding
+):
+    """Distinct logical orders must yield distinct ref_ids so idempotency
+    dedupe doesn't collapse genuinely different orders."""
+    _write_onboarding(isolated_onboarding, cap=10_000.0)
+    fake = _FakeMcpClient(
+        call_tool_result=McpCallResult(
+            tool="place_equity_order",
+            content={"order_id": "rh-x", "status": "accepted"},
+            is_error=False,
+        )
+    )
+    broker = RobinhoodAgenticBroker(
+        mode=ExecutionMode.LIVE,
+        mcp_client=fake,
+        token_loader=_good_tokens,
+    )
+    await broker.submit(
+        OrderRequest(
+            symbol="SPY", side="buy", qty=2, limit_price=100.0,
+            decision_id="dec-1",
+        )
+    )
+    await broker.submit(
+        OrderRequest(
+            symbol="QQQ", side="buy", qty=2, limit_price=100.0,
+            decision_id="dec-2",
+        )
+    )
+    assert len(fake.calls) == 2
+    assert fake.calls[0][1]["ref_id"] != fake.calls[1][1]["ref_id"]
 
 
 @pytest.mark.asyncio

@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from packages.execution import daily_notional
 from packages.execution.broker import (
@@ -79,6 +79,12 @@ SHADOW_TRADES_PATH = Path(
 # ``live_float_cap_usd = 1_000_000`` from blowing the user up if they
 # fat-finger the wizard. The Phase 6 auto-greenlight respects this.
 ABSOLUTE_MAX_FLOAT_USD = 10_000.0
+
+# Fixed UUIDv5 namespace for converting our deterministic idempotency
+# identity into Robinhood's required ``ref_id`` UUID format. Frozen
+# forever -- changing it would change every derived ref_id and break
+# retry-dedupe against the gateway.
+_REF_ID_NAMESPACE = uuid5(NAMESPACE_URL, "https://the-seer.local/robinhood/ref_id")
 
 # Robinhood live trading is gated by the SAME resolve_mode promotion gate
 # that guards the Alpaca/ENABLE_LIVE_TRADING path (P0-5). We resolve the
@@ -692,7 +698,7 @@ class RobinhoodAgenticBroker(Broker):
         # Deterministic idempotency key (P0-1): a retried logical order
         # produces the SAME key so Robinhood dedupes instead of
         # double-filling.
-        client_order_id = deterministic_client_order_id(
+        idempotency_key = deterministic_client_order_id(
             symbol=req.symbol,
             side=side,
             qty=req.qty,
@@ -700,6 +706,15 @@ class RobinhoodAgenticBroker(Broker):
             bar_ts=req.bar_ts,
             prefix="rh",
         )
+        # ref_id is Robinhood's CONFIRMED idempotency field (optional UUID,
+        # verified against a live authenticated session): re-send the SAME
+        # ref_id on transient retries of one logical order, a new one only
+        # for a new order. Our deterministic key is a sha256-derived
+        # ``rh-<hex>`` string, NOT a UUID, so we fold it through uuid5 over
+        # a fixed namespace -- that stays deterministic (same identity ->
+        # same UUID, distinct identity -> distinct UUID) while satisfying
+        # the UUID-format requirement.
+        ref_id = str(uuid5(_REF_ID_NAMESPACE, idempotency_key))
         try:
             result = await client.call_tool(
                 "place_equity_order",
@@ -710,12 +725,7 @@ class RobinhoodAgenticBroker(Broker):
                     "type": req.type,
                     "limit_price": req.limit_price,
                     "time_in_force": req.time_in_force,
-                    # TODO(robinhood-api): confirm the exact idempotency
-                    # field name place_equity_order accepts. ``client_order_id``
-                    # is our best guess and is the ONE place to rename if
-                    # their API uses a different key (e.g. ``idempotency_key``
-                    # / ``ref_id``).
-                    "client_order_id": client_order_id,
+                    "ref_id": ref_id,
                 },
             )
         except McpError as exc:

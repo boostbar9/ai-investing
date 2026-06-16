@@ -224,8 +224,13 @@ async def test_live_submit_includes_idempotency_key(
     )
     await broker.submit(req)
     args = fake.calls[0][1]
-    assert "client_order_id" in args
-    assert args["client_order_id"].startswith("rh-")
+    # Confirmed Robinhood idempotency field is ref_id (a UUID), not the
+    # previously-guessed client_order_id.
+    assert "client_order_id" not in args
+    assert "ref_id" in args
+    import uuid
+
+    assert str(uuid.UUID(args["ref_id"])) == args["ref_id"]
 
 
 # ---------------------------------------------------------------------------
