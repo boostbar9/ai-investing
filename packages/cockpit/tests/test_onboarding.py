@@ -226,6 +226,8 @@ def test_to_dict_contains_all_fields() -> None:
         "live_float_cap_usd",
         "accepted_disclaimer_at",
         "rh_mode",
+        "broker_backend",
+        "rh_account_number",
         "wizard_started_at",
         "wizard_completed_at",
         "display_name",

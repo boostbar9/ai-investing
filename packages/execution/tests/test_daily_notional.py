@@ -43,9 +43,18 @@ def onboarding(monkeypatch, tmp_path):
     return path
 
 
-def _write_onboarding(path, *, cap=300.0):
+def _write_onboarding(path, *, cap=300.0, account="668863863"):
     path.write_text(
-        json.dumps({"completed": True, "live_float_cap_usd": cap, "rh_mode": "live"})
+        json.dumps(
+            {
+                "completed": True,
+                "live_float_cap_usd": cap,
+                "rh_mode": "live",
+                # Stored agentic account so the live order path (which now
+                # requires a target account) resolves one.
+                "rh_account_number": account,
+            }
+        )
     )
 
 

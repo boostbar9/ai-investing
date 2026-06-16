@@ -323,12 +323,34 @@ class RobinhoodAgenticBroker(Broker):
         mode: ExecutionMode = ExecutionMode.SHADOW,
         mcp_client: RobinhoodMcpClient | None = None,
         token_loader=load_tokens,  # injectable for tests
+        account_number: str | None = None,
     ) -> None:
         self._mode = mode
         self._mcp_client_override = mcp_client
         self._token_loader = token_loader
+        # The agentic-allowed Robinhood account to target. Robinhood's MCP
+        # tools require an ``account_number`` and reject trades on the
+        # non-agentic accounts, so reads + orders must carry this. ``None``
+        # leaves the arg off (read tools degrade gracefully); the live order
+        # path refuses to submit without it (fail safe).
+        #
+        # When not passed explicitly, fall back to the onboarding-stored
+        # agentic account so a directly-constructed broker still targets the
+        # right account (the factory passes it explicitly). This read never
+        # hits the network and fails safe to ``None``.
+        if account_number:
+            self._account_number: str | None = str(account_number).strip()
+        else:
+            self._account_number = resolve_agentic_account_number()
         # Cached so we don't build a new client on every call.
         self._mcp: RobinhoodMcpClient | None = None
+
+    def _acct_args(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build a tool-args dict including ``account_number`` when set."""
+        args: dict[str, Any] = dict(extra or {})
+        if self._account_number:
+            args["account_number"] = self._account_number
+        return args
 
     # ---- helpers --------------------------------------------------------
 
@@ -454,7 +476,9 @@ class RobinhoodAgenticBroker(Broker):
         """
         try:
             client = await self._client()
-            result = await client.call_tool("get_equity_positions", {})
+            result = await client.call_tool(
+                "get_equity_positions", self._acct_args()
+            )
         except BrokerError:
             return []  # no token yet -- caller treats as empty portfolio
         except McpError as exc:
@@ -557,6 +581,12 @@ class RobinhoodAgenticBroker(Broker):
             accounts = _normalize_rows(
                 res.content, keys=("accounts", "results", "items")
             )
+            # Late-bind the agentic account number if we don't have one yet
+            # (read-only; never enables trading on its own).
+            if not self._account_number and isinstance(accounts, list):
+                picked = select_agentic_account(accounts)
+                if picked:
+                    self._account_number = picked
             if isinstance(accounts, list):
                 snap["accounts"] = [a for a in accounts if isinstance(a, dict)]
         except McpError as exc:
@@ -576,7 +606,7 @@ class RobinhoodAgenticBroker(Broker):
 
         # ---- portfolio (total equity + day change) ----------------------
         try:
-            res = await client.call_tool("portfolio", {})
+            res = await client.call_tool("portfolio", self._acct_args())
             portfolio = _normalize_obj(res.content)
             if portfolio:
                 snap["portfolio"] = portfolio
@@ -694,6 +724,16 @@ class RobinhoodAgenticBroker(Broker):
             return ack
 
         # ---- (4) live ----
+        # Fail safe: Robinhood rejects orders that don't target the
+        # agentic-allowed account, so refuse to submit a live order without
+        # a resolved account_number rather than letting it bounce at the
+        # gateway (or worse, hit a wrong account). Reads above degrade
+        # gracefully; only the order path is hard-gated.
+        if not self._account_number:
+            raise BrokerError(
+                "robinhood: no agentic account_number resolved -- connect "
+                "and select your Agentic account before live trading"
+            )
         client = await self._client()
         # Deterministic idempotency key (P0-1): a retried logical order
         # produces the SAME key so Robinhood dedupes instead of
@@ -718,15 +758,17 @@ class RobinhoodAgenticBroker(Broker):
         try:
             result = await client.call_tool(
                 "place_equity_order",
-                {
-                    "symbol": req.symbol,
-                    "side": side,
-                    "qty": req.qty,
-                    "type": req.type,
-                    "limit_price": req.limit_price,
-                    "time_in_force": req.time_in_force,
-                    "ref_id": ref_id,
-                },
+                self._acct_args(
+                    {
+                        "symbol": req.symbol,
+                        "side": side,
+                        "qty": req.qty,
+                        "type": req.type,
+                        "limit_price": req.limit_price,
+                        "time_in_force": req.time_in_force,
+                        "ref_id": ref_id,
+                    }
+                ),
             )
         except McpError as exc:
             raise BrokerError(f"robinhood submit failed: {exc}") from exc
@@ -798,7 +840,8 @@ class RobinhoodAgenticBroker(Broker):
         client = await self._client()
         try:
             result = await client.call_tool(
-                "get_equity_order", {"order_id": broker_order_id}
+                "get_equity_order",
+                self._acct_args({"order_id": broker_order_id}),
             )
         except McpError as exc:
             raise BrokerError(f"robinhood get_equity_order failed: {exc}") from exc
@@ -963,6 +1006,150 @@ def is_connected() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Agentic-account discovery + resolution
+#
+# Robinhood enforces ``agentic_allowed`` at the API level: orders placed on
+# a non-agentic account are rejected. So the broker MUST target the single
+# account flagged ``agentic_allowed=true`` (and active / not deactivated).
+# We discover it via ``get_accounts`` and persist the chosen account_number
+# in onboarding state so we don't re-discover on every call. We NEVER
+# hardcode an account number in source.
+# ---------------------------------------------------------------------------
+
+
+def _is_agentic_account(acct: dict[str, Any]) -> bool:
+    """True if an account dict is flagged agentic-allowed AND active.
+
+    Field names vary across server versions, so we accept a few aliases.
+    ``agentic_allowed`` must be truthy; if any of the deactivated/closed
+    flags are truthy the account is skipped (fail safe -- never target a
+    deactivated account)."""
+    allowed = acct.get("agentic_allowed")
+    if allowed is None:
+        allowed = acct.get("agenticAllowed")
+    if not bool(allowed):
+        return False
+    for dead_key in ("deactivated", "is_deactivated", "closed", "is_closed"):
+        if bool(acct.get(dead_key)):
+            return False
+    # If an explicit status/state is present, require it to look active.
+    status = str(acct.get("status") or acct.get("state") or "active").lower()
+    return status not in {"deactivated", "closed", "inactive", "disabled"}
+
+
+def _account_number_of(acct: dict[str, Any]) -> str:
+    """Pull the account number from an account dict (field name varies)."""
+    for key in ("account_number", "accountNumber", "account_id", "number"):
+        val = acct.get(key)
+        if val:
+            return str(val)
+    return ""
+
+
+def select_agentic_account(accounts: list[Any]) -> str | None:
+    """Pick the agentic-allowed account number from a ``get_accounts`` list.
+
+    Returns the FIRST active ``agentic_allowed=true`` account's number, or
+    ``None`` if none qualifies (fail safe -- the caller must NOT enable
+    Robinhood trading without one). Logs which account was chosen and warns
+    if multiple agentic accounts exist (we take the first active one)."""
+    agentic = [
+        a
+        for a in accounts
+        if isinstance(a, dict) and _is_agentic_account(a) and _account_number_of(a)
+    ]
+    if not agentic:
+        return None
+    if len(agentic) > 1:
+        logger.warning(
+            "robinhood: %d agentic accounts found -- using the first active one",
+            len(agentic),
+        )
+    chosen = _account_number_of(agentic[0])
+    logger.info("robinhood: selected agentic account ...%s", chosen[-4:])
+    return chosen
+
+
+async def discover_agentic_account_number(
+    broker: RobinhoodAgenticBroker | None = None,
+) -> str | None:
+    """Call ``get_accounts`` and return the agentic-allowed account number.
+
+    Read-only (safe in shadow). Returns ``None`` on any failure or when no
+    agentic account exists -- the caller treats that as "do not enable
+    Robinhood trading" (fail safe). Builds a default broker honoring the
+    user's onboarding mode when one isn't supplied."""
+    owns = broker is None
+    if broker is None:
+        broker = build_broker_from_settings()
+    try:
+        client = await broker._client()
+        res = await client.call_tool("get_accounts", {})
+        accounts = _normalize_rows(
+            res.content, keys=("accounts", "results", "items")
+        )
+        return select_agentic_account(accounts if isinstance(accounts, list) else [])
+    except (BrokerError, McpError) as exc:
+        logger.warning(
+            "robinhood: agentic-account discovery failed (%s)",
+            exc.__class__.__name__,
+        )
+        return None
+    finally:
+        if owns:
+            with contextlib.suppress(Exception):
+                await broker.aclose()
+
+
+def resolve_agentic_account_number() -> str | None:
+    """Return the stored agentic account number from onboarding, if any.
+
+    Pure read of ``OnboardingState.rh_account_number`` -- never hits the
+    network. ``None`` when unset so the broker/factory can fail safe."""
+    try:
+        from packages.cockpit.onboarding import load_onboarding
+
+        num = load_onboarding().rh_account_number.strip()
+        return num or None
+    except Exception as exc:  # pragma: no cover - belt and braces
+        logger.warning(
+            "robinhood: account-number resolve failed (%s)",
+            exc.__class__.__name__,
+        )
+        return None
+
+
+async def ensure_agentic_account_number() -> str | None:
+    """Resolve the agentic account number, discovering + persisting if unset.
+
+    1. If onboarding already stores one, return it (no network).
+    2. Otherwise discover it via ``get_accounts``; on success persist it to
+       onboarding and return it.
+    3. On any failure / no agentic account, return ``None`` (fail safe).
+    """
+    stored = resolve_agentic_account_number()
+    if stored:
+        return stored
+    discovered = await discover_agentic_account_number()
+    if discovered:
+        try:
+            from packages.cockpit.onboarding import (
+                load_onboarding,
+                save_onboarding,
+            )
+
+            state = load_onboarding()
+            state.rh_account_number = discovered
+            save_onboarding(state)
+        except Exception as exc:  # pragma: no cover - persistence best-effort
+            logger.warning(
+                "robinhood: failed to persist agentic account (%s)",
+                exc.__class__.__name__,
+            )
+    return discovered
+
+
+# ---------------------------------------------------------------------------
 # Convenience factory used by the cockpit when wiring brokers
 # ---------------------------------------------------------------------------
 
@@ -973,6 +1160,11 @@ def build_broker_from_settings() -> RobinhoodAgenticBroker:
     Reads ``OnboardingState.rh_mode`` -- 'shadow' (default) -> SHADOW,
     'live' -> LIVE. The user can never go LIVE without explicitly
     flipping that field in Settings.
+
+    Also threads the stored agentic ``account_number`` into the broker so
+    its reads + orders target the agentic-allowed account (Robinhood
+    rejects trades on non-agentic accounts). ``None`` when unset -- the
+    broker stays read-safe and the factory's live path refuses to enable.
     """
     try:
         from packages.cockpit.onboarding import load_onboarding
@@ -983,10 +1175,12 @@ def build_broker_from_settings() -> RobinhoodAgenticBroker:
             if state.rh_mode == "live"
             else ExecutionMode.SHADOW
         )
+        account_number = state.rh_account_number.strip() or None
     except Exception as exc:
         logger.warning("rh_mode resolve failed: %s -- defaulting to shadow", exc.__class__.__name__)
         mode = ExecutionMode.SHADOW
-    return RobinhoodAgenticBroker(mode=mode)
+        account_number = None
+    return RobinhoodAgenticBroker(mode=mode, account_number=account_number)
 
 
 async def robinhood_account_snapshot() -> dict[str, Any]:
@@ -1042,9 +1236,13 @@ __all__ = [
     "build_broker_from_settings",
     "complete_auth",
     "disconnect",
+    "discover_agentic_account_number",
+    "ensure_agentic_account_number",
     "is_connected",
     "load_shadow_trades",
     "pending_auth",
+    "resolve_agentic_account_number",
     "resolve_float_cap",
     "robinhood_account_snapshot",
+    "select_agentic_account",
 ]

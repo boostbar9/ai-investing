@@ -81,7 +81,7 @@ def isolated_onboarding(monkeypatch, tmp_path):
     return path
 
 
-def _write_onboarding(path, *, cap=300.0, mode="shadow"):
+def _write_onboarding(path, *, cap=300.0, mode="shadow", account="668863863"):
     path.write_text(
         json.dumps(
             {
@@ -90,6 +90,9 @@ def _write_onboarding(path, *, cap=300.0, mode="shadow"):
                 "live_float_cap_usd": cap,
                 "rh_mode": mode,
                 "accepted_disclaimer_at": "2026-05-27T00:00:00+00:00",
+                # Stored agentic account so a directly-constructed LIVE
+                # broker resolves a target (the order path requires one).
+                "rh_account_number": account,
             }
         )
     )

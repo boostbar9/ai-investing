@@ -2189,13 +2189,22 @@ def api_rh_disconnect() -> dict[str, Any]:
 @app.get("/api/onboarding/robinhood/status")
 def api_rh_status() -> dict[str, Any]:
     """Report whether a usable Robinhood token is stored, plus the cached
-    onboarding status. Read-only; never touches the network."""
+    onboarding status and the ACTIVE-broker safety posture. Read-only;
+    never touches the network.
+
+    The ``active_broker`` block surfaces which backend the autonomy loop
+    will trade through (default: alpaca_paper), whether it's shadow or
+    live, the resolved float cap, and the targeted agentic account number
+    MASKED to its last 4 digits -- so the user can confirm at a glance
+    that selecting Robinhood didn't silently enable live trading."""
     from packages.cockpit.onboarding import load_onboarding
+    from packages.execution.broker_factory import active_broker_status
     from packages.execution.robinhood import is_connected
 
     return {
         "connected": is_connected(),
         "robinhood_status": load_onboarding().robinhood_status,
+        "active_broker": active_broker_status(),
     }
 
 
@@ -2234,6 +2243,78 @@ async def api_rh_snapshot(refresh: bool = True) -> dict[str, Any]:
             "errors": [],
         }
     return snap
+
+
+@app.post("/api/onboarding/robinhood/select-account")
+async def api_rh_select_account() -> dict[str, Any]:
+    """Discover + persist the agentic-allowed Robinhood account number.
+
+    Calls ``get_accounts`` (read-only) and stores the single account
+    flagged ``agentic_allowed=true`` so the broker targets it for reads +
+    orders. Robinhood rejects trades on non-agentic accounts at the API
+    level, so this MUST succeed before Robinhood live trading is usable.
+    Returns the masked account number on success; ``ok=False`` with a
+    reason when not connected or no agentic account exists (fail safe)."""
+    from packages.execution.robinhood import (
+        ensure_agentic_account_number,
+        is_connected,
+    )
+
+    if not is_connected():
+        return {"ok": False, "reason": "not_connected"}
+    acct = await ensure_agentic_account_number()
+    if not acct:
+        return {"ok": False, "reason": "no_agentic_account"}
+    return {"ok": True, "account_masked": "••••" + acct[-4:]}
+
+
+class _BrokerBackendBody(BaseModel):
+    """Payload for selecting the active broker backend."""
+
+    backend: str
+
+
+@app.get("/api/onboarding/broker-backend")
+def api_broker_backend_get() -> dict[str, Any]:
+    """Return the selected + effective active broker backend and posture.
+
+    Read-only. ``backend`` is what the user selected; the
+    ``active_broker`` block reflects what actually resolved (which may
+    have failed safe back to alpaca_paper)."""
+    from packages.cockpit.onboarding import load_onboarding
+    from packages.execution.broker_factory import active_broker_status
+
+    return {
+        "backend": load_onboarding().broker_backend,
+        "active_broker": active_broker_status(),
+    }
+
+
+@app.post("/api/onboarding/broker-backend")
+def api_broker_backend_set(body: _BrokerBackendBody) -> dict[str, Any]:
+    """Select the active broker backend (``alpaca_paper`` | ``robinhood``).
+
+    Selecting ``robinhood`` only changes WHICH broker the loop trades
+    through -- it does NOT enable live trading (the broker still runs in
+    SHADOW unless the resolve_mode gate + ENABLE_LIVE_TRADING authorize).
+    Rejects unknown backends with 400."""
+    from packages.cockpit.onboarding import (
+        VALID_BROKER_BACKENDS,
+        load_onboarding,
+        save_onboarding,
+    )
+    from packages.execution.broker_factory import active_broker_status
+
+    backend = body.backend.strip().lower()
+    if backend not in VALID_BROKER_BACKENDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"backend must be one of {list(VALID_BROKER_BACKENDS)}",
+        )
+    state = load_onboarding()
+    state.broker_backend = backend  # type: ignore[assignment]
+    save_onboarding(state)
+    return {"ok": True, "backend": backend, "active_broker": active_broker_status()}
 
 
 # ---------------------------------------------------------------------------
@@ -3799,13 +3880,37 @@ async def _autonomy_startup() -> None:  # pragma: no cover
     # Phase 25: build the exit_rules / dip_watch tick hooks. The hooks
     # capture _last_price + a broker factory so autonomy.py never has
     # to import the broker directly (keeps it testable in isolation).
+    #
+    # The active broker is obtained through ``resolve_active_broker`` so the
+    # loop trades through whichever backend the user selected (default:
+    # Alpaca paper). Selecting Robinhood doesn't enable live -- the broker
+    # still runs in SHADOW unless the resolve_mode gate + ENABLE_LIVE_TRADING
+    # authorize it. The Alpaca-cred gate below only applies when the active
+    # backend is Alpaca paper; a Robinhood-backed loop doesn't need Alpaca
+    # keys.
+    def _loop_broker() -> Any | None:
+        """Resolve the active loop broker, gating on Alpaca creds only when
+        the effective backend is Alpaca paper. Returns ``None`` (skip the
+        tick) when the paper backend has no creds -- existing behavior."""
+        from packages.execution.broker_factory import (
+            BACKEND_ALPACA_PAPER,
+            resolve_broker_selection,
+        )
+
+        sel = resolve_broker_selection()
+        if sel.effective_backend == BACKEND_ALPACA_PAPER and not (
+            os.getenv("ALPACA_PAPER_KEY_ID") and os.getenv("ALPACA_PAPER_SECRET")
+        ):
+            return None
+        return sel.broker
+
     async def _phase25_exit_rules_tick() -> dict[str, Any]:
         from packages.cockpit.web.dip_watch import arm as dip_arm
         from packages.cockpit.web.exit_rules import run_tick as exit_run_tick
 
-        if not (os.getenv("ALPACA_PAPER_KEY_ID") and os.getenv("ALPACA_PAPER_SECRET")):
+        broker = _loop_broker()
+        if broker is None:
             return {"skipped": True, "reason": "no_broker_creds"}
-        broker = AlpacaPaperBroker()
         try:
             async def _submit_sell(symbol: str, qty: float) -> Any:
                 from packages.execution.broker import OrderRequest
@@ -3847,9 +3952,9 @@ async def _autonomy_startup() -> None:  # pragma: no cover
     async def _phase25_dip_watch_tick() -> dict[str, Any]:
         from packages.cockpit.web.dip_watch import run_tick as dip_run_tick
 
-        if not (os.getenv("ALPACA_PAPER_KEY_ID") and os.getenv("ALPACA_PAPER_SECRET")):
+        broker = _loop_broker()
+        if broker is None:
             return {"skipped": True, "reason": "no_broker_creds"}
-        broker = AlpacaPaperBroker()
         try:
             async def _submit_buy(symbol: str, qty: float) -> Any:
                 from packages.execution.broker import OrderRequest
@@ -3930,12 +4035,10 @@ async def _autonomy_startup() -> None:  # pragma: no cover
     # ET so the bot stays pure intraday. Idempotent per session.
     from packages.execution.eod_flattener import make_flatten_tick_hook
 
-    def _eod_broker_factory() -> AlpacaPaperBroker | None:
-        if not (
-            os.getenv("ALPACA_PAPER_KEY_ID") and os.getenv("ALPACA_PAPER_SECRET")
-        ):
-            return None
-        return AlpacaPaperBroker()
+    def _eod_broker_factory() -> Any | None:
+        # Same selection seam as the autonomy ticks: the EOD flattener
+        # operates on whichever backend is active (default Alpaca paper).
+        return _loop_broker()
 
     _eod_flatten_hook = make_flatten_tick_hook(_eod_broker_factory)
 
