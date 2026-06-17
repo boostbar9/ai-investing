@@ -273,6 +273,109 @@
       </div>
     </section>
 
+    <!-- ==== Brokerage & Live Trading control center (Robinhood) ==== -->
+    <div class="seer-row-head mb-3">
+      <span class="seer-row-eyebrow">Brokerage &amp; Live Trading</span>
+      <span class="seer-row-rule"></span>
+      <span class="seer-row-hint">Connect Robinhood, see what's needed to go live, and switch between practice and real money</span>
+    </div>
+
+    <section id="rh-control-center" class="grid grid-cols-1 lg:grid-cols-2 gap-3 md:gap-4 mb-4">
+
+      <!-- Connection + mode card -->
+      <div class="card p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="section-h mb-0">Robinhood connection</h2>
+          <span id="rh-conn-pill" class="pill pill-muted">checking…</span>
+        </div>
+        <p class="text-sm" style="color:var(--text-secondary)" id="rh-conn-detail">
+          Linking Robinhood lets the AI trade in your real account. Until you go LIVE, nothing real happens — it only practices.
+        </p>
+        <div id="rh-account-line" class="mono text-xs mt-2" style="color:var(--text-muted)"></div>
+
+        <div class="flex flex-wrap items-center gap-2 mt-4">
+          <button id="rh-connect-btn" class="btn btn-primary btn-sm">Connect Robinhood</button>
+          <button id="rh-disconnect-btn" class="btn btn-ghost btn-sm hidden">Disconnect</button>
+          <button id="rh-findacct-btn" class="btn btn-ghost btn-sm hidden">Find my account</button>
+        </div>
+
+        <!-- Manual-paste fallback (shown after Connect) -->
+        <div id="rh-paste-box" class="hidden mt-3 p-3 rounded" style="background:rgba(255,255,255,.03);border:1px solid var(--border)">
+          <div class="text-xs mb-2" style="color:var(--text-secondary)">
+            A new tab opened for Robinhood sign-in. If it couldn't return automatically,
+            paste the full address it landed on here:
+          </div>
+          <input id="rh-paste-input" type="text" placeholder="http://localhost:8788/callback?code=…"
+                 class="w-full text-xs mono p-2 rounded mb-2"
+                 style="background:var(--bg-page);border:1px solid var(--border);color:var(--text-primary)" />
+          <button id="rh-finish-btn" class="btn btn-success btn-sm">Finish connecting</button>
+        </div>
+
+        <!-- Live / Shadow toggle -->
+        <div class="mt-4 pt-4" style="border-top:1px solid var(--border)">
+          <div class="flex items-center justify-between mb-2">
+            <span class="stat-label" style="margin:0">Trading mode</span>
+            <span id="rh-mode-pill" class="pill pill-muted">—</span>
+          </div>
+          <div id="rh-mode-desc" class="text-xs mb-3" style="color:var(--text-secondary)"></div>
+          <div class="flex items-center gap-2">
+            <button id="rh-shadow-btn" class="btn btn-ghost btn-sm">Practice (SHADOW)</button>
+            <button id="rh-live-btn" class="btn btn-danger btn-sm" disabled>Go LIVE</button>
+          </div>
+          <div id="rh-live-blocked" class="text-xs mt-2" style="color:var(--warning)"></div>
+        </div>
+      </div>
+
+      <!-- Go-live checklist card -->
+      <div class="card p-4">
+        <h2 class="section-h mb-2">What's needed to go live</h2>
+        <div id="rh-next-step" class="text-sm mb-3 p-2 rounded"
+             style="background:rgba(0,229,196,.08);border:1px solid rgba(0,229,196,.25);color:var(--text-primary)">
+          <span class="eyebrow" style="color:var(--accent)">Next step</span>
+          <div id="rh-next-step-text" class="mt-1">Loading…</div>
+        </div>
+        <ul id="rh-checklist" class="space-y-1.5 text-sm"></ul>
+      </div>
+    </section>
+
+    <!-- Broker selector + dual pipeline -->
+    <section class="card p-4 mb-5">
+      <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h2 class="section-h mb-0">How your orders flow</h2>
+        <div class="flex items-center gap-2">
+          <span class="stat-label" style="margin:0">Active broker</span>
+          <button id="rh-pick-alpaca" class="btn btn-ghost btn-sm">Paper (Alpaca)</button>
+          <button id="rh-pick-robinhood" class="btn btn-ghost btn-sm">Robinhood</button>
+        </div>
+      </div>
+      <p class="text-xs mb-4" style="color:var(--text-secondary)">
+        <strong>Paper (Alpaca)</strong> = pretend money, zero risk — the default. <strong>Robinhood</strong> = your real account,
+        but still only practices until every check above passes and you flip to LIVE.
+      </p>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div id="pipe-alpaca" class="p-3 rounded" style="border:1px solid var(--border)">
+          <div class="flex items-center justify-between mb-2">
+            <span class="font-semibold text-sm">Paper · Alpaca</span>
+            <span id="pipe-alpaca-badge" class="pill pill-muted">inactive</span>
+          </div>
+          <div class="text-xs mono" style="color:var(--text-secondary);line-height:1.8">
+            Signal → Decision → Risk &amp; cap check → <strong>Alpaca paper</strong> → Fill
+          </div>
+          <div class="text-xs mt-2" style="color:var(--text-muted)">Pretend money. Used to prove the strategy before risking anything real.</div>
+        </div>
+        <div id="pipe-robinhood" class="p-3 rounded" style="border:1px solid var(--border)">
+          <div class="flex items-center justify-between mb-2">
+            <span class="font-semibold text-sm">Robinhood · your account</span>
+            <span id="pipe-rh-badge" class="pill pill-muted">inactive</span>
+          </div>
+          <div class="text-xs mono" style="color:var(--text-secondary);line-height:1.8">
+            Signal → Decision → Risk &amp; cap check → <strong>Robinhood</strong> → Fill
+          </div>
+          <div class="text-xs mt-2" style="color:var(--text-muted)">Real money — capped at your dollar limit, and only when LIVE is on.</div>
+        </div>
+      </div>
+    </section>
+
     <!-- ==== Agent intelligence row ==== -->
     <div class="seer-row-head mb-3">
       <span class="seer-row-eyebrow">Agent intelligence</span>
@@ -1469,6 +1572,187 @@
       } catch (e) { /* ignore */ }
     }
     Cockpit.poll(refreshAgentStatus, 10000, { name: 'index-agent-status' });
+
+    // ==== Brokerage & Live Trading control center ====
+    (function () {
+      const $ = (id) => document.getElementById(id);
+      let lastReady = false;
+
+      function setPill(el, cls, text) {
+        if (!el) return;
+        el.className = 'pill ' + cls;
+        el.textContent = text;
+      }
+
+      async function refreshControlCenter() {
+        let status, readiness;
+        try {
+          [status, readiness] = await Promise.all([
+            Cockpit.api.get('/api/onboarding/robinhood/status'),
+            Cockpit.api.get('/api/onboarding/robinhood/readiness'),
+          ]);
+        } catch (e) { return; }
+
+        const connected = !!(status && status.connected);
+        const ab = (status && status.active_broker) || {};
+        const backend = ab.effective_backend || ab.backend || 'alpaca_paper';
+        const isLive = !!ab.live;
+
+        // --- connection pill + buttons ---
+        if (connected) {
+          setPill($('rh-conn-pill'), 'pill-success', 'Connected');
+          $('rh-conn-detail').textContent =
+            'Your Robinhood account is linked. The AI can read it now and trade it once you go LIVE.';
+          $('rh-disconnect-btn').classList.remove('hidden');
+          $('rh-findacct-btn').classList.remove('hidden');
+          $('rh-connect-btn').classList.add('hidden');
+        } else {
+          setPill($('rh-conn-pill'), 'pill-muted', 'Not connected');
+          $('rh-disconnect-btn').classList.add('hidden');
+          $('rh-findacct-btn').classList.add('hidden');
+          $('rh-connect-btn').classList.remove('hidden');
+        }
+        const acct = readiness && readiness.account_masked;
+        $('rh-account-line').textContent = acct ? ('AI account ' + acct) : '';
+
+        // --- mode pill + toggle ---
+        const rhMode = (readiness && readiness.rh_mode) || 'shadow';
+        if (rhMode === 'live' && isLive) {
+          setPill($('rh-mode-pill'), 'pill-live', 'LIVE — real money');
+          $('rh-mode-desc').textContent =
+            'Real orders are armed, capped at your dollar limit. Switch back to practice anytime.';
+        } else {
+          setPill($('rh-mode-pill'), 'pill-success', 'SHADOW — practice mode');
+          $('rh-mode-desc').textContent =
+            'No real money is used. Every trade is logged as practice so you can watch the AI work safely.';
+        }
+
+        // --- go-live gating for the LIVE button ---
+        lastReady = !!(readiness && readiness.ready);
+        const liveBtn = $('rh-live-btn');
+        if (rhMode === 'live') {
+          liveBtn.classList.add('hidden');
+        } else {
+          liveBtn.classList.remove('hidden');
+          liveBtn.disabled = !lastReady;
+        }
+        $('rh-live-blocked').textContent = (!lastReady && rhMode !== 'live')
+          ? 'Locked until every check passes — see the list on the right.'
+          : '';
+
+        // --- checklist ---
+        const ul = $('rh-checklist');
+        if (ul && readiness && Array.isArray(readiness.checklist)) {
+          ul.innerHTML = '';
+          readiness.checklist.forEach((c) => {
+            const li = document.createElement('li');
+            li.className = 'flex items-start gap-2';
+            const ok = !!c.ok;
+            const mark = document.createElement('span');
+            mark.textContent = ok ? '✓' : (c.informational ? 'ℹ' : '✗');
+            mark.style.color = ok ? 'var(--success)' : (c.informational ? 'var(--info)' : 'var(--danger)');
+            mark.style.fontWeight = '700';
+            mark.style.minWidth = '14px';
+            const txt = document.createElement('div');
+            const label = document.createElement('div');
+            label.textContent = c.label;
+            label.style.color = ok ? 'var(--text-secondary)' : 'var(--text-primary)';
+            txt.appendChild(label);
+            if (!ok && !c.informational && c.todo) {
+              const todo = document.createElement('div');
+              todo.textContent = c.todo;
+              todo.className = 'text-xs';
+              todo.style.color = 'var(--text-muted)';
+              txt.appendChild(todo);
+            }
+            li.appendChild(mark); li.appendChild(txt);
+            ul.appendChild(li);
+          });
+        }
+        if (readiness && readiness.next_step) {
+          $('rh-next-step-text').textContent = readiness.ready
+            ? 'All set — you can flip to LIVE whenever you’re ready.'
+            : readiness.next_step;
+        }
+
+        // --- broker selector + dual pipeline badges ---
+        const alpacaActive = backend === 'alpaca_paper';
+        setPill($('pipe-alpaca-badge'), alpacaActive ? 'pill-success' : 'pill-muted',
+          alpacaActive ? 'ACTIVE · practice' : 'inactive');
+        $('pipe-alpaca').style.borderColor = alpacaActive ? 'var(--success)' : 'var(--border)';
+        const rhActive = backend === 'robinhood';
+        setPill($('pipe-rh-badge'), rhActive ? (isLive ? 'pill-live' : 'pill-success') : 'pill-muted',
+          rhActive ? (isLive ? 'ACTIVE · LIVE' : 'ACTIVE · practice') : 'inactive');
+        $('pipe-robinhood').style.borderColor = rhActive
+          ? (isLive ? 'var(--danger)' : 'var(--success)') : 'var(--border)';
+        $('rh-pick-alpaca').className = 'btn btn-sm ' + (alpacaActive ? 'btn-primary' : 'btn-ghost');
+        $('rh-pick-robinhood').className = 'btn btn-sm ' + (rhActive ? 'btn-primary' : 'btn-ghost');
+      }
+
+      // --- actions ---
+      $('rh-connect-btn').addEventListener('click', async () => {
+        try {
+          const r = await Cockpit.api.post('/api/onboarding/robinhood/connect', {});
+          if (!r || !r.ok) { Cockpit.toastError((r && r.error) || 'Could not start Robinhood sign-in'); return; }
+          window.open(r.authorize_url, '_blank', 'noopener');
+          $('rh-paste-box').classList.remove('hidden');
+          Cockpit.toastSuccess('Robinhood sign-in opened in a new tab');
+        } catch (e) { Cockpit.toastError('Could not start Robinhood sign-in'); }
+      });
+      $('rh-finish-btn').addEventListener('click', async () => {
+        const url = $('rh-paste-input').value.trim();
+        if (!url) { Cockpit.toastWarn('Paste the address Robinhood sent you to'); return; }
+        try {
+          await Cockpit.api.post('/api/onboarding/robinhood/finish', { redirect_url: url });
+          Cockpit.toastSuccess('Robinhood connected'); $('rh-paste-box').classList.add('hidden');
+          refreshControlCenter();
+        } catch (e) { Cockpit.toastError('Could not finish connecting — check the address'); }
+      });
+      $('rh-disconnect-btn').addEventListener('click', async () => {
+        if (!confirm('Disconnect Robinhood? The AI will stop using your real account.')) return;
+        try { await Cockpit.api.post('/api/onboarding/robinhood/disconnect', {});
+          Cockpit.toastSuccess('Robinhood disconnected'); refreshControlCenter();
+        } catch (e) { Cockpit.toastError('Disconnect failed'); }
+      });
+      $('rh-findacct-btn').addEventListener('click', async () => {
+        try {
+          const r = await Cockpit.api.post('/api/onboarding/robinhood/select-account', {});
+          if (r && r.ok) { Cockpit.toastSuccess('Found your AI account ' + r.account_masked); }
+          else { Cockpit.toastWarn('No AI account found yet — open your Agentic account in the Robinhood app first'); }
+          refreshControlCenter();
+        } catch (e) { Cockpit.toastError('Could not look up your account'); }
+      });
+      $('rh-shadow-btn').addEventListener('click', async () => {
+        try { await Cockpit.api.post('/api/onboarding/robinhood/mode', { mode: 'shadow' });
+          Cockpit.toastSuccess('Back to practice mode (no real money)'); refreshControlCenter();
+        } catch (e) { Cockpit.toastError('Could not switch to practice mode'); }
+      });
+      $('rh-live-btn').addEventListener('click', async () => {
+        if (!lastReady) { Cockpit.toastWarn('Not ready for live yet — finish the checklist first'); return; }
+        const typed = prompt(
+          'This turns ON real-money trading in your Robinhood account.\n\n' +
+          'Type GO LIVE to confirm:');
+        if (typed !== 'GO LIVE') { Cockpit.toastWarn('Cancelled — still in practice mode'); return; }
+        try {
+          await Cockpit.api.post('/api/onboarding/robinhood/mode', { mode: 'live', confirm: true });
+          Cockpit.toastSuccess('LIVE trading armed'); refreshControlCenter();
+        } catch (e) {
+          Cockpit.toastError('Server refused — not ready for live. See the checklist.');
+          refreshControlCenter();
+        }
+      });
+      async function pickBackend(backend) {
+        try { await Cockpit.api.post('/api/onboarding/broker-backend', { backend });
+          Cockpit.toastSuccess(backend === 'robinhood' ? 'Robinhood is now the active broker (still practice)' : 'Back to Alpaca paper');
+          refreshControlCenter();
+        } catch (e) { Cockpit.toastError('Could not change broker'); }
+      }
+      $('rh-pick-alpaca').addEventListener('click', () => pickBackend('alpaca_paper'));
+      $('rh-pick-robinhood').addEventListener('click', () => pickBackend('robinhood'));
+
+      refreshControlCenter();
+      Cockpit.poll(refreshControlCenter, 8000, { name: 'index-rh-control' });
+    })();
   </script>
 </body>
 </html>

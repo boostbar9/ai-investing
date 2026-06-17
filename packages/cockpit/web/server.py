@@ -2318,6 +2318,242 @@ def api_broker_backend_set(body: _BrokerBackendBody) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Robinhood go-live readiness + mode control
+#
+# ``/readiness`` is the Robinhood analogue of ``/api/promote``: an ordered,
+# plain-language checklist of every precondition that must hold before a
+# real Robinhood order can execute, each with a boolean + human label + a
+# "what to do" hint, plus an overall ``ready`` flag and the single most
+# important next action. ``/mode`` flips ``rh_mode`` -- going LIVE requires
+# an explicit confirm AND server-side re-validation of that checklist;
+# going SHADOW is always allowed (turning OFF live never needs a gate).
+# ---------------------------------------------------------------------------
+
+
+def _enable_live_flag() -> bool:
+    """True when ENABLE_LIVE_TRADING is armed in the environment."""
+    return os.getenv("ENABLE_LIVE_TRADING", "").strip().lower() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
+
+
+def _compute_robinhood_readiness() -> dict[str, Any]:
+    """Build the ordered Robinhood go-live checklist (read-only, fail-safe).
+
+    Every check is independent and never raises -- a failure to read any
+    one precondition is reported as that step being unmet, never a 500.
+    The promotion gate is the SAME §16 gate the Alpaca path uses.
+    """
+    from packages.cockpit.onboarding import load_onboarding
+    from packages.execution import robinhood as rh
+    from packages.execution.broker_factory import BACKEND_ROBINHOOD
+
+    # Read each source of truth defensively.
+    try:
+        state = load_onboarding()
+    except Exception:  # pragma: no cover - defensive
+        state = None
+    rh_mode = getattr(state, "rh_mode", "shadow") if state else "shadow"
+    backend = getattr(state, "broker_backend", "alpaca_paper") if state else "alpaca_paper"
+    cap = 0.0
+    try:
+        cap = rh.resolve_float_cap()
+    except Exception:  # pragma: no cover - defensive
+        cap = 0.0
+
+    try:
+        connected = rh.is_connected()
+    except Exception:  # pragma: no cover - defensive
+        connected = False
+
+    try:
+        account = rh.resolve_agentic_account_number()
+    except Exception:  # pragma: no cover - defensive
+        account = None
+
+    # Funded state: only observable from a cached snapshot (never force a
+    # network call here -- this endpoint must stay cheap + read-only).
+    buying_power: float | None = None
+    try:
+        snap = latest_robinhood_snapshot()
+        if isinstance(snap, dict):
+            bp = snap.get("buying_power")
+            buying_power = float(bp) if bp is not None else None
+    except Exception:  # pragma: no cover - defensive
+        buying_power = None
+
+    enable_flag = _enable_live_flag()
+
+    try:
+        promote = _compute_promote_payload()
+        gate_passed = bool(promote.get("readiness", {}).get("ready", False))
+    except Exception:  # pragma: no cover - defensive
+        gate_passed = False
+
+    checks: list[dict[str, Any]] = [
+        {
+            "id": "connected",
+            "ok": bool(connected),
+            "label": "Robinhood account connected",
+            "todo": "Click “Connect Robinhood” and sign in to link your account.",
+        },
+        {
+            "id": "account",
+            "ok": bool(account),
+            "label": "AI trading account found",
+            "todo": "Open your AI (Agentic) account in the Robinhood app, then click “Find my account.”",
+        },
+        {
+            "id": "funded",
+            "ok": (buying_power is None) or (buying_power > 0),
+            "informational": buying_power is None,
+            "label": (
+                "Your AI trading account has money to invest"
+                if buying_power is not None
+                else "Account funding (we'll check once connected)"
+            ),
+            "todo": "Add money to your AI trading account in the Robinhood app.",
+        },
+        {
+            "id": "backend",
+            "ok": backend == BACKEND_ROBINHOOD,
+            "label": "Robinhood is the active broker",
+            "todo": "Switch the active broker to Robinhood in the control center.",
+        },
+        {
+            "id": "cap",
+            "ok": cap > 0,
+            "label": "A spending cap is set",
+            "todo": "Set a dollar cap (how much real money the AI may use).",
+        },
+        {
+            "id": "enable_live",
+            "ok": enable_flag,
+            "label": "Live trading is armed",
+            "todo": "Arm live trading on the Promote page after the practice checks pass.",
+        },
+        {
+            "id": "promotion_gate",
+            "ok": gate_passed,
+            "label": "Practice results are good enough to go live",
+            "todo": "Keep running in practice mode until the readiness checks on the Promote page pass.",
+        },
+        {
+            "id": "rh_mode_live",
+            "ok": rh_mode == "live",
+            "label": "Robinhood set to LIVE",
+            "todo": "Flip the switch to LIVE (you'll be asked to confirm).",
+        },
+    ]
+
+    # ``ready`` ignores the final rh_mode flip + informational funding so it
+    # reflects "is it SAFE to flip to live now" -- the mode endpoint uses
+    # this exact predicate as its server-side gate.
+    blocking = [
+        c
+        for c in checks
+        if c["id"] != "rh_mode_live"
+        and not c.get("informational")
+        and not c["ok"]
+    ]
+    ready = len(blocking) == 0
+
+    # Next action = first unmet step in order (including the rh_mode flip
+    # once everything else is green).
+    next_step = "You're ready - flip the switch to LIVE when you want real trading."
+    for c in checks:
+        if c.get("informational"):
+            continue
+        if not c["ok"]:
+            next_step = c["todo"]
+            break
+
+    return {
+        "ready": ready,
+        "next_step": next_step,
+        "rh_mode": rh_mode,
+        "broker_backend": backend,
+        "cap_usd": cap,
+        "buying_power": buying_power,
+        "account_masked": ("••••" + account[-4:]) if account else None,
+        "checklist": checks,
+    }
+
+
+@app.get("/api/onboarding/robinhood/readiness")
+def api_rh_readiness() -> dict[str, Any]:
+    """Ordered Robinhood go-live checklist + overall ready flag + next step.
+
+    Read-only and fail-safe: never raises, never touches the network, and
+    reports each precondition as a plain-language step the operator can act
+    on. Mirrors ``/api/promote`` but for the Robinhood chain."""
+    return _compute_robinhood_readiness()
+
+
+class _RhModeBody(BaseModel):
+    """Payload for setting Robinhood shadow/live mode."""
+
+    mode: str
+    confirm: bool = False
+
+
+@app.post("/api/onboarding/robinhood/mode")
+def api_rh_mode_set(body: _RhModeBody) -> dict[str, Any]:
+    """Set ``rh_mode`` to ``shadow`` or ``live``.
+
+    SHADOW is always allowed (turning live OFF never needs a gate). Going
+    LIVE requires BOTH an explicit ``confirm=true`` AND a server-side
+    re-validation of the go-live checklist; if either fails we refuse with
+    a clear reason list and leave the mode unchanged. This is the deliberate
+    confirmation barrier -- selecting the Robinhood backend alone can never
+    flip this; only this endpoint, with confirm + readiness, can."""
+    from packages.cockpit.onboarding import (
+        VALID_RH_MODES,
+        load_onboarding,
+        save_onboarding,
+    )
+
+    mode = body.mode.strip().lower()
+    if mode not in VALID_RH_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"mode must be one of {list(VALID_RH_MODES)}",
+        )
+
+    if mode == "live":
+        if not body.confirm:
+            raise HTTPException(
+                status_code=400,
+                detail="going live requires explicit confirmation",
+            )
+        readiness = _compute_robinhood_readiness()
+        if not readiness["ready"]:
+            unmet = [
+                c["label"]
+                for c in readiness["checklist"]
+                if c["id"] != "rh_mode_live"
+                and not c.get("informational")
+                and not c["ok"]
+            ]
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "not_ready",
+                    "reasons": unmet,
+                    "next_step": readiness["next_step"],
+                },
+            )
+
+    state = load_onboarding()
+    state.rh_mode = mode  # type: ignore[assignment]
+    save_onboarding(state)
+    return {"ok": True, "rh_mode": mode}
+
+
+# ---------------------------------------------------------------------------
 # /api/research-sweep -- Phase 1D
 #
 # The dashboard 'Research Candidates' tile polls these endpoints. GET
@@ -2838,8 +3074,18 @@ async def api_trading_unified_snapshot(
         "window": None,
         "streak": None,
         "robinhood": None,
+        "active_broker": None,
         "errors": {},
     }
+
+    # Which broker backend is active right now + its shadow/live posture
+    # (read-only; never enables trading). Powers the dual-pipeline view.
+    try:
+        from packages.execution.broker_factory import active_broker_status
+
+        out["active_broker"] = active_broker_status()
+    except Exception as exc:  # pragma: no cover — defensive
+        out["errors"]["active_broker"] = f"{exc.__class__.__name__}: {exc}"
 
     # Alpaca account + positions (best-effort)
     try:
