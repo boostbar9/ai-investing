@@ -46,11 +46,24 @@ RH_MCP_URL = os.getenv("ROBINHOOD_MCP_URL", "https://agent.robinhood.com/mcp/tra
 RH_OAUTH_BASE = os.getenv("ROBINHOOD_OAUTH_BASE", "https://agent.robinhood.com")
 
 # Loopback redirect for the native-app authorization-code flow (RFC 8252).
-# The cockpit runs a one-shot local listener on this port during auth.
-RH_OAUTH_REDIRECT_PORT = int(os.getenv("ROBINHOOD_OAUTH_REDIRECT_PORT", "8788"))
+# Robinhood redirects the browser back here after the user approves; the
+# cockpit's own FastAPI web server serves the ``/callback`` route and
+# finishes the token exchange there (see packages/cockpit/web/server.py).
+# There is NO separate one-shot listener -- the redirect MUST therefore
+# point at the port the cockpit web server actually runs on (8000 by
+# default; see tools/start_cockpit.ps1). We use 127.0.0.1 (not
+# ``localhost``) to match $CockpitUrl and sidestep localhost-resolution
+# edge cases. ROBINHOOD_OAUTH_REDIRECT_PORT is kept for back-compat but
+# the cockpit port (COCKPIT_PORT) is what the callback is actually served
+# on; full URI override stays available via ROBINHOOD_OAUTH_REDIRECT_URI
+# (e.g. for the cloudflare-tunnel / phone case where loopback is unreachable).
+RH_OAUTH_REDIRECT_PORT = int(
+    os.getenv("ROBINHOOD_OAUTH_REDIRECT_PORT")
+    or os.getenv("COCKPIT_PORT", "8000")
+)
 RH_OAUTH_REDIRECT_URI = os.getenv(
     "ROBINHOOD_OAUTH_REDIRECT_URI",
-    f"http://localhost:{RH_OAUTH_REDIRECT_PORT}/callback",
+    f"http://127.0.0.1:{RH_OAUTH_REDIRECT_PORT}/callback",
 )
 
 # Scopes the agent needs. Robinhood's authorization-server metadata
