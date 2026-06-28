@@ -722,6 +722,203 @@ class RobinhoodAgenticBroker(Broker):
 
         return snap
 
+    # ---- read-only market-data tools (safe in shadow) -------------------
+    #
+    # These back the Robinhood-realistic paper simulator
+    # (``packages/execution/robinhood_paper.py``). They are STRICTLY
+    # read-only: each calls a Robinhood read tool and NEVER touches
+    # ``place_equity_order`` / ``cancel_*``. Every one fails safe -- any
+    # error or missing field returns ``None`` / a "not known" result so a
+    # caller can skip (it must never fabricate a price or treat a missing
+    # quote as a fill).
+
+    async def equity_quote(self, symbol: str) -> dict[str, Any] | None:
+        """Live bid/ask/last for ``symbol`` via the ``get_equity_quotes``
+        read tool. Returns ``{"symbol","bid","ask","last","mid"}`` (floats,
+        any of which may be ``None`` if the server omitted it) or ``None``
+        on any failure / unparseable payload. Never raises, never trades.
+
+        FAIL SAFE: a missing quote yields ``None`` so the simulator skips
+        the order rather than inventing a price.
+        """
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return None
+        try:
+            client = await self._client()
+            res = await client.call_tool(
+                "get_equity_quotes", self._acct_args({"symbols": [sym]})
+            )
+        except (BrokerError, McpError) as exc:
+            logger.warning(
+                "robinhood quote failed for %s: %s", sym, exc.__class__.__name__
+            )
+            return None
+
+        rows = _normalize_rows(
+            res.content, keys=("quotes", "results", "items", "data")
+        )
+        row: dict[str, Any] | None = None
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            rsym = str(r.get("symbol") or r.get("instrument") or "").upper()
+            if not rsym or rsym == sym:
+                row = r
+                break
+        if row is None:
+            obj = _normalize_obj(res.content)
+            row = obj or None
+        if not isinstance(row, dict):
+            return None
+
+        bid = _first_float(row, ("bid_price", "bid", "bidPrice"))
+        ask = _first_float(row, ("ask_price", "ask", "askPrice"))
+        last = _first_float(
+            row,
+            (
+                "last_trade_price",
+                "last_price",
+                "last",
+                "lastTradePrice",
+                "price",
+                "mark_price",
+            ),
+        )
+        bid_size = _first_float(row, ("bid_size", "bidSize", "bid_quantity"))
+        ask_size = _first_float(row, ("ask_size", "askSize", "ask_quantity"))
+        mid: float | None = None
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            mid = (bid + ask) / 2.0
+        if bid is None and ask is None and last is None and mid is None:
+            return None
+        return {
+            "symbol": sym,
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "mid": mid,
+            "bid_size": bid_size,
+            "ask_size": ask_size,
+        }
+
+    async def equity_tradability(self, symbol: str) -> dict[str, Any]:
+        """Tradability/fractional rules for ``symbol`` via the
+        ``get_equity_tradability`` read tool. Returns
+        ``{"tradable","fractional","known"}``.
+
+        ``known`` is ``False`` when the call fails or omits the flag -- in
+        that case the caller MUST NOT block trading on a read failure (we
+        only ever skip on an *explicit* untradable flag), but it may decline
+        fractional sizing when fractional support is unknown.
+        """
+        out = {"tradable": True, "fractional": False, "known": False}
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return out
+        try:
+            client = await self._client()
+            res = await client.call_tool(
+                "get_equity_tradability", self._acct_args({"symbols": [sym]})
+            )
+        except (BrokerError, McpError) as exc:
+            logger.warning(
+                "robinhood tradability failed for %s: %s",
+                sym,
+                exc.__class__.__name__,
+            )
+            return out
+
+        rows = _normalize_rows(
+            res.content, keys=("tradability", "results", "items", "data")
+        )
+        row: dict[str, Any] | None = None
+        for r in rows:
+            if isinstance(r, dict):
+                rsym = str(r.get("symbol") or r.get("instrument") or "").upper()
+                if not rsym or rsym == sym:
+                    row = r
+                    break
+        if row is None:
+            row = _normalize_obj(res.content) or None
+        if not isinstance(row, dict):
+            return out
+
+        tradable_raw = None
+        for key in ("tradable", "tradeable", "is_tradable", "tradability"):
+            if key in row and row[key] is not None:
+                tradable_raw = row[key]
+                break
+        if isinstance(tradable_raw, str):
+            tradable = tradable_raw.strip().lower() not in {
+                "false", "untradable", "halted", "no", "0", "inactive"
+            }
+        elif tradable_raw is not None:
+            tradable = bool(tradable_raw)
+        else:
+            tradable = True  # field absent -> don't block on a read gap
+
+        frac_raw = None
+        for key in (
+            "fractional",
+            "fractional_tradable",
+            "fractionalTradable",
+            "fractional_eligible",
+        ):
+            if key in row and row[key] is not None:
+                frac_raw = row[key]
+                break
+        fractional = bool(frac_raw) if frac_raw is not None else False
+
+        return {
+            "tradable": tradable,
+            "fractional": fractional,
+            "known": tradable_raw is not None,
+        }
+
+    async def review_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        qty: float,
+        order_type: str = "market",
+        limit_price: float | None = None,
+    ) -> dict[str, Any] | None:
+        """READ-ONLY pre-trade review via ``review_equity_order``.
+
+        This anchors the simulator's pricing/acceptance to Robinhood's own
+        response WITHOUT placing anything. It calls ``review_equity_order``
+        (a validation/preview tool) -- NEVER ``place_equity_order``. Returns
+        the server's review dict, or ``None`` on any failure. Callers
+        rate-limit this (it is opt-in) so it doesn't slow the loop.
+        """
+        sym = str(symbol or "").strip().upper()
+        if not sym or qty <= 0:
+            return None
+        args = self._acct_args(
+            {
+                "symbol": sym,
+                "side": str(side).lower(),
+                "quantity": float(qty),
+                "type": str(order_type).lower(),
+            }
+        )
+        if limit_price is not None:
+            args["limit_price"] = float(limit_price)
+        try:
+            client = await self._client()
+            res = await client.call_tool("review_equity_order", args)
+        except (BrokerError, McpError) as exc:
+            logger.warning(
+                "robinhood order-review failed for %s: %s",
+                sym,
+                exc.__class__.__name__,
+            )
+            return None
+        obj = _normalize_obj(res.content)
+        return obj or None
+
     async def aclose(self) -> None:
         """Close the cached MCP client if we own one. Safe to call
         multiple times and when no client was ever built. The injected

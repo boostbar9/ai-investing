@@ -113,6 +113,39 @@ def clamp_confidence(value: Any, default: float = DEFAULT_MIN_CONFIDENCE) -> flo
     return _clamp_float(value, 0.0, 1.0, default)
 
 
+def clamp_paper_balance(value: Any, ceiling: float) -> float | None:
+    """Clamp a paper starting-balance override into ``(0, ceiling]``.
+
+    ``None`` / empty / non-positive / unparseable -> ``None`` (meaning "use
+    my real Robinhood cash"). Keeps a fixed training balance bounded by the
+    same absolute ceiling as the budget."""
+    if value is None or value == "":
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v) or v <= 0:
+        return None
+    return min(v, ceiling)
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    """Coerce common truthy/falsey JSON + form values; fail safe to default."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in {"true", "1", "yes", "on"}:
+        return True
+    if s in {"false", "0", "no", "off"}:
+        return False
+    return default
+
+
 def normalize_preset(value: Any) -> RiskPreset:
     """Coerce to a valid preset; unknown -> 'custom'."""
     s = str(value or "").strip().lower()
@@ -139,6 +172,18 @@ class TradingControls:
     risk_preset: RiskPreset = "custom"
     pending_mode: PendingMode = "auto_when_qualified"
 
+    # --- Paper realism (Robinhood-realistic simulator) ---
+    # ``paper_start_balance_usd`` is the simulator's starting cash. ``None``
+    # means "use my real Robinhood cash" (the default); a number is a fixed
+    # training balance. ``paper_use_real_cash`` records which the user chose
+    # so an override value can be remembered without being active.
+    paper_use_real_cash: bool = True
+    paper_start_balance_usd: float | None = None
+    # Opt-in, rate-limited read-only ``review_equity_order`` grounding.
+    paper_review_grounding: bool = False
+    # Allow fills in extended hours (pre/after-market) as well as RTH.
+    paper_extended_hours: bool = False
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "total_budget_usd": self.total_budget_usd,
@@ -148,6 +193,10 @@ class TradingControls:
             "min_confidence": self.min_confidence,
             "risk_preset": self.risk_preset,
             "pending_mode": self.pending_mode,
+            "paper_use_real_cash": self.paper_use_real_cash,
+            "paper_start_balance_usd": self.paper_start_balance_usd,
+            "paper_review_grounding": self.paper_review_grounding,
+            "paper_extended_hours": self.paper_extended_hours,
         }
 
 
@@ -231,6 +280,16 @@ def _coerce(raw: dict[str, Any], budget: float) -> TradingControls:
         min_confidence=min_conf,
         risk_preset=preset,
         pending_mode=pending,
+        paper_use_real_cash=_as_bool(raw.get("paper_use_real_cash", True), True),
+        paper_start_balance_usd=clamp_paper_balance(
+            raw.get("paper_start_balance_usd"), _budget_ceiling()
+        ),
+        paper_review_grounding=_as_bool(
+            raw.get("paper_review_grounding", False), False
+        ),
+        paper_extended_hours=_as_bool(
+            raw.get("paper_extended_hours", False), False
+        ),
     )
 
 
@@ -337,6 +396,28 @@ def update_controls(
         pr = str(u["pending_mode"])
         pending = pr if pr in VALID_PENDING_MODES else current.pending_mode  # type: ignore[assignment]
 
+    # --- paper realism ---
+    paper_use_real = (
+        _as_bool(u["paper_use_real_cash"], current.paper_use_real_cash)
+        if "paper_use_real_cash" in u
+        else current.paper_use_real_cash
+    )
+    paper_balance = (
+        clamp_paper_balance(u["paper_start_balance_usd"], _budget_ceiling())
+        if "paper_start_balance_usd" in u
+        else current.paper_start_balance_usd
+    )
+    paper_review = (
+        _as_bool(u["paper_review_grounding"], current.paper_review_grounding)
+        if "paper_review_grounding" in u
+        else current.paper_review_grounding
+    )
+    paper_ext = (
+        _as_bool(u["paper_extended_hours"], current.paper_extended_hours)
+        if "paper_extended_hours" in u
+        else current.paper_extended_hours
+    )
+
     resolved = TradingControls(
         total_budget_usd=budget,
         max_per_trade_usd=per_trade,
@@ -345,6 +426,10 @@ def update_controls(
         min_confidence=min_conf,
         risk_preset=preset,
         pending_mode=pending,
+        paper_use_real_cash=paper_use_real,
+        paper_start_balance_usd=paper_balance,
+        paper_review_grounding=paper_review,
+        paper_extended_hours=paper_ext,
     )
     _save_controls_file(resolved, path)
     return resolved

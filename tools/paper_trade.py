@@ -1443,14 +1443,31 @@ async def run(
                         time_in_force="day",
                     )
                     ack = await order_broker.submit(req)
-                    submitted.append({
+                    rec = {
                         "symbol": po.symbol,
                         "side": po.side,
                         "qty": po.qty,
                         "broker_order_id": ack.broker_order_id,
                         "status": ack.status,
                         "broker": order_broker_backend,
-                    })
+                    }
+                    # Robinhood-realistic sim exposes per-fill provenance
+                    # (pricing source, modeled spread/slippage, partial) so
+                    # the learning layer/UI can show how realistic the data
+                    # is. Other brokers don't set this -> key stays absent.
+                    fill_meta = getattr(order_broker, "last_fill_meta", None)
+                    if isinstance(fill_meta, dict):
+                        for _k in (
+                            "pricing_source",
+                            "fill_price",
+                            "spread_bps",
+                            "slippage_bps",
+                            "filled_qty",
+                            "partial",
+                        ):
+                            if _k in fill_meta:
+                                rec[_k] = fill_meta[_k]
+                    submitted.append(rec)
                     log.info("submitted %s %s %.4f -> %s", po.side, po.symbol, po.qty, ack.status)
                     # Phase 35 — attach OCO bracket on successful long
                     # entries so exits run at exchange speed even if

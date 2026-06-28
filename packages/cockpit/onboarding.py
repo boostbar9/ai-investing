@@ -63,8 +63,12 @@ VALID_RH_MODES: tuple[RhMode, ...] = ("shadow", "live")
 # agentic broker -- and even then SHADOW stays the default unless the
 # resolve_mode promotion gate + ENABLE_LIVE_TRADING authorize live.
 # ---------------------------------------------------------------------------
-BrokerBackend = Literal["alpaca_paper", "robinhood"]
-VALID_BROKER_BACKENDS: tuple[BrokerBackend, ...] = ("alpaca_paper", "robinhood")
+BrokerBackend = Literal["alpaca_paper", "robinhood", "robinhood_paper"]
+VALID_BROKER_BACKENDS: tuple[BrokerBackend, ...] = (
+    "alpaca_paper",
+    "robinhood",
+    "robinhood_paper",
+)
 
 # Defensive default: $300 first-float cap per the user's stated comfort.
 # Can be raised after 14 days of positive shadow-trading PnL (Phase 6).

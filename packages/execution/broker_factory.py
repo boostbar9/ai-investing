@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 # Recognized backend identifiers. Anything else resolves to the default.
 BACKEND_ALPACA_PAPER = "alpaca_paper"
 BACKEND_ROBINHOOD = "robinhood"
+# Robinhood-realistic paper simulator: prices fills from live read-only RH
+# quotes (spread + slippage), respects buying power + caps, NEVER places a
+# real order. An *option* only -- the default backend is unchanged.
+BACKEND_ROBINHOOD_PAPER = "robinhood_paper"
 
 
 @dataclass(frozen=True)
@@ -138,6 +142,38 @@ def _build_robinhood_or_fallback() -> BrokerSelection:
     )
 
 
+def _build_robinhood_paper_or_fallback() -> BrokerSelection:
+    """Build the Robinhood-realistic paper simulator.
+
+    Unlike the live ``robinhood`` backend this does NOT require a connected
+    account: when Robinhood quotes are unavailable the simulator fails over
+    to the existing parquet data feed (read-only), so it always builds. We
+    only fall back to Alpaca paper if construction itself raises -- a belt-
+    and-braces guard that keeps the loop running. Selecting this backend
+    never enables live trading (it is read-only against Robinhood)."""
+    try:
+        from packages.execution.robinhood_paper import build_robinhood_paper_broker
+
+        broker = build_robinhood_paper_broker()
+    except Exception as exc:  # pragma: no cover - belt and braces
+        logger.warning(
+            "robinhood_paper build failed (%s) -- falling back to alpaca paper",
+            exc.__class__.__name__,
+        )
+        return BrokerSelection(
+            AlpacaPaperBroker(),
+            BACKEND_ROBINHOOD_PAPER,
+            BACKEND_ALPACA_PAPER,
+            f"robinhood_paper build failed ({exc.__class__.__name__}) -- using paper",
+        )
+    return BrokerSelection(
+        broker,
+        BACKEND_ROBINHOOD_PAPER,
+        BACKEND_ROBINHOOD_PAPER,
+        "robinhood-realistic paper sim (read-only quotes; never live)",
+    )
+
+
 def resolve_broker_selection() -> BrokerSelection:
     """Resolve the active broker plus selection metadata (for status).
 
@@ -150,6 +186,9 @@ def resolve_broker_selection() -> BrokerSelection:
 
     if backend == BACKEND_ROBINHOOD:
         return _build_robinhood_or_fallback()
+
+    if backend == BACKEND_ROBINHOOD_PAPER:
+        return _build_robinhood_paper_or_fallback()
 
     # Default / unset / unrecognized -> existing Alpaca paper behavior.
     reason = (
@@ -222,6 +261,7 @@ def active_broker_status() -> dict[str, Any]:
 __all__ = [
     "BACKEND_ALPACA_PAPER",
     "BACKEND_ROBINHOOD",
+    "BACKEND_ROBINHOOD_PAPER",
     "BrokerSelection",
     "active_broker_status",
     "resolve_active_broker",

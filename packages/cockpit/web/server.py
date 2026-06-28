@@ -2172,6 +2172,32 @@ def _trading_controls_payload() -> dict[str, Any]:
     controls = tc.load_controls()
     live = _trading_controls_live_state()
     remaining = max(0.0, controls.total_budget_usd - live["used_budget_usd"])
+
+    # Paper-realism context for the "Paper realism" UI group. The modeled
+    # spread/slippage constants + active backend let the UI explain how
+    # realistic the practice fills are. Never raises.
+    paper_realism: dict[str, Any] = {
+        "available_backends": ["alpaca_paper", "robinhood", "robinhood_paper"],
+        "active_backend": "alpaca_paper",
+        "is_realistic": False,
+        "half_spread_bps": None,
+        "slippage_bps": None,
+        "data_source": "robinhood_quotes_with_fallback",
+    }
+    try:
+        from packages.execution import robinhood_paper as rhp
+        from packages.execution.broker_factory import active_broker_status
+
+        status = active_broker_status()
+        paper_realism["active_backend"] = status.get("backend", "alpaca_paper")
+        paper_realism["is_realistic"] = (
+            status.get("effective_backend") == "robinhood_paper"
+        )
+        paper_realism["half_spread_bps"] = rhp.SYNTHETIC_HALF_SPREAD_BPS
+        paper_realism["slippage_bps"] = rhp.SLIPPAGE_BPS
+    except Exception:  # pragma: no cover - status must never break the page
+        pass
+
     return {
         **controls.to_dict(),
         "absolute_max_usd": tc._budget_ceiling(),
@@ -2180,6 +2206,7 @@ def _trading_controls_payload() -> dict[str, Any]:
         "remaining_budget_usd": round(remaining, 2),
         "open_positions": live["open_positions"],
         "trades_today": live["trades_today"],
+        "paper_realism": paper_realism,
     }
 
 
@@ -2199,6 +2226,12 @@ class _TradingControlsBody(BaseModel):
     min_confidence: float | None = None
     risk_preset: str | None = None
     pending_mode: str | None = None
+    # Paper realism. ``paper_start_balance_usd`` may be sent as ``null`` to
+    # mean "use my real Robinhood cash", so it is handled specially below.
+    paper_use_real_cash: bool | None = None
+    paper_start_balance_usd: float | None = None
+    paper_review_grounding: bool | None = None
+    paper_extended_hours: bool | None = None
 
 
 @app.post("/api/trading-controls")
@@ -2215,6 +2248,29 @@ def api_trading_controls_set(body: _TradingControlsBody) -> dict[str, Any]:
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     tc.update_controls(updates)
     return _trading_controls_payload()
+
+
+@app.get("/api/trading-controls/real-cash")
+async def api_trading_controls_real_cash() -> dict[str, Any]:
+    """Read the user's REAL Robinhood Agentic-account cash (read-only,
+    cached) so the cockpit's "use my real Robinhood cash" button can show
+    and apply it as the paper starting balance.
+
+    Read-only: never places an order, never enables live trading. Returns
+    ``{cash, buying_power, source, connected}`` with ``cash=None`` (and a
+    short ``source`` reason) when unavailable -- the UI degrades to the
+    configured/default balance."""
+    from packages.execution.robinhood_paper import fetch_real_rh_cash
+
+    try:
+        return await fetch_real_rh_cash()
+    except Exception as exc:  # pragma: no cover - endpoint must not 500
+        return {
+            "cash": None,
+            "buying_power": None,
+            "source": f"error:{exc.__class__.__name__}",
+            "connected": False,
+        }
 
 
 @app.get("/api/trading-controls/pending")

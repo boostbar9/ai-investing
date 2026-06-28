@@ -135,6 +135,67 @@
       </details>
     </section>
 
+    <!-- ============ PAPER REALISM ============ -->
+    <section class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-1">
+        <h2 class="section-h mb-0">Paper realism</h2>
+        <span id="tc-realism-badge" class="pill pill-muted" style="display:none;">prices sourced from Robinhood (live)</span>
+      </div>
+      <p class="text-sm mb-4" style="color:var(--text-secondary);">
+        This makes practice trades behave like real Robinhood trades — using
+        live Robinhood prices, your real buying power, and realistic costs — so
+        the AI learns from realistic results. It stays read-only and never
+        places a real order.
+      </p>
+
+      <div class="tc-field">
+        <label class="text-sm font-medium" for="tc-paper-backend">Practice engine</label>
+        <select id="tc-paper-backend" class="tc-input">
+          <option value="alpaca_paper">Simple paper (Alpaca, no spread)</option>
+          <option value="robinhood_paper">Robinhood-realistic paper (live prices, spread + slippage)</option>
+          <option value="robinhood">Robinhood agentic (shadow / live-gated)</option>
+        </select>
+        <div class="tc-help">Pick how practice trades are simulated. Default is unchanged unless you switch it.</div>
+      </div>
+
+      <div class="tc-field">
+        <label class="flex items-center gap-2 text-sm font-medium">
+          <input id="tc-paper-use-real" type="checkbox" />
+          Use my real Robinhood cash as the starting balance
+        </label>
+        <div class="tc-help">
+          <button type="button" id="tc-real-cash-btn" class="btn btn-ghost" style="padding:4px 10px;font-size:12px;">
+            Use my real Robinhood cash<span id="tc-real-cash-val"></span>
+          </button>
+          <span id="tc-real-cash-note" style="color:var(--text-muted);"></span>
+        </div>
+      </div>
+
+      <div class="tc-field">
+        <label class="text-sm font-medium" for="tc-paper-balance">Practice starting balance</label>
+        <input id="tc-paper-balance" class="tc-input mono" type="number" min="0" step="50" placeholder="Using real Robinhood cash" />
+        <div class="tc-help">Or set a fixed training balance (e.g. 1000). Leave blank to use your real cash.</div>
+      </div>
+
+      <div class="tc-field">
+        <label class="flex items-center gap-2 text-sm font-medium">
+          <input id="tc-paper-review" type="checkbox" />
+          Double-check fills against Robinhood's order preview
+        </label>
+        <div class="tc-help">Anchors simulated fills to Robinhood's own read-only order review (rate-limited, read-only).</div>
+      </div>
+
+      <div class="tc-field" style="margin-bottom:0;">
+        <label class="flex items-center gap-2 text-sm font-medium">
+          <input id="tc-paper-ext" type="checkbox" />
+          Allow practice fills outside regular hours
+        </label>
+        <div class="tc-help">When off, practice trades only fill 9:30am–4:00pm ET (markets closed → nothing happens).</div>
+      </div>
+
+      <div class="tc-help mt-3" id="tc-realism-assumptions" style="color:var(--text-muted);"></div>
+    </section>
+
     <div class="flex items-center gap-3 mb-6">
       <button id="tc-save" class="btn btn-primary">Save controls</button>
       <span id="tc-save-status" class="text-sm" style="color:var(--text-muted);"></span>
@@ -204,6 +265,55 @@
       });
       paintPresets(d.risk_preset);
       paintBudgetBar();
+      applyPaperRealism(d);
+    }
+
+    function applyPaperRealism(d) {
+      const useReal = d.paper_use_real_cash !== false;
+      $('tc-paper-use-real').checked = useReal;
+      $('tc-paper-review').checked = !!d.paper_review_grounding;
+      $('tc-paper-ext').checked = !!d.paper_extended_hours;
+      const bal = d.paper_start_balance_usd;
+      $('tc-paper-balance').value = (bal == null) ? '' : Math.round(Number(bal));
+      $('tc-paper-balance').disabled = useReal;
+
+      const r = d.paper_realism || {};
+      // Practice-engine selector reflects the *selected* backend.
+      if (r.active_backend) $('tc-paper-backend').value = r.active_backend;
+      // Live-prices badge only when the realistic sim is actually active.
+      $('tc-realism-badge').style.display = r.is_realistic ? '' : 'none';
+      const note = $('tc-realism-assumptions');
+      if (r.half_spread_bps != null && r.slippage_bps != null) {
+        note.textContent =
+          `Modeled costs: ~${r.half_spread_bps} bps half-spread each side + ${r.slippage_bps} bps slippage. ` +
+          `Prices come from Robinhood (live) and fall back to the data feed if a quote is missing.`;
+      } else {
+        note.textContent = '';
+      }
+    }
+
+    async function loadRealCash() {
+      const btn = $('tc-real-cash-btn');
+      const note = $('tc-real-cash-note');
+      btn.disabled = true;
+      note.textContent = ' checking…';
+      try {
+        const d = await Cockpit.api.get('/api/trading-controls/real-cash');
+        if (d.cash != null) {
+          $('tc-real-cash-val').textContent = `: ${fmtUsd(d.cash)}`;
+          note.textContent = '';
+          // Clicking applies it as a fixed balance + unchecks "use real".
+          return Number(d.cash);
+        }
+        note.textContent = d.connected
+          ? ' (cash unavailable right now)'
+          : ' (connect Robinhood first)';
+      } catch (e) {
+        note.textContent = ' (lookup failed)';
+      } finally {
+        btn.disabled = false;
+      }
+      return null;
     }
 
     async function loadControls() {
@@ -248,11 +358,19 @@
     }
 
     async function save(extra) {
+      const useReal = $('tc-paper-use-real').checked;
+      const balRaw = $('tc-paper-balance').value;
+      // Blank balance OR "use real cash" => null (server uses real RH cash).
+      const paperBalance = (useReal || balRaw === '') ? null : Number(balRaw);
       const body = Object.assign({
         total_budget_usd: Number($('tc-total-budget').value),
         max_per_trade_usd: Number($('tc-per-trade').value),
         max_trades_per_day: Number($('tc-max-trades').value),
         max_open_positions: Number($('tc-max-open').value),
+        paper_use_real_cash: useReal,
+        paper_start_balance_usd: paperBalance,
+        paper_review_grounding: $('tc-paper-review').checked,
+        paper_extended_hours: $('tc-paper-ext').checked,
       }, extra || {});
       try {
         const d = await Cockpit.api.post('/api/trading-controls', body);
@@ -281,6 +399,32 @@
         save({ min_confidence: Number(slider.value) / 100 });
       });
       $('tc-save').addEventListener('click', () => save());
+
+      // Paper realism wiring.
+      $('tc-paper-use-real').addEventListener('change', (e) => {
+        $('tc-paper-balance').disabled = e.target.checked;
+        if (e.target.checked) $('tc-paper-balance').value = '';
+      });
+      $('tc-real-cash-btn').addEventListener('click', async () => {
+        const cash = await loadRealCash();
+        if (cash != null) {
+          $('tc-paper-use-real').checked = false;
+          $('tc-paper-balance').disabled = false;
+          $('tc-paper-balance').value = Math.round(cash);
+          save();
+        }
+      });
+      // Practice-engine selector persists via the broker-backend endpoint
+      // (separate from trading-controls). Switching it never enables live.
+      $('tc-paper-backend').addEventListener('change', async (e) => {
+        try {
+          await Cockpit.api.post('/api/onboarding/broker-backend', { backend: e.target.value });
+          if (Cockpit.toastSuccess) Cockpit.toastSuccess('Practice engine updated');
+          loadControls();
+        } catch (err) {
+          if (Cockpit.toastError) Cockpit.toastError('Could not switch engine: ' + err.message);
+        }
+      });
 
       loadControls();
       loadPending();
