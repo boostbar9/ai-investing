@@ -124,6 +124,27 @@ def test_score_resilient_to_malformed_input() -> None:
     assert f2 == []
 
 
+def test_score_applies_agent_influence_weights() -> None:
+    # Same candidate; a trusted voting agent should lift the score, a
+    # quietened agent should lower it — never to zero.
+    trusted = _cand(symbol="AAA", confidence=0.5, agents_voted=["winner"])
+    probation = _cand(symbol="BBB", confidence=0.5, agents_voted=["loser"])
+    aw = {"winner": 2.0, "loser": 0.5}
+    s_trust, _, _ = autonomy._score_candidate(trusted, agent_weights=aw)
+    s_prob, _, _ = autonomy._score_candidate(probation, agent_weights=aw)
+    s_base, _, _ = autonomy._score_candidate(_cand(symbol="CCC", confidence=0.5))
+    assert s_trust > s_base > s_prob
+    assert s_prob > 0  # quietened, never silenced
+
+
+def test_score_agent_weights_failsafe_without_attribution() -> None:
+    # No agents_voted on the candidate -> multiplier is a no-op.
+    c = _cand(symbol="AAA", confidence=0.5)
+    s_with, _, _ = autonomy._score_candidate(c, agent_weights={"x": 2.0})
+    s_without, _, _ = autonomy._score_candidate(c)
+    assert s_with == s_without
+
+
 def test_pick_focus_ranks_and_caps_results() -> None:
     cands = [
         _cand(symbol="LOW", confidence=0.2),

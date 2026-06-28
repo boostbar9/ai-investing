@@ -109,6 +109,21 @@
       </div>
     </section>
 
+    <!-- ============ WHO THE AI LISTENS TO (agent influence weights) ============ -->
+    <section class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-1">
+        <h2 class="section-h">Who the AI is listening to most</h2>
+        <span id="weights-updated" class="chip">—</span>
+      </div>
+      <p class="text-xs muted mb-4">
+        As trades finish, the AI gives more say to the agents that have been
+        right and less to the ones that have been wrong. 1.0× means an equal
+        say; nobody is ever switched off.
+      </p>
+      <div id="weights-changed" class="mb-3 text-sm" style="color:var(--text-secondary); display:none;"></div>
+      <div id="weights-list" class="space-y-3"><div class="text-xs muted">Loading…</div></div>
+    </section>
+
     <!-- ============ PER-AGENT ============ -->
     <section class="card p-5 mb-4">
       <h2 class="section-h mb-3">Which agents earn their keep</h2>
@@ -256,6 +271,49 @@
       }).join("");
     }
 
+    function weightPillClass(rec) {
+      if (rec.cold_start) return "pill-info";
+      if ((rec.factor || 1) >= 1.15) return "pill-good";
+      if ((rec.factor || 1) <= 0.85) return "pill-warn";
+      return "pill-info";
+    }
+    function renderAgentWeights(aw) {
+      const host = document.getElementById("weights-list");
+      const upd = document.getElementById("weights-updated");
+      const changed = document.getElementById("weights-changed");
+      aw = aw || {};
+      upd.textContent = aw.updated ? ("updated " + new Date(aw.updated).toLocaleString()) : "not run yet";
+      const entries = Object.entries(aw.agents || {});
+      // "What just changed" note.
+      const notes = aw.changes || [];
+      if (notes.length) {
+        changed.style.display = "block";
+        changed.innerHTML = "<strong>What just changed:</strong> " + notes.map(esc).join(" ");
+      } else {
+        changed.style.display = "none";
+      }
+      if (!entries.length) {
+        host.innerHTML = `<div class="text-xs muted">Every agent has an equal say until trades start finishing.</div>`;
+        return;
+      }
+      // Sort by influence factor, highest first.
+      entries.sort((a, b) => (b[1].factor || 1) - (a[1].factor || 1));
+      host.innerHTML = entries.map(([name, rec]) => {
+        const factor = rec.factor || 1;
+        // Bar: map 0.5×–2.0× onto 0–100% so an equal say sits at one-third.
+        const pct = Math.max(0, Math.min(100, ((factor - 0.5) / 1.5) * 100));
+        const wr = rec.cold_start ? "—" : Math.round((rec.win_rate || 0) * 100) + "% right";
+        return `<div>
+          <div class="flex items-center justify-between text-xs mb-1">
+            <span style="color:var(--text-primary);font-weight:500;">${esc(name)}</span>
+            <span class="pill ${weightPillClass(rec)}">${factor.toFixed(2)}× — ${esc(rec.reason || "")}</span>
+          </div>
+          <div class="bar-track"><span class="bar-fill" style="width:${pct.toFixed(0)}%"></span></div>
+          <div class="text-xs muted mt-1">${wr} · ${rec.decided || 0} graded${rec.cold_start ? "" : (" of " + (rec.picks || 0) + " picks")}</div>
+        </div>`;
+      }).join("");
+    }
+
     function renderAgents(agents) {
       const host = document.getElementById("agent-list");
       if (!agents || !agents.length) { host.innerHTML = `<div class="text-xs muted">No graded picks yet.</div>`; return; }
@@ -289,6 +347,7 @@
       renderWorks("works-symbols", ww.symbols);
       renderWorks("works-strategies", ww.strategies);
       renderWorks("works-regimes", ww.regimes);
+      renderAgentWeights(d.agent_weights || {});
       renderAgents(d.agents || []);
     }
 

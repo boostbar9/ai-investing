@@ -264,6 +264,7 @@ def _score_candidate(
     *,
     weights: dict[str, float] | None = None,
     multipliers: dict[str, float] | None = None,
+    agent_weights: dict[str, float] | None = None,
 ) -> tuple[float, list[str], list[str]]:
     """Score a sweep candidate for "investigate-worthiness".
 
@@ -368,6 +369,28 @@ def _score_candidate(
     except (TypeError, ValueError):
         pass
 
+    # Ensemble reweighting: scale the score by the average historical
+    # influence of the agents that voted for this candidate (learned from
+    # resolved outcomes). Fail-safe — no attribution or no learned weights
+    # leaves the score untouched (multiplier 1.0), and the multiplier is
+    # bounded so a quietened agent is never fully silenced.
+    if agent_weights:
+        voted = c.get("agents_voted") or c.get("agents") or []
+        if isinstance(voted, dict):
+            voted = list(voted.keys())
+        if isinstance(voted, (list, tuple)) and voted:
+            try:
+                from packages.learning.agent_weights import (
+                    agent_influence_multiplier,
+                )
+
+                mult = agent_influence_multiplier(
+                    [str(a) for a in voted], agent_weights
+                )
+                score *= mult
+            except Exception:  # pragma: no cover — defensive
+                pass
+
     return (round(score, 4), reasons, features)
 
 
@@ -378,6 +401,7 @@ def pick_focus(
     focus_count: int = 3,
     weights: dict[str, float] | None = None,
     multipliers: dict[str, float] | None = None,
+    agent_weights: dict[str, float] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """Curiosity's decision: which symbols are worth a deep dive next?
 
@@ -427,7 +451,9 @@ def pick_focus(
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 log.debug("ranker inference failed for %s: %s", sym, exc)
-        s, r, feats = _score_candidate(c, weights=weights, multipliers=multipliers)
+        s, r, feats = _score_candidate(
+            c, weights=weights, multipliers=multipliers, agent_weights=agent_weights
+        )
         scored.append((s, sym, r, feats, c))
     # Highest score first; ties broken alphabetically for determinism.
     scored.sort(key=lambda x: (-x[0], x[1]))
@@ -752,6 +778,18 @@ async def run_one_tick(
         except Exception as exc:  # pragma: no cover — defensive
             log.warning("learning recalibration failed: %s", exc)
 
+        # Auto-reweight the ensemble's agents from resolved outcomes: shift
+        # influence toward agents that have actually been right. Network-free
+        # (reads data/learning/outcomes.jsonl), cold-start-safe (equal weights
+        # until agents clear the per-agent sample floor), bounded so nobody is
+        # ever silenced, and guarded so a hiccup can't break the tick.
+        try:
+            from packages.learning.agent_weights import reweight_from_outcomes
+
+            reweight_from_outcomes()
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("learning agent reweight failed: %s", exc)
+
     # ------------------------------------------------------------------
     # Phase 21-B: detect current market regime.
     # ------------------------------------------------------------------
@@ -786,8 +824,17 @@ async def run_one_tick(
         weights = {}
     STATE.last_bandit_weights = dict(weights)
 
+    # Pull current per-agent influence weights (learned from outcomes).
+    try:
+        from packages.learning.agent_weights import current_agent_weights
+
+        agent_weights = current_agent_weights() if cfg.self_improve_enabled else {}
+    except Exception as exc:  # pragma: no cover — defensive
+        log.warning("agent weights load failed: %s", exc)
+        agent_weights = {}
+
     # ------------------------------------------------------------------
-    # Curiosity step — now tilted by bandit + regime.
+    # Curiosity step — now tilted by bandit + regime + agent influence.
     # ------------------------------------------------------------------
     focus_syms, focus_details = pick_focus(
         result_dict.get("candidates") or [],
@@ -795,6 +842,7 @@ async def run_one_tick(
         focus_count=cfg.curiosity_focus_count,
         weights=weights or None,
         multipliers=multipliers or None,
+        agent_weights=agent_weights or None,
     )
     STATE.last_curiosity_at = STATE.last_sweep_finished_at
     STATE.last_curiosity_focus = focus_syms

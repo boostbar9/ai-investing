@@ -142,6 +142,39 @@ def test_summary_endpoint_has_close_loop_keys(client):
     assert data["what_works"] == {"symbols": [], "strategies": [], "regimes": []}
 
 
+def test_summary_includes_agent_weights_key(client, monkeypatch, tmp_path):
+    """Summary carries the new per-agent influence weights (cold-start safe)."""
+    from packages.learning import agent_weights as aw
+
+    monkeypatch.setattr(aw, "DEFAULT_AGENT_WEIGHTS_PATH", tmp_path / "aw.json")
+    c, _ = client
+    data = c.get("/api/learning/summary").json()
+    assert "agent_weights" in data
+    assert data["agent_weights"]["cold_start"] is True
+    assert data["agent_weights"]["agents"] == {}
+
+
+def test_agent_weights_endpoint_cold_start(client, monkeypatch, tmp_path):
+    from packages.learning import agent_weights as aw
+
+    monkeypatch.setattr(aw, "DEFAULT_AGENT_WEIGHTS_PATH", tmp_path / "aw.json")
+    c, _ = client
+    r = c.get("/api/learning/agent-weights")
+    assert r.status_code == 200
+    s = r.json()
+    assert s["cold_start"] is True
+    assert s["agents"] == {}
+    assert s["min_samples"] == aw.MIN_SAMPLES_PER_AGENT
+
+
+def test_learning_page_has_listening_section(client):
+    c, _ = client
+    body = c.get("/learning").text
+    assert "Who the AI is listening to most" in body
+    assert "/api/learning/agent-weights" not in body  # page uses /summary
+    assert "equal say" in body
+
+
 def test_status_endpoint_cold_start(client):
     c, _ = client
     r = c.get("/api/learning/status")

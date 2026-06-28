@@ -1318,6 +1318,20 @@ def api_learning_status() -> dict[str, Any]:
     return load_status()
 
 
+@app.get("/api/learning/agent-weights")
+def api_learning_agent_weights() -> dict[str, Any]:
+    """Who the AI is listening to most: per-agent influence weights.
+
+    Read-only view of the last auto-reweight: each agent's influence
+    factor (1.0 == an equal say), win rate, sample count, cold-start flag
+    and a plain-language reason, plus any "what changed" notes. Degrades
+    to an empty/cold-start payload before any trades have finished.
+    """
+    from packages.learning.agent_weights import load_agent_weights
+
+    return load_agent_weights()
+
+
 @app.get("/api/learning/picks")
 def api_learning_picks(
     limit: int = 200,
@@ -1375,6 +1389,13 @@ async def api_learning_backfill(req: _BackfillRequest | None = None) -> dict[str
     # Close the loop: feed the freshly-labeled outcomes back into the
     # confidence calibrator (bounded + cold-start-safe) and record status.
     cal_info = recalibrate_from_outcomes()
+    # Reweight the ensemble's agents from the same outcomes (guarded).
+    try:
+        from packages.learning.agent_weights import reweight_from_outcomes
+
+        reweight_from_outcomes()
+    except Exception:  # pragma: no cover — defensive
+        pass
     rows = load_outcomes(DEFAULT_OUTCOMES_PATH)
     status = {
         "last_run": datetime.now(UTC).isoformat(),

@@ -247,6 +247,7 @@ def build_learning_report(
     calibrator: IsotonicCalibrator | None = None,
     now: datetime | None = None,
     min_samples: int = MIN_OUTCOMES_FOR_CALIBRATION,
+    agent_weights: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble everything the Learning page needs, in one cheap pass.
 
@@ -257,6 +258,14 @@ def build_learning_report(
     """
     now = now or datetime.now(UTC)
     cal = calibrator if calibrator is not None else IsotonicCalibrator.load()
+
+    # Per-agent influence weights (auto-reweighted from outcomes each
+    # cycle). Read the persisted status by default so the page reflects
+    # the live weights, but allow injection for tests.
+    if agent_weights is None:
+        from packages.learning.agent_weights import load_agent_weights
+
+        agent_weights = load_agent_weights()
 
     summary = summary_stats(outcomes)
     pairs = outcome_pairs(outcomes)
@@ -311,6 +320,10 @@ def build_learning_report(
             "regimes": _grouped_scores(outcomes, "regime_at_pick"),
         },
         "recent_adjustments": recent_adjustments(cal),
+        # Who the AI is listening to most: per-agent influence weights,
+        # learned from resolved outcomes with cold-start / shrinkage /
+        # bounded-movement guardrails.
+        "agent_weights": dict(agent_weights),
     }
 
 
@@ -393,6 +406,17 @@ async def run_learning_cycle(
         persist=True,
     )
 
+    # Reweight the ensemble's agents from the same journal. Network-free
+    # and fully guarded so a hiccup here can never break the loop.
+    agents_reweighted = 0
+    try:
+        from packages.learning.agent_weights import reweight_from_outcomes
+
+        weight_status = reweight_from_outcomes(outcomes_path=outcomes_path)
+        agents_reweighted = weight_status.get("n_agents", 0)
+    except Exception as exc:  # pragma: no cover — defensive, loop must survive
+        log.warning("run_learning_cycle: agent reweight failed: %s", exc)
+
     rows = load_outcomes(outcomes_path)
     decided = len(outcome_pairs(rows))
     status = {
@@ -403,6 +427,7 @@ async def run_learning_cycle(
         "calibration_active": cal_info["fitted"],
         "calibrated_ece": cal_info["calibrated_ece"],
         "cold_start": cal_info["cold_start"],
+        "agents_reweighted": agents_reweighted,
     }
     try:
         write_status(status, status_path)
