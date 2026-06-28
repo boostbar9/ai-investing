@@ -114,6 +114,11 @@ KEYRING_ENC_KEY_USERNAME = "enc_key"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _TOKEN_FILE_NAME = ".rh_tokens.enc"
 _CLIENT_ID_FILE_NAME = ".rh_client_id.enc"
+# Short-lived, single-use, encrypted store for the in-flight OAuth
+# pending-auth blob (state + PKCE verifier + endpoints). Persisted so the
+# flow survives a cockpit server auto-restart between begin_auth and the
+# /callback redirect; see ``robinhood.py`` for the why + TTL.
+_PENDING_AUTH_FILE_NAME = ".rh_pending_auth.enc"
 _KEY_FILE_NAME = ".rh_key"  # last-resort key store when keyring is unusable
 
 
@@ -135,6 +140,10 @@ def _token_file() -> Path:
 
 def _client_id_file() -> Path:
     return _storage_dir() / _CLIENT_ID_FILE_NAME
+
+
+def _pending_auth_file() -> Path:
+    return _storage_dir() / _PENDING_AUTH_FILE_NAME
 
 
 def _key_file() -> Path:
@@ -325,7 +334,11 @@ def _delete_keyring(username: str) -> None:
 def _maybe_remove_key() -> None:
     """Drop the shared Fernet key once no encrypted store references it, so a
     full disconnect leaves nothing behind."""
-    if _token_file().exists() or _client_id_file().exists():
+    if (
+        _token_file().exists()
+        or _client_id_file().exists()
+        or _pending_auth_file().exists()
+    ):
         return
     _delete_keyring(KEYRING_ENC_KEY_USERNAME)
     kf = _key_file()
@@ -405,6 +418,54 @@ def clear_tokens() -> None:
     except OSError as exc:  # pragma: no cover - fs variance
         logger.debug("token file unlink no-op: %s", exc.__class__.__name__)
     _delete_keyring(KEYRING_USERNAME)
+    _maybe_remove_key()
+
+
+# ---------------------------------------------------------------------------
+# Pending-auth persistence (in-flight OAuth state, short-lived + single-use)
+# ---------------------------------------------------------------------------
+#
+# The in-flight pending-auth blob (state + PKCE verifier + endpoints) was
+# previously held ONLY in a module-level global. The cockpit launcher now
+# runs the web server under an auto-restart loop, so the process can restart
+# between begin_auth (which stores the global) and the /callback redirect
+# (which reads it) -- wiping the global and failing every callback with an
+# "OAuth state mismatch". We persist the blob encrypted on disk so it
+# survives that restart. This reuses the SAME encrypted-file store as the
+# tokens (big ciphertext in file, tiny Fernet key in keyring). It is a
+# deliberate, documented tradeoff vs. the OAuth 2.1 "keep the verifier in
+# memory only" guidance: the blob is encrypted at rest, 0600, single-use
+# (deleted on consumption), and TTL-bounded by the caller (see
+# ``robinhood.complete_auth``).
+
+
+def save_pending_auth(payload: str) -> None:
+    """Persist the in-flight OAuth pending-auth blob, encrypted on disk.
+
+    ``payload`` is an opaque JSON string built by ``robinhood.begin_auth``
+    (state, code_verifier, client_id, redirect_uri, serialized endpoints,
+    created_at). Encrypted at rest with the shared Fernet key, same as the
+    token store; never raises on a storage failure path the caller can't
+    recover from -- the caller wraps this so connect never crashes."""
+    _write_secret(_pending_auth_file(), payload)
+
+
+def load_pending_auth() -> str | None:
+    """Return the persisted pending-auth JSON string, or ``None`` if absent /
+    unreadable. NEVER raises -- a missing/corrupt file degrades to ``None`` so
+    the callback handler can report 'no auth flow' instead of crashing."""
+    return _read_secret(_pending_auth_file())
+
+
+def clear_pending_auth() -> None:
+    """Delete the persisted pending-auth file (single-use consumption + full
+    disconnect). Idempotent; drops the shared key if nothing else needs it."""
+    try:
+        _pending_auth_file().unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:  # pragma: no cover - fs variance
+        logger.debug("pending-auth file unlink no-op: %s", exc.__class__.__name__)
     _maybe_remove_key()
 
 

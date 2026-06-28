@@ -441,10 +441,106 @@ def test_complete_auth_rejects_state_mismatch(fake_kr, monkeypatch):
     assert rh.pending_auth() is not None
 
 
-def test_complete_auth_without_pending_raises(monkeypatch):
+def test_complete_auth_without_pending_raises(fake_kr, monkeypatch):
+    # No in-memory flow AND no persisted file (fake_kr points the store at a
+    # clean tmp dir) -> a clear 'click Connect first' error.
     monkeypatch.setattr(rh, "_PENDING_AUTH", None)
     with pytest.raises(BrokerError, match="no auth flow"):
         rh.complete_auth(code="c", state="s")
+
+
+def test_complete_auth_survives_server_restart_via_file(fake_kr, monkeypatch):
+    """Regression for the auto-restart bug: the cockpit server can restart
+    between Connect (begin_auth) and the /callback redirect, wiping the
+    in-memory ``_PENDING_AUTH`` global. complete_auth must fall back to the
+    encrypted pending-auth file and still finish the exchange."""
+    monkeypatch.delenv("ROBINHOOD_OAUTH_CLIENT_ID", raising=False)
+    eps = _endpoints()
+    monkeypatch.setattr(rh, "discover_endpoints", lambda: eps)
+    monkeypatch.setattr(
+        rh, "register_client", lambda endpoints, redirect_uri=None: "cid"
+    )
+
+    pending = rh.begin_auth()
+    # begin_auth must have mirrored the flow to the encrypted file.
+    assert rt._pending_auth_file().exists()
+
+    # Simulate the process restart: the in-memory global is gone.
+    monkeypatch.setattr(rh, "_PENDING_AUTH", None)
+    assert rh.pending_auth() is None
+
+    fresh = TokenSet(
+        access_token="acc", refresh_token="ref", expires_at=time.time() + 3600
+    )
+    captured: dict[str, str] = {}
+
+    def fake_exchange(endpoints, *, code, code_verifier, client_id, redirect_uri=None):
+        captured["code_verifier"] = code_verifier
+        captured["client_id"] = client_id
+        return fresh
+
+    monkeypatch.setattr(rh, "exchange_code", fake_exchange)
+
+    tokens = rh.complete_auth(code="thecode", state=pending.state)
+    assert tokens.access_token == "acc"
+    # The verifier + client_id came from the persisted file, not memory.
+    assert captured["code_verifier"] == pending.code_verifier
+    assert captured["client_id"] == "cid"
+    # Single-use consumption: file deleted, tokens + client_id persisted.
+    assert not rt._pending_auth_file().exists()
+    assert rt.load_tokens().access_token == "acc"
+    assert rt.load_client_id() == "cid"
+
+
+def test_complete_auth_expired_pending_clears_file(fake_kr, monkeypatch):
+    """A pending-auth older than the TTL is treated as expired: complete_auth
+    raises a clear 'expired' error and deletes the file (replay protection),
+    without ever calling the token exchange."""
+    monkeypatch.delenv("ROBINHOOD_OAUTH_CLIENT_ID", raising=False)
+    eps = _endpoints()
+    monkeypatch.setattr(rh, "discover_endpoints", lambda: eps)
+    monkeypatch.setattr(
+        rh, "register_client", lambda endpoints, redirect_uri=None: "cid"
+    )
+
+    pending = rh.begin_auth()
+    # Drop the in-memory flow and backdate the persisted blob beyond the TTL.
+    monkeypatch.setattr(rh, "_PENDING_AUTH", None)
+    stale = rh._deserialize_pending(rt.load_pending_auth())
+    assert stale is not None
+    stale.created_at = time.time() - rh.PENDING_AUTH_TTL_S - 5
+    rt.save_pending_auth(rh._serialize_pending(stale))
+
+    def _no_exchange(*_a, **_k):
+        pytest.fail("exchange_code must not be called on an expired flow")
+
+    monkeypatch.setattr(rh, "exchange_code", _no_exchange)
+
+    with pytest.raises(BrokerError, match="expired"):
+        rh.complete_auth(code="thecode", state=pending.state)
+    assert not rt._pending_auth_file().exists()
+
+
+def test_complete_auth_state_mismatch_against_memory_and_file(fake_kr, monkeypatch):
+    """Wrong state when neither memory nor the file matches -> the existing
+    CSRF guard fires and the pending flow is preserved (could be a stray
+    callback while the real one is still in flight)."""
+    eps = _endpoints()
+    monkeypatch.setattr(rh, "discover_endpoints", lambda: eps)
+    monkeypatch.setattr(
+        rh, "register_client", lambda endpoints, redirect_uri=None: "cid"
+    )
+    rh.begin_auth()
+
+    def _no_exchange(*_a, **_k):
+        pytest.fail("exchange_code must not be called on a state mismatch")
+
+    monkeypatch.setattr(rh, "exchange_code", _no_exchange)
+
+    with pytest.raises(BrokerError, match="state mismatch"):
+        rh.complete_auth(code="c", state="WRONG")
+    # Not consumed -- the encrypted file is preserved on a mismatch.
+    assert rt._pending_auth_file().exists()
 
 
 def test_begin_auth_wraps_discovery_failure(monkeypatch):

@@ -29,6 +29,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,16 +56,19 @@ from packages.execution.robinhood_token import (
     TokenSet,
     build_authorize_url,
     clear_client_id,
+    clear_pending_auth,
     clear_tokens,
     discover_endpoints,
     exchange_code,
     load_client_id,
+    load_pending_auth,
     load_tokens,
     new_pkce_pair,
     new_state,
     refresh_access_token,
     register_client,
     save_client_id,
+    save_pending_auth,
     save_tokens,
 )
 
@@ -868,21 +872,43 @@ class RobinhoodAgenticBroker(Broker):
 # native-app flow (RFC 8252). The cockpit:
 #   1. begin_auth()    -> discover endpoints, register client, build the
 #                         authorize URL, and stash the in-flight verifier +
-#                         state in memory (NOT on disk -- OAuth 2.1 rule).
+#                         state BOTH in memory AND in a short-lived encrypted
+#                         file (see below for why on-disk).
 #   2. user opens the URL, approves, Robinhood redirects to our loopback
 #      redirect_uri (http://localhost:PORT/callback?code=...&state=...).
-#   3. complete_auth() -> verify state, exchange code+verifier for tokens,
-#                         persist tokens + client_id to the OS keychain.
+#   3. complete_auth() -> verify state (memory first, then the encrypted
+#                         file), exchange code+verifier for tokens, persist
+#                         tokens + client_id, then DELETE the pending-auth
+#                         file (single-use consumption).
 #
-# The cockpit owns the actual HTTP listener (it already runs a web server),
-# so this module exposes the stateless pieces and an in-memory pending-auth
-# holder. There is at most one auth flow in flight at a time.
+# Why persist the pending-auth (a deliberate, documented tradeoff):
+#   The cockpit launcher (tools/start_cockpit.ps1) runs the web server under
+#   an AUTO-RESTART loop. The process can restart between begin_auth and the
+#   /callback redirect, wiping the in-memory ``_PENDING_AUTH`` global -> every
+#   callback then fails state validation ("OAuth state mismatch"). Keeping the
+#   verifier in memory only (the OAuth 2.1 / RFC 7636 ideal) is therefore not
+#   workable here. We persist the blob with the SAME encrypted-file store as
+#   the tokens (Fernet, key in keyring) and bound the exposure with: a short
+#   TTL (PENDING_AUTH_TTL_S), encryption at rest, 0600 perms, and single-use
+#   deletion on consumption. The cockpit owns the actual HTTP listener (it
+#   already runs a web server). There is at most one auth flow in flight.
+
+
+# Max age of a persisted pending-auth before it's treated as expired (and
+# its replay window closed). 10 minutes comfortably covers a human approving
+# in the browser while keeping the CSRF/replay exposure small.
+PENDING_AUTH_TTL_S = 600
 
 
 @dataclass
 class PendingAuth:
-    """In-memory state for one in-flight authorization. Never persisted --
-    the code_verifier must live in memory only (OAuth 2.1 / RFC 7636)."""
+    """State for one in-flight authorization.
+
+    Held in the module-level ``_PENDING_AUTH`` global AND mirrored to a
+    short-lived encrypted file (``data/cockpit/.rh_pending_auth.enc``) so the
+    flow survives a cockpit server auto-restart between ``begin_auth`` and the
+    ``/callback`` redirect. ``created_at`` (unix ts) stamps when the flow
+    began so ``complete_auth`` can expire a stale blob (TTL)."""
 
     state: str
     code_verifier: str
@@ -890,11 +916,86 @@ class PendingAuth:
     endpoints: OAuthEndpoints
     redirect_uri: str
     authorize_url: str
+    created_at: float = 0.0
 
 
 # Module-level holder for the single in-flight flow. Set by begin_auth,
-# consumed + cleared by complete_auth.
+# consumed + cleared by complete_auth. Mirrored to an encrypted file so a
+# server restart between begin and callback doesn't drop the flow.
 _PENDING_AUTH: PendingAuth | None = None
+
+
+def _serialize_pending(pending: PendingAuth) -> str:
+    """Serialize a ``PendingAuth`` to the JSON string we persist on disk.
+
+    ``OAuthEndpoints`` is flattened to a dict so it rehydrates cleanly; the
+    code_verifier is included because ``complete_auth`` needs it for the PKCE
+    exchange (the file is encrypted + 0600 + single-use + TTL'd)."""
+    return json.dumps(
+        {
+            "state": pending.state,
+            "code_verifier": pending.code_verifier,
+            "client_id": pending.client_id,
+            "redirect_uri": pending.redirect_uri,
+            "endpoints": pending.endpoints.to_dict(),
+            "authorize_url": pending.authorize_url,
+            "created_at": pending.created_at,
+        },
+        separators=(",", ":"),
+    )
+
+
+def _deserialize_pending(raw: str) -> PendingAuth | None:
+    """Rehydrate a ``PendingAuth`` from a persisted JSON string, or ``None`` if
+    the blob is malformed (never raises -- a corrupt file degrades to 'no
+    pending flow')."""
+    try:
+        data = json.loads(raw)
+        eps = data["endpoints"]
+        endpoints = OAuthEndpoints(
+            issuer=str(eps.get("issuer", "")),
+            authorization_endpoint=str(eps["authorization_endpoint"]),
+            token_endpoint=str(eps["token_endpoint"]),
+            registration_endpoint=str(eps.get("registration_endpoint", "")),
+        )
+        return PendingAuth(
+            state=str(data["state"]),
+            code_verifier=str(data["code_verifier"]),
+            client_id=str(data["client_id"]),
+            endpoints=endpoints,
+            redirect_uri=str(data["redirect_uri"]),
+            authorize_url=str(data.get("authorize_url", "")),
+            created_at=float(data.get("created_at", 0.0)),
+        )
+    except (KeyError, ValueError, TypeError) as exc:
+        logger.warning("pending-auth blob malformed: %s", exc.__class__.__name__)
+        return None
+
+
+def _load_pending_from_disk() -> PendingAuth | None:
+    """Best-effort load of the persisted pending-auth. Never raises."""
+    try:
+        raw = load_pending_auth()
+    except Exception as exc:  # pragma: no cover - storage fail-safe
+        logger.warning(
+            "pending-auth disk read failed (%s)", exc.__class__.__name__
+        )
+        return None
+    if not raw:
+        return None
+    return _deserialize_pending(raw)
+
+
+def _clear_pending() -> None:
+    """Clear the in-flight flow from BOTH memory and disk. Never raises."""
+    global _PENDING_AUTH
+    _PENDING_AUTH = None
+    try:
+        clear_pending_auth()
+    except Exception as exc:  # pragma: no cover - storage fail-safe
+        logger.warning(
+            "pending-auth clear failed (%s)", exc.__class__.__name__
+        )
 
 
 def begin_auth(*, redirect_uri: str | None = None) -> PendingAuth:
@@ -936,7 +1037,19 @@ def begin_auth(*, redirect_uri: str | None = None) -> PendingAuth:
         endpoints=endpoints,
         redirect_uri=redirect_uri,
         authorize_url=url,
+        created_at=time.time(),
     )
+    # Mirror to the encrypted file so the flow survives a server restart
+    # between here and the /callback redirect. Storage failure must never
+    # crash connect -- the in-memory global still works if the process
+    # doesn't restart, so we degrade quietly.
+    try:
+        save_pending_auth(_serialize_pending(_PENDING_AUTH))
+    except Exception as exc:  # pragma: no cover - storage fail-safe
+        logger.warning(
+            "pending-auth persist failed (%s) -- continuing in-memory only",
+            exc.__class__.__name__,
+        )
     return _PENDING_AUTH
 
 
@@ -945,17 +1058,39 @@ def complete_auth(*, code: str, state: str) -> TokenSet:
 
     Must be called with the ``code`` and ``state`` query params Robinhood
     sent to the loopback redirect. Raises ``BrokerError`` if there is no
-    pending flow or the state doesn't match (CSRF guard).
+    pending flow, the flow has expired (TTL), or the state doesn't match
+    (CSRF guard).
+
+    The in-memory global is consulted first. If it's empty or its state
+    doesn't match -- the common case after a cockpit server auto-restart
+    wiped the global between begin_auth and this callback -- we fall back to
+    the encrypted pending-auth file and validate against that. On success we
+    delete the file and clear the global (single-use consumption).
     """
-    global _PENDING_AUTH
     pending = _PENDING_AUTH
+    # Fall back to the persisted blob when memory is gone (restart) or its
+    # state doesn't match the callback. We re-validate state below against
+    # whichever source we end up using, so this fallback can't weaken the
+    # CSRF guard.
+    if pending is None or not state or state != pending.state:
+        from_disk = _load_pending_from_disk()
+        if from_disk is not None:
+            pending = from_disk
     if pending is None:
         raise BrokerError(
             "robinhood: no auth flow in progress -- click Connect first"
         )
+    # TTL / replay window: an old blob is expired regardless of state. Clear
+    # it (memory + file) so a stale flow can't be replayed.
+    if pending.created_at and (time.time() - pending.created_at) > PENDING_AUTH_TTL_S:
+        _clear_pending()
+        raise BrokerError(
+            "robinhood: auth flow expired -- click Connect again"
+        )
     if not state or state != pending.state:
-        # Do NOT clear the pending flow on a mismatch -- it may be a
-        # stray/replayed callback while the real one is still coming.
+        # Mismatch against BOTH memory and the file. Do NOT clear the pending
+        # flow -- it may be a stray/replayed callback while the real one is
+        # still coming.
         raise BrokerError(
             "robinhood: OAuth state mismatch -- ignoring callback (possible "
             "CSRF or stale tab)"
@@ -975,7 +1110,7 @@ def complete_auth(*, code: str, state: str) -> TokenSet:
 
     save_tokens(tokens)
     save_client_id(pending.client_id)
-    _PENDING_AUTH = None  # consume the one-shot flow
+    _clear_pending()  # consume the one-shot flow (memory + encrypted file)
     return tokens
 
 
@@ -987,11 +1122,14 @@ def pending_auth() -> PendingAuth | None:
 
 def disconnect() -> None:
     """Full Robinhood disconnect: wipe tokens + client_id + any pending
-    flow. Backs the 'Disconnect Robinhood' button."""
+    flow (in memory AND the encrypted file). Backs the 'Disconnect
+    Robinhood' button."""
     global _PENDING_AUTH
     _PENDING_AUTH = None
     clear_tokens()
     clear_client_id()
+    with contextlib.suppress(Exception):
+        clear_pending_auth()
 
 
 def is_connected() -> bool:
