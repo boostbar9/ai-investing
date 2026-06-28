@@ -497,6 +497,120 @@ def build_router() -> APIRouter:
             ),
         }
 
+    @router.get("/rh/tools")
+    def remote_rh_tools(
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Discovery helper: dump the LIVE Robinhood MCP ``tools/list``.
+
+        Read-only. Builds a broker from the user's onboarding settings
+        (which honors SHADOW default), runs the MCP ``initialize`` +
+        ``tools/list`` handshake with the OAuth token the cockpit already
+        holds, and returns the raw tool catalog (names + input schemas) so
+        we can see the server's real contract. Never places an order and
+        never logs the bearer token.
+        """
+        require_remote_auth(authorization, x_cockpit_token)
+        import asyncio
+
+        from packages.execution.robinhood import (
+            build_broker_from_settings,
+            is_connected,
+        )
+        from packages.execution.robinhood_mcp import McpError
+
+        if not is_connected():
+            return {"ok": False, "reason": "not_connected", "tools": []}
+
+        async def _run() -> list[dict[str, Any]]:
+            broker = build_broker_from_settings()
+            try:
+                client = await broker._client()
+                return await client.list_tools()
+            finally:
+                with contextlib.suppress(Exception):
+                    await broker.aclose()
+
+        try:
+            tools = asyncio.run(_run())
+        except (McpError, Exception) as e:  # noqa: BLE001 - report, never crash
+            return {"ok": False, "error": f"{e.__class__.__name__}: {e}", "tools": []}
+        # Surface name + description + required params so the contract is
+        # legible without dumping huge schemas.
+        summary = []
+        for t in tools if isinstance(tools, list) else []:
+            if not isinstance(t, dict):
+                continue
+            schema = t.get("inputSchema") or t.get("input_schema") or {}
+            required = schema.get("required") if isinstance(schema, dict) else None
+            props = schema.get("properties") if isinstance(schema, dict) else None
+            summary.append(
+                {
+                    "name": t.get("name"),
+                    "description": t.get("description"),
+                    "required": required,
+                    "properties": list(props.keys()) if isinstance(props, dict) else None,
+                }
+            )
+        return {"ok": True, "count": len(summary), "tools": summary, "raw": tools}
+
+    @router.get("/rh/probe")
+    def remote_rh_probe(
+        tool: str,
+        account_number: str = "",
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Discovery helper: call ONE read-only Robinhood MCP tool and dump
+        its raw result. Refuses any tool whose name hints at a mutating
+        action (order/trade/buy/sell/cancel) so this can never place a
+        trade. Optionally threads an ``account_number`` arg for tools that
+        require it.
+        """
+        require_remote_auth(authorization, x_cockpit_token)
+        import asyncio
+
+        from packages.execution.robinhood import (
+            build_broker_from_settings,
+            is_connected,
+        )
+        from packages.execution.robinhood_mcp import McpError
+
+        lname = (tool or "").strip().lower()
+        if not lname:
+            raise HTTPException(status_code=400, detail="tool name required")
+        BLOCKED = ("order", "trade", "buy", "sell", "cancel", "place", "submit")
+        if any(b in lname for b in BLOCKED):
+            raise HTTPException(
+                status_code=400,
+                detail=f"refusing potentially-mutating tool {tool!r} (read-only probe)",
+            )
+        if not is_connected():
+            return {"ok": False, "reason": "not_connected"}
+
+        args: dict[str, Any] = {}
+        if account_number.strip():
+            args["account_number"] = account_number.strip()
+
+        async def _run() -> Any:
+            broker = build_broker_from_settings()
+            try:
+                client = await broker._client()
+                res = await client.call_tool(tool, args)
+                return {"is_error": res.is_error, "content": res.content}
+            finally:
+                with contextlib.suppress(Exception):
+                    await broker.aclose()
+
+        try:
+            out = asyncio.run(_run())
+        except McpError as e:
+            return {"ok": False, "error": f"McpError: {e}"}
+        except Exception as e:  # noqa: BLE001 - report, never crash
+            return {"ok": False, "error": f"{e.__class__.__name__}: {e}"}
+        return {"ok": True, "tool": tool, "args": args, "result": out}
+
     @router.get("/version")
     def remote_version(
         authorization: str | None = Header(default=None),
