@@ -36,7 +36,7 @@ class TestFetchHandle:
         with mock.patch.object(subprocess, "run", return_value=_gh_ok(handle)) as run:
             out = cockpit_discover.fetch_handle("boostbar9", "ai-investing")
         assert out == handle
-        args, kwargs = run.call_args
+        args, _ = run.call_args
         cmd = args[0]
         assert cmd[:2] == ["gh", "api"]
         assert "repos/boostbar9/ai-investing/contents/data/cockpit/remote_handle.json" in cmd[2]
@@ -50,9 +50,11 @@ class TestFetchHandle:
         assert "ref=other-branch" in cmd[2]
 
     def test_raises_on_gh_failure(self) -> None:
-        with mock.patch.object(subprocess, "run", return_value=_gh_fail("nope", rc=1)):
-            with pytest.raises(RuntimeError, match="gh api failed"):
-                cockpit_discover.fetch_handle("o", "r")
+        with (
+            mock.patch.object(subprocess, "run", return_value=_gh_fail("nope", rc=1)),
+            pytest.raises(RuntimeError, match="gh api failed"),
+        ):
+            cockpit_discover.fetch_handle("o", "r")
 
     def test_raises_on_missing_content_field(self) -> None:
         bad = mock.MagicMock(
@@ -60,9 +62,11 @@ class TestFetchHandle:
             stdout=json.dumps({"name": "remote_handle.json"}),  # no 'content'
             stderr="",
         )
-        with mock.patch.object(subprocess, "run", return_value=bad):
-            with pytest.raises(RuntimeError, match="unexpected payload"):
-                cockpit_discover.fetch_handle("o", "r")
+        with (
+            mock.patch.object(subprocess, "run", return_value=bad),
+            pytest.raises(RuntimeError, match="unexpected payload"),
+        ):
+            cockpit_discover.fetch_handle("o", "r")
 
 
 class TestMainCLI:

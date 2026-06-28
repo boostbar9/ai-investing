@@ -42,11 +42,11 @@ import contextlib
 import json
 import logging
 import os
-import time
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -118,7 +118,7 @@ class FinnhubWebSocketClient:
 
         # OrderedDict gives us LRU semantics: oldest insertion is the
         # first candidate for eviction when we hit the symbol cap.
-        self._desired: "OrderedDict[str, None]" = OrderedDict()
+        self._desired: OrderedDict[str, None] = OrderedDict()
         self._subscribed: set[str] = set()
 
         self._ws: Any | None = None
@@ -260,7 +260,7 @@ class FinnhubWebSocketClient:
                     self._stop_event.wait(), timeout=backoff
                 )
                 break
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             backoff = min(backoff * 2, BACKOFF_MAX_S)
 

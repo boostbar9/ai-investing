@@ -25,27 +25,48 @@ ourselves.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
+from packages.execution import daily_notional
 from packages.execution.broker import (
     Broker,
     BrokerError,
     BrokerPosition,
     OrderAck,
     OrderRequest,
+    deterministic_client_order_id,
+    reconcile_fill_via_poll,
 )
-from packages.execution.modes import ExecutionMode
+from packages.execution.modes import ExecutionMode, resolve_mode
 from packages.execution.robinhood_mcp import (
     McpError,
     RobinhoodMcpClient,
 )
-from packages.execution.robinhood_token import TokenSet, load_tokens
+from packages.execution.robinhood_token import (
+    OAuthEndpoints,
+    TokenSet,
+    build_authorize_url,
+    clear_client_id,
+    clear_tokens,
+    discover_endpoints,
+    exchange_code,
+    load_client_id,
+    load_tokens,
+    new_pkce_pair,
+    new_state,
+    refresh_access_token,
+    register_client,
+    save_client_id,
+    save_tokens,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +79,17 @@ SHADOW_TRADES_PATH = Path(
 # ``live_float_cap_usd = 1_000_000`` from blowing the user up if they
 # fat-finger the wizard. The Phase 6 auto-greenlight respects this.
 ABSOLUTE_MAX_FLOAT_USD = 10_000.0
+
+# Fixed UUIDv5 namespace for converting our deterministic idempotency
+# identity into Robinhood's required ``ref_id`` UUID format. Frozen
+# forever -- changing it would change every derived ref_id and break
+# retry-dedupe against the gateway.
+_REF_ID_NAMESPACE = uuid5(NAMESPACE_URL, "https://the-seer.local/robinhood/ref_id")
+
+# Robinhood live trading is gated by the SAME resolve_mode promotion gate
+# that guards the Alpaca/ENABLE_LIVE_TRADING path (P0-5). We resolve the
+# mode under this strategy key so the cockpit's mode store stays coherent.
+ROBINHOOD_STRATEGY_KEY = os.getenv("ROBINHOOD_STRATEGY_KEY", "robinhood_agentic")
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +120,45 @@ def resolve_float_cap() -> float:
 
         cap = DEFAULT_FLOAT_CAP_USD
     return max(0.0, min(cap, ABSOLUTE_MAX_FLOAT_USD))
+
+
+# ---------------------------------------------------------------------------
+# Live-promotion gate bridge (P0-5)
+# ---------------------------------------------------------------------------
+
+
+def _live_promotion_passed() -> bool:
+    """Best-effort read of the live-readiness verdict.
+
+    Reuses ``packages.backtests.live_promotion.live_readiness_gate`` over
+    the cockpit's paper equity curve -- the SAME gate the Alpaca live path
+    consults. Fails safe: ANY error (missing curve, import failure, too
+    few paper days) returns ``False`` so we never accidentally greenlight
+    live trading on an exception.
+
+    Env override ``ROBINHOOD_FORCE_LIVE_GATE=true`` exists ONLY for tests
+    and explicit operator override; it cannot enable live without
+    ``ENABLE_LIVE_TRADING`` also being set (resolve_mode enforces that).
+    """
+    forced = os.getenv("ROBINHOOD_FORCE_LIVE_GATE", "").strip().lower()
+    if forced in {"true", "1", "yes", "on"}:
+        return True
+    try:
+        import pandas as pd
+
+        from packages.backtests import live_promotion as lp
+        from packages.cockpit.web.server import equity_curve_points
+
+        points = equity_curve_points(window=200)
+        series = pd.Series([float(p.get("equity", 0.0)) for p in points])
+        verdict = lp.live_readiness_gate(series)
+        return bool(verdict.ready)
+    except Exception as exc:
+        logger.warning(
+            "live-promotion read failed (%s) -- treating gate as not passed",
+            exc.__class__.__name__,
+        )
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +206,102 @@ def load_shadow_trades(path: Path | None = None) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# MCP payload normalization
+#
+# The MCP spec wraps every ``tools/call`` result in a list of content
+# blocks, e.g. ``[{"type": "text", "text": "<json string>"}]`` or a
+# structured ``{"type": "json", "json": {...}}``. Robinhood's tools
+# return their domain payload inside that envelope, and the exact shape
+# varies by tool + server version. These helpers unwrap the envelope so
+# the broker's parsing code can treat results as plain dicts / lists
+# regardless of how the server framed them.
+# ---------------------------------------------------------------------------
+
+
+def _unwrap_content(content: Any) -> Any:
+    """Best-effort unwrap of an MCP content payload to a Python object.
+
+    Handles three layouts:
+      1. Already a dict / list -> returned as-is (unless it's a list of
+         content blocks, which we drill into).
+      2. A list of content blocks ``[{"type": "text", "text": ...}, ...]``
+         -> the first block carrying a ``text`` (JSON-decoded when it
+         parses) or ``json`` field wins.
+      3. A JSON string -> decoded.
+    Returns the original value when nothing better can be extracted.
+    """
+    if content is None:
+        return None
+    if isinstance(content, str):
+        try:
+            return json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            return content
+    if isinstance(content, dict):
+        # A single content block masquerading as the whole payload.
+        if "json" in content and isinstance(content.get("json"), (dict, list)):
+            return content["json"]
+        if "text" in content and isinstance(content.get("text"), str):
+            return _unwrap_content(content["text"])
+        return content
+    if isinstance(content, list):
+        # MCP content-block list: prefer json blocks, then text blocks.
+        for block in content:
+            if isinstance(block, dict) and isinstance(
+                block.get("json"), (dict, list)
+            ):
+                return block["json"]
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                unwrapped = _unwrap_content(block["text"])
+                if isinstance(unwrapped, (dict, list)):
+                    return unwrapped
+        # Otherwise it may already be a list of domain rows.
+        return content
+    return content
+
+
+def _normalize_rows(content: Any, *, keys: tuple[str, ...]) -> list[Any]:
+    """Normalize an MCP payload to a list of rows.
+
+    Unwraps content blocks, then if the result is a dict, pulls the
+    first matching ``keys`` entry that holds a list. Returns ``[]`` when
+    no list can be found.
+    """
+    obj = _unwrap_content(content)
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        for key in keys:
+            val = obj.get(key)
+            if isinstance(val, list):
+                return val
+    return []
+
+
+def _normalize_obj(content: Any) -> dict[str, Any]:
+    """Normalize an MCP payload to a single dict (``{}`` when not a dict)."""
+    obj = _unwrap_content(content)
+    if isinstance(obj, dict):
+        return obj
+    # Some tools return a single-element list wrapping the object.
+    if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+        return obj[0]
+    return {}
+
+
+def _first_float(obj: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    """Return the first key in ``keys`` that parses to a float, else None."""
+    for key in keys:
+        if key in obj and obj[key] is not None:
+            try:
+                return float(obj[key])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Broker
 # ---------------------------------------------------------------------------
 
@@ -156,19 +323,81 @@ class RobinhoodAgenticBroker(Broker):
         mode: ExecutionMode = ExecutionMode.SHADOW,
         mcp_client: RobinhoodMcpClient | None = None,
         token_loader=load_tokens,  # injectable for tests
+        account_number: str | None = None,
     ) -> None:
         self._mode = mode
         self._mcp_client_override = mcp_client
         self._token_loader = token_loader
+        # The agentic-allowed Robinhood account to target. Robinhood's MCP
+        # tools require an ``account_number`` and reject trades on the
+        # non-agentic accounts, so reads + orders must carry this. ``None``
+        # leaves the arg off (read tools degrade gracefully); the live order
+        # path refuses to submit without it (fail safe).
+        #
+        # When not passed explicitly, fall back to the onboarding-stored
+        # agentic account so a directly-constructed broker still targets the
+        # right account (the factory passes it explicitly). This read never
+        # hits the network and fails safe to ``None``.
+        if account_number:
+            self._account_number: str | None = str(account_number).strip()
+        else:
+            self._account_number = resolve_agentic_account_number()
         # Cached so we don't build a new client on every call.
         self._mcp: RobinhoodMcpClient | None = None
+
+    def _acct_args(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build a tool-args dict including ``account_number`` when set."""
+        args: dict[str, Any] = dict(extra or {})
+        if self._account_number:
+            args["account_number"] = self._account_number
+        return args
 
     # ---- helpers --------------------------------------------------------
 
     def _is_shadow(self) -> bool:
         # PAPER is treated as SHADOW for Robinhood -- there is no
         # 'paper Robinhood'. Anything that isn't explicit LIVE is logged.
-        return self._mode is not ExecutionMode.LIVE
+        # An explicit-LIVE request is ALSO treated as shadow unless the
+        # resolve_mode promotion gate clears it (P0-5): the float cap is a
+        # blast-radius limiter, not a readiness gate.
+        if self._mode is not ExecutionMode.LIVE:
+            return True
+        return not self._live_gate_clears()
+
+    def _live_gate_clears(self) -> bool:
+        """Route the Robinhood live path through the SAME promotion gate
+        that guards the Alpaca/ENABLE_LIVE_TRADING path.
+
+        Robinhood live requires BOTH ``ENABLE_LIVE_TRADING=true`` AND a
+        passed live-promotion gate. We fail safe: any error resolving the
+        gate downgrades to shadow. We never auto-upgrade shadow->live --
+        only an explicit ``ExecutionMode.LIVE`` request reaches here.
+        """
+        try:
+            # Pin the strategy mode to LIVE for this resolution so
+            # resolve_mode evaluates the gates (it reads get_mode, which
+            # defaults to PAPER otherwise). We mirror the operator's
+            # explicit LIVE intent here.
+            from packages.execution import modes as modes_mod
+
+            modes_mod.set_mode(ROBINHOOD_STRATEGY_KEY, ExecutionMode.LIVE)
+            decision = resolve_mode(
+                ROBINHOOD_STRATEGY_KEY,
+                live_gate_passed=_live_promotion_passed(),
+            )
+            if decision.effective is not ExecutionMode.LIVE:
+                logger.warning(
+                    "robinhood live gate downgraded to %s: %s",
+                    decision.effective.value,
+                    decision.reason,
+                )
+            return decision.effective is ExecutionMode.LIVE
+        except Exception as exc:  # pragma: no cover - fail safe
+            logger.warning(
+                "robinhood live gate resolution failed (%s) -- staying shadow",
+                exc.__class__.__name__,
+            )
+            return False
 
     def _require_token(self) -> TokenSet:
         tokens = self._token_loader()
@@ -178,11 +407,41 @@ class RobinhoodAgenticBroker(Broker):
                 "from Settings to connect your account"
             )
         if tokens.is_stale():
-            raise BrokerError(
-                "robinhood: access token is stale -- refresh from "
-                "Settings (Phase 2 will add automatic refresh)"
-            )
+            tokens = self._refresh_or_die(tokens)
         return tokens
+
+    def _refresh_or_die(self, tokens: TokenSet) -> TokenSet:
+        """Refresh a stale access token using the stored refresh token.
+
+        On success the rotated token set is persisted and returned. On
+        any failure we raise ``BrokerError`` with a 'reconnect' hint --
+        the user must re-run the browser flow (refresh tokens can be
+        revoked or expire too).
+        """
+        if not tokens.refresh_token:
+            raise BrokerError(
+                "robinhood: access token expired and no refresh token "
+                "available -- reconnect your account from Settings"
+            )
+        client_id = load_client_id()
+        if not client_id:
+            raise BrokerError(
+                "robinhood: missing client_id for refresh -- reconnect "
+                "your account from Settings"
+            )
+        try:
+            fresh = refresh_access_token(
+                tokens.refresh_token, client_id=client_id
+            )
+        except Exception as exc:
+            raise BrokerError(
+                f"robinhood: token refresh failed ({exc.__class__.__name__}) "
+                "-- reconnect your account from Settings"
+            ) from exc
+        save_tokens(fresh)
+        # Reset the cached MCP client so the next call uses the new token.
+        self._mcp = None
+        return fresh
 
     async def _client(self) -> RobinhoodMcpClient:
         if self._mcp_client_override is not None:
@@ -209,10 +468,17 @@ class RobinhoodAgenticBroker(Broker):
 
     async def positions(self) -> list[BrokerPosition]:
         """Read positions from Robinhood. Safe in shadow mode because
-        this is read-only -- no orders submitted, no cap concern."""
+        this is read-only -- no orders submitted, no cap concern.
+
+        Uses the real Robinhood MCP tool name ``get_equity_positions``
+        (the agentic-trading server exposes ``get_equity_positions``,
+        not the legacy ``list_positions`` guess).
+        """
         try:
             client = await self._client()
-            result = await client.call_tool("list_positions", {})
+            result = await client.call_tool(
+                "get_equity_positions", self._acct_args()
+            )
         except BrokerError:
             return []  # no token yet -- caller treats as empty portfolio
         except McpError as exc:
@@ -220,10 +486,11 @@ class RobinhoodAgenticBroker(Broker):
             return []
 
         # The server is the source of truth on payload shape. We accept
-        # a flexible structure and skip rows we can't parse.
-        items = result.content or []
-        if isinstance(items, dict):  # some MCP servers wrap in {"items": ...}
-            items = items.get("positions") or items.get("items") or []
+        # a flexible structure and skip rows we can't parse. MCP wraps
+        # tool results in content blocks, so normalize first.
+        items = _normalize_rows(
+            result.content, keys=("positions", "equity_positions", "items", "results")
+        )
         out: list[BrokerPosition] = []
         for row in items if isinstance(items, list) else []:
             if not isinstance(row, dict):
@@ -250,6 +517,134 @@ class RobinhoodAgenticBroker(Broker):
                 continue
         return out
 
+    async def account_snapshot(self) -> dict[str, Any]:
+        """Read a live, read-only snapshot of the connected Robinhood
+        account so the AI has real account context (buying power,
+        cash, total equity, and current positions) when reasoning
+        about the market.
+
+        This is ALWAYS read-only and therefore safe in shadow mode --
+        it never submits, reviews, or cancels an order. It calls the
+        real Robinhood agentic-trading read tools:
+
+          * ``get_accounts``  -> account list (cash / buying power)
+          * ``portfolio``     -> portfolio equity + day change
+          * ``get_equity_positions`` (via :meth:`positions`)
+
+        Returns a plain dict (never raises) shaped for the cockpit +
+        agent context. On any failure the relevant section is left
+        empty / ``None`` and ``connected`` reflects whether we have a
+        usable token, so the UI can degrade gracefully:
+
+            {
+              "connected": bool,
+              "mode": "shadow" | "live",
+              "as_of": ISO-8601 str,
+              "accounts": [ {...}, ... ],
+              "portfolio": {...} | None,
+              "positions": [ {position dict}, ... ],
+              "buying_power": float | None,
+              "cash": float | None,
+              "total_equity": float | None,
+              "errors": [ str, ... ],
+            }
+        """
+        snap: dict[str, Any] = {
+            "connected": is_connected(),
+            "mode": "shadow" if self._is_shadow() else "live",
+            "as_of": datetime.now(UTC).isoformat(timespec="seconds"),
+            "accounts": [],
+            "portfolio": None,
+            "positions": [],
+            "buying_power": None,
+            "cash": None,
+            "total_equity": None,
+            "errors": [],
+        }
+        if not snap["connected"]:
+            return snap
+
+        try:
+            client = await self._client()
+        except BrokerError as exc:
+            # No usable token / refresh failed -- report, don't raise.
+            snap["connected"] = False
+            snap["errors"].append(f"client: {exc}")
+            return snap
+        except McpError as exc:  # pragma: no cover -- defensive
+            snap["errors"].append(f"client: {exc}")
+            return snap
+
+        # ---- accounts (cash + buying power) -----------------------------
+        try:
+            res = await client.call_tool("get_accounts", {})
+            accounts = _normalize_rows(
+                res.content, keys=("accounts", "results", "items")
+            )
+            # Late-bind the agentic account number if we don't have one yet
+            # (read-only; never enables trading on its own).
+            if not self._account_number and isinstance(accounts, list):
+                picked = select_agentic_account(accounts)
+                if picked:
+                    self._account_number = picked
+            if isinstance(accounts, list):
+                snap["accounts"] = [a for a in accounts if isinstance(a, dict)]
+        except McpError as exc:
+            snap["errors"].append(f"get_accounts: {exc}")
+
+        # Derive top-line cash / buying power from the first account that
+        # exposes them (field names vary across server versions).
+        for acct in snap["accounts"]:
+            if snap["buying_power"] is None:
+                snap["buying_power"] = _first_float(
+                    acct, ("buying_power", "buyingPower", "buying_power_usd")
+                )
+            if snap["cash"] is None:
+                snap["cash"] = _first_float(
+                    acct, ("cash", "cash_balance", "cashBalance", "uncleared_deposits")
+                )
+
+        # ---- portfolio (total equity + day change) ----------------------
+        try:
+            res = await client.call_tool("portfolio", self._acct_args())
+            portfolio = _normalize_obj(res.content)
+            if portfolio:
+                snap["portfolio"] = portfolio
+                snap["total_equity"] = _first_float(
+                    portfolio,
+                    (
+                        "equity",
+                        "total_equity",
+                        "market_value",
+                        "extended_hours_equity",
+                        "portfolio_value",
+                    ),
+                )
+                if snap["buying_power"] is None:
+                    snap["buying_power"] = _first_float(
+                        portfolio, ("buying_power", "buyingPower")
+                    )
+        except McpError as exc:
+            snap["errors"].append(f"portfolio: {exc}")
+
+        # ---- positions (reuse the parsed BrokerPosition path) -----------
+        try:
+            snap["positions"] = [p.to_dict() for p in await self.positions()]
+        except Exception as exc:  # pragma: no cover -- positions() is defensive
+            snap["errors"].append(f"positions: {exc}")
+
+        return snap
+
+    async def aclose(self) -> None:
+        """Close the cached MCP client if we own one. Safe to call
+        multiple times and when no client was ever built. The injected
+        override client is left alone -- its owner is responsible for it.
+        """
+        if self._mcp is not None:
+            with contextlib.suppress(Exception):
+                await self._mcp.aclose()
+            self._mcp = None
+
     async def submit(self, req: OrderRequest) -> OrderAck:
         """Submit an order, gated by mode + float cap.
 
@@ -270,23 +665,37 @@ class RobinhoodAgenticBroker(Broker):
         if side not in {"buy", "sell"}:
             raise BrokerError(f"robinhood: bad side {req.side!r}")
 
+        is_shadow = self._is_shadow()
+
         # ---- (2) float cap ----
         cap = resolve_float_cap()
         # Sell orders generate cash; the cap is a *deployment* ceiling so
         # we only enforce on buys. (Sells of held shares can't increase
         # net exposure; refusing them would lock the user out of risk
         # reduction.)
+        notional = self._estimate_notional(req) if side == "buy" else 0.0
         if side == "buy":
-            notional = self._estimate_notional(req)
             if notional > cap:
                 raise BrokerError(
                     f"robinhood: notional ${notional:.2f} exceeds float "
                     f"cap ${cap:.2f} -- raise the cap in Settings after "
                     f"14 days of positive shadow PnL"
                 )
+            # Cumulative daily-notional gate (P0-4). Shadow buys are
+            # recorded but NEVER blocked; only a *live* buy is rejected
+            # when today's aggregate would breach the cap.
+            if not is_shadow:
+                exceeds, projected = daily_notional.would_exceed_cap(notional, cap)
+                if exceeds:
+                    raise BrokerError(
+                        f"robinhood: today's deployed buy notional "
+                        f"${projected:.2f} (incl. this ${notional:.2f} order) "
+                        f"exceeds daily float cap ${cap:.2f} -- the cap is a "
+                        f"per-day aggregate, not per-order"
+                    )
 
         # ---- (3) shadow ----
-        if self._is_shadow():
+        if is_shadow:
             ack = OrderAck(
                 broker=self.name,
                 broker_order_id=f"shadow-{uuid4()}",
@@ -305,26 +714,61 @@ class RobinhoodAgenticBroker(Broker):
                     "limit_price": req.limit_price,
                     "time_in_force": req.time_in_force,
                     "mode": "shadow",
-                    "notional_estimate": self._estimate_notional(req)
-                    if side == "buy"
-                    else None,
+                    "notional_estimate": notional if side == "buy" else None,
                 }
             )
+            if side == "buy":
+                daily_notional.record_buy(
+                    symbol=req.symbol, notional=notional, mode="shadow"
+                )
             return ack
 
         # ---- (4) live ----
+        # Fail safe: Robinhood rejects orders that don't target the
+        # agentic-allowed account, so refuse to submit a live order without
+        # a resolved account_number rather than letting it bounce at the
+        # gateway (or worse, hit a wrong account). Reads above degrade
+        # gracefully; only the order path is hard-gated.
+        if not self._account_number:
+            raise BrokerError(
+                "robinhood: no agentic account_number resolved -- connect "
+                "and select your Agentic account before live trading"
+            )
         client = await self._client()
+        # Deterministic idempotency key (P0-1): a retried logical order
+        # produces the SAME key so Robinhood dedupes instead of
+        # double-filling.
+        idempotency_key = deterministic_client_order_id(
+            symbol=req.symbol,
+            side=side,
+            qty=req.qty,
+            decision_id=req.decision_id,
+            bar_ts=req.bar_ts,
+            prefix="rh",
+        )
+        # ref_id is Robinhood's CONFIRMED idempotency field (optional UUID,
+        # verified against a live authenticated session): re-send the SAME
+        # ref_id on transient retries of one logical order, a new one only
+        # for a new order. Our deterministic key is a sha256-derived
+        # ``rh-<hex>`` string, NOT a UUID, so we fold it through uuid5 over
+        # a fixed namespace -- that stays deterministic (same identity ->
+        # same UUID, distinct identity -> distinct UUID) while satisfying
+        # the UUID-format requirement.
+        ref_id = str(uuid5(_REF_ID_NAMESPACE, idempotency_key))
         try:
             result = await client.call_tool(
-                "submit_order",
-                {
-                    "symbol": req.symbol,
-                    "side": side,
-                    "qty": req.qty,
-                    "type": req.type,
-                    "limit_price": req.limit_price,
-                    "time_in_force": req.time_in_force,
-                },
+                "place_equity_order",
+                self._acct_args(
+                    {
+                        "symbol": req.symbol,
+                        "side": side,
+                        "qty": req.qty,
+                        "type": req.type,
+                        "limit_price": req.limit_price,
+                        "time_in_force": req.time_in_force,
+                        "ref_id": ref_id,
+                    }
+                ),
             )
         except McpError as exc:
             raise BrokerError(f"robinhood submit failed: {exc}") from exc
@@ -334,8 +778,8 @@ class RobinhoodAgenticBroker(Broker):
                 f"robinhood rejected order: {result.content!r}"
             )
 
-        content = result.content if isinstance(result.content, dict) else {}
-        return OrderAck(
+        content = _normalize_obj(result.content)
+        ack = OrderAck(
             broker=self.name,
             broker_order_id=str(content.get("order_id") or content.get("id") or ""),
             status=str(content.get("status") or "accepted"),
@@ -344,6 +788,64 @@ class RobinhoodAgenticBroker(Broker):
                 or datetime.now(UTC).isoformat(timespec="seconds")
             ),
         )
+        if side == "buy":
+            daily_notional.record_buy(
+                symbol=req.symbol, notional=notional, mode="live"
+            )
+        return ack
+
+    # ---- fill reconciliation (P0-3) -------------------------------------
+
+    async def reconcile_fill(
+        self,
+        broker_order_id: str,
+        intended_qty: float,
+        *,
+        max_polls: int = 5,
+        delay_s: float = 1.0,
+    ) -> dict[str, Any]:
+        """Poll Robinhood for an order's fill status and surface mismatches.
+
+        Reads ``get_equity_order`` a BOUNDED number of times until the
+        order reaches a terminal state or we exhaust ``max_polls``. Returns
+        a structured result describing filled vs intended qty. NEVER places
+        an order -- read-only by construction. Logs a structured warning on
+        any shortfall so a partial fill can't silently pass.
+
+        Safe in shadow mode: returns a synthetic 'matched' result without
+        touching the network (shadow fills are assumed complete).
+        """
+        if self._is_shadow():
+            return {
+                "broker_order_id": broker_order_id,
+                "intended_qty": float(intended_qty),
+                "filled_qty": float(intended_qty),
+                "status": "shadow",
+                "matched": True,
+                "polls": 0,
+            }
+        recon = await reconcile_fill_via_poll(
+            poll=lambda: self._poll_equity_order(broker_order_id),
+            broker_order_id=broker_order_id,
+            intended_qty=intended_qty,
+            max_polls=max_polls,
+            delay_s=delay_s,
+        )
+        return recon.to_dict()
+
+    async def _poll_equity_order(self, broker_order_id: str) -> dict[str, Any]:
+        """Fetch one order snapshot via the ``get_equity_order`` MCP tool.
+        Returns a dict with at least ``filled_qty`` and ``status`` keys
+        (best-effort -- shapes vary; missing fields default safely)."""
+        client = await self._client()
+        try:
+            result = await client.call_tool(
+                "get_equity_order",
+                self._acct_args({"order_id": broker_order_id}),
+            )
+        except McpError as exc:
+            raise BrokerError(f"robinhood get_equity_order failed: {exc}") from exc
+        return _normalize_obj(result.content)
 
     # ---- internal --------------------------------------------------------
 
@@ -359,6 +861,295 @@ class RobinhoodAgenticBroker(Broker):
 
 
 # ---------------------------------------------------------------------------
+# OAuth browser flow (loopback, PKCE) -- the "Connect your agent" path
+# ---------------------------------------------------------------------------
+#
+# Robinhood's MCP server uses the OAuth 2.1 authorization-code-with-PKCE
+# native-app flow (RFC 8252). The cockpit:
+#   1. begin_auth()    -> discover endpoints, register client, build the
+#                         authorize URL, and stash the in-flight verifier +
+#                         state in memory (NOT on disk -- OAuth 2.1 rule).
+#   2. user opens the URL, approves, Robinhood redirects to our loopback
+#      redirect_uri (http://localhost:PORT/callback?code=...&state=...).
+#   3. complete_auth() -> verify state, exchange code+verifier for tokens,
+#                         persist tokens + client_id to the OS keychain.
+#
+# The cockpit owns the actual HTTP listener (it already runs a web server),
+# so this module exposes the stateless pieces and an in-memory pending-auth
+# holder. There is at most one auth flow in flight at a time.
+
+
+@dataclass
+class PendingAuth:
+    """In-memory state for one in-flight authorization. Never persisted --
+    the code_verifier must live in memory only (OAuth 2.1 / RFC 7636)."""
+
+    state: str
+    code_verifier: str
+    client_id: str
+    endpoints: OAuthEndpoints
+    redirect_uri: str
+    authorize_url: str
+
+
+# Module-level holder for the single in-flight flow. Set by begin_auth,
+# consumed + cleared by complete_auth.
+_PENDING_AUTH: PendingAuth | None = None
+
+
+def begin_auth(*, redirect_uri: str | None = None) -> PendingAuth:
+    """Start the OAuth flow: discover, register, build authorize URL.
+
+    Returns a ``PendingAuth`` whose ``authorize_url`` the caller surfaces
+    to the user (open in browser). Stores the pending state in memory so
+    ``complete_auth`` can finish the exchange. Raises ``BrokerError`` on
+    any discovery/registration failure so the cockpit can show a clear
+    message instead of a dead 'Connect' button.
+    """
+    global _PENDING_AUTH
+    from packages.execution.robinhood_token import RH_OAUTH_REDIRECT_URI
+
+    redirect_uri = redirect_uri or RH_OAUTH_REDIRECT_URI
+    try:
+        endpoints = discover_endpoints()
+        client_id = load_client_id() or register_client(
+            endpoints, redirect_uri=redirect_uri
+        )
+        verifier, challenge = new_pkce_pair()
+        state = new_state()
+        url = build_authorize_url(
+            endpoints,
+            client_id=client_id,
+            code_challenge=challenge,
+            state=state,
+            redirect_uri=redirect_uri,
+        )
+    except Exception as exc:
+        raise BrokerError(
+            f"robinhood: could not start auth flow ({exc.__class__.__name__}: {exc})"
+        ) from exc
+
+    _PENDING_AUTH = PendingAuth(
+        state=state,
+        code_verifier=verifier,
+        client_id=client_id,
+        endpoints=endpoints,
+        redirect_uri=redirect_uri,
+        authorize_url=url,
+    )
+    return _PENDING_AUTH
+
+
+def complete_auth(*, code: str, state: str) -> TokenSet:
+    """Finish the flow: verify state, exchange code, persist tokens.
+
+    Must be called with the ``code`` and ``state`` query params Robinhood
+    sent to the loopback redirect. Raises ``BrokerError`` if there is no
+    pending flow or the state doesn't match (CSRF guard).
+    """
+    global _PENDING_AUTH
+    pending = _PENDING_AUTH
+    if pending is None:
+        raise BrokerError(
+            "robinhood: no auth flow in progress -- click Connect first"
+        )
+    if not state or state != pending.state:
+        # Do NOT clear the pending flow on a mismatch -- it may be a
+        # stray/replayed callback while the real one is still coming.
+        raise BrokerError(
+            "robinhood: OAuth state mismatch -- ignoring callback (possible "
+            "CSRF or stale tab)"
+        )
+    try:
+        tokens = exchange_code(
+            pending.endpoints,
+            code=code,
+            code_verifier=pending.code_verifier,
+            client_id=pending.client_id,
+            redirect_uri=pending.redirect_uri,
+        )
+    except Exception as exc:
+        raise BrokerError(
+            f"robinhood: code exchange failed ({exc.__class__.__name__}: {exc})"
+        ) from exc
+
+    save_tokens(tokens)
+    save_client_id(pending.client_id)
+    _PENDING_AUTH = None  # consume the one-shot flow
+    return tokens
+
+
+def pending_auth() -> PendingAuth | None:
+    """Expose the current in-flight auth (cockpit uses this to re-show the
+    authorize URL if the user closed the tab)."""
+    return _PENDING_AUTH
+
+
+def disconnect() -> None:
+    """Full Robinhood disconnect: wipe tokens + client_id + any pending
+    flow. Backs the 'Disconnect Robinhood' button."""
+    global _PENDING_AUTH
+    _PENDING_AUTH = None
+    clear_tokens()
+    clear_client_id()
+
+
+def is_connected() -> bool:
+    """True if a (possibly stale-but-refreshable) token set is stored.
+    Stale-with-refresh still counts as connected -- the broker will
+    refresh on first use."""
+    tokens = load_tokens()
+    if tokens is None:
+        return False
+    # Stale-with-refresh still counts as connected; stale-without does not.
+    return not (tokens.is_stale() and not tokens.refresh_token)
+
+
+# ---------------------------------------------------------------------------
+# Agentic-account discovery + resolution
+#
+# Robinhood enforces ``agentic_allowed`` at the API level: orders placed on
+# a non-agentic account are rejected. So the broker MUST target the single
+# account flagged ``agentic_allowed=true`` (and active / not deactivated).
+# We discover it via ``get_accounts`` and persist the chosen account_number
+# in onboarding state so we don't re-discover on every call. We NEVER
+# hardcode an account number in source.
+# ---------------------------------------------------------------------------
+
+
+def _is_agentic_account(acct: dict[str, Any]) -> bool:
+    """True if an account dict is flagged agentic-allowed AND active.
+
+    Field names vary across server versions, so we accept a few aliases.
+    ``agentic_allowed`` must be truthy; if any of the deactivated/closed
+    flags are truthy the account is skipped (fail safe -- never target a
+    deactivated account)."""
+    allowed = acct.get("agentic_allowed")
+    if allowed is None:
+        allowed = acct.get("agenticAllowed")
+    if not bool(allowed):
+        return False
+    for dead_key in ("deactivated", "is_deactivated", "closed", "is_closed"):
+        if bool(acct.get(dead_key)):
+            return False
+    # If an explicit status/state is present, require it to look active.
+    status = str(acct.get("status") or acct.get("state") or "active").lower()
+    return status not in {"deactivated", "closed", "inactive", "disabled"}
+
+
+def _account_number_of(acct: dict[str, Any]) -> str:
+    """Pull the account number from an account dict (field name varies)."""
+    for key in ("account_number", "accountNumber", "account_id", "number"):
+        val = acct.get(key)
+        if val:
+            return str(val)
+    return ""
+
+
+def select_agentic_account(accounts: list[Any]) -> str | None:
+    """Pick the agentic-allowed account number from a ``get_accounts`` list.
+
+    Returns the FIRST active ``agentic_allowed=true`` account's number, or
+    ``None`` if none qualifies (fail safe -- the caller must NOT enable
+    Robinhood trading without one). Logs which account was chosen and warns
+    if multiple agentic accounts exist (we take the first active one)."""
+    agentic = [
+        a
+        for a in accounts
+        if isinstance(a, dict) and _is_agentic_account(a) and _account_number_of(a)
+    ]
+    if not agentic:
+        return None
+    if len(agentic) > 1:
+        logger.warning(
+            "robinhood: %d agentic accounts found -- using the first active one",
+            len(agentic),
+        )
+    chosen = _account_number_of(agentic[0])
+    logger.info("robinhood: selected agentic account ...%s", chosen[-4:])
+    return chosen
+
+
+async def discover_agentic_account_number(
+    broker: RobinhoodAgenticBroker | None = None,
+) -> str | None:
+    """Call ``get_accounts`` and return the agentic-allowed account number.
+
+    Read-only (safe in shadow). Returns ``None`` on any failure or when no
+    agentic account exists -- the caller treats that as "do not enable
+    Robinhood trading" (fail safe). Builds a default broker honoring the
+    user's onboarding mode when one isn't supplied."""
+    owns = broker is None
+    if broker is None:
+        broker = build_broker_from_settings()
+    try:
+        client = await broker._client()
+        res = await client.call_tool("get_accounts", {})
+        accounts = _normalize_rows(
+            res.content, keys=("accounts", "results", "items")
+        )
+        return select_agentic_account(accounts if isinstance(accounts, list) else [])
+    except (BrokerError, McpError) as exc:
+        logger.warning(
+            "robinhood: agentic-account discovery failed (%s)",
+            exc.__class__.__name__,
+        )
+        return None
+    finally:
+        if owns:
+            with contextlib.suppress(Exception):
+                await broker.aclose()
+
+
+def resolve_agentic_account_number() -> str | None:
+    """Return the stored agentic account number from onboarding, if any.
+
+    Pure read of ``OnboardingState.rh_account_number`` -- never hits the
+    network. ``None`` when unset so the broker/factory can fail safe."""
+    try:
+        from packages.cockpit.onboarding import load_onboarding
+
+        num = load_onboarding().rh_account_number.strip()
+        return num or None
+    except Exception as exc:  # pragma: no cover - belt and braces
+        logger.warning(
+            "robinhood: account-number resolve failed (%s)",
+            exc.__class__.__name__,
+        )
+        return None
+
+
+async def ensure_agentic_account_number() -> str | None:
+    """Resolve the agentic account number, discovering + persisting if unset.
+
+    1. If onboarding already stores one, return it (no network).
+    2. Otherwise discover it via ``get_accounts``; on success persist it to
+       onboarding and return it.
+    3. On any failure / no agentic account, return ``None`` (fail safe).
+    """
+    stored = resolve_agentic_account_number()
+    if stored:
+        return stored
+    discovered = await discover_agentic_account_number()
+    if discovered:
+        try:
+            from packages.cockpit.onboarding import (
+                load_onboarding,
+                save_onboarding,
+            )
+
+            state = load_onboarding()
+            state.rh_account_number = discovered
+            save_onboarding(state)
+        except Exception as exc:  # pragma: no cover - persistence best-effort
+            logger.warning(
+                "robinhood: failed to persist agentic account (%s)",
+                exc.__class__.__name__,
+            )
+    return discovered
+
+
+# ---------------------------------------------------------------------------
 # Convenience factory used by the cockpit when wiring brokers
 # ---------------------------------------------------------------------------
 
@@ -369,6 +1160,11 @@ def build_broker_from_settings() -> RobinhoodAgenticBroker:
     Reads ``OnboardingState.rh_mode`` -- 'shadow' (default) -> SHADOW,
     'live' -> LIVE. The user can never go LIVE without explicitly
     flipping that field in Settings.
+
+    Also threads the stored agentic ``account_number`` into the broker so
+    its reads + orders target the agentic-allowed account (Robinhood
+    rejects trades on non-agentic accounts). ``None`` when unset -- the
+    broker stays read-safe and the factory's live path refuses to enable.
     """
     try:
         from packages.cockpit.onboarding import load_onboarding
@@ -379,18 +1175,74 @@ def build_broker_from_settings() -> RobinhoodAgenticBroker:
             if state.rh_mode == "live"
             else ExecutionMode.SHADOW
         )
+        account_number = state.rh_account_number.strip() or None
     except Exception as exc:
         logger.warning("rh_mode resolve failed: %s -- defaulting to shadow", exc.__class__.__name__)
         mode = ExecutionMode.SHADOW
-    return RobinhoodAgenticBroker(mode=mode)
+        account_number = None
+    return RobinhoodAgenticBroker(mode=mode, account_number=account_number)
+
+
+async def robinhood_account_snapshot() -> dict[str, Any]:
+    """Convenience wrapper used by the cockpit + agent context.
+
+    Builds a broker honoring the user's onboarding mode and returns a
+    read-only :meth:`RobinhoodAgenticBroker.account_snapshot`. Always
+    closes the MCP client afterwards and never raises -- on any failure
+    it returns a snapshot with ``connected=False`` and an ``errors``
+    entry so callers (UI / agent) can degrade gracefully.
+    """
+    if not is_connected():
+        return {
+            "connected": False,
+            "mode": "shadow",
+            "as_of": datetime.now(UTC).isoformat(timespec="seconds"),
+            "accounts": [],
+            "portfolio": None,
+            "positions": [],
+            "buying_power": None,
+            "cash": None,
+            "total_equity": None,
+            "errors": [],
+        }
+    broker = build_broker_from_settings()
+    try:
+        return await broker.account_snapshot()
+    except Exception as exc:  # pragma: no cover -- account_snapshot is defensive
+        return {
+            "connected": is_connected(),
+            "mode": "shadow" if broker._is_shadow() else "live",
+            "as_of": datetime.now(UTC).isoformat(timespec="seconds"),
+            "accounts": [],
+            "portfolio": None,
+            "positions": [],
+            "buying_power": None,
+            "cash": None,
+            "total_equity": None,
+            "errors": [f"snapshot: {exc}"],
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            await broker.aclose()
 
 
 # Re-export the audit-log writer for tests / debugging tools.
 __all__ = [
     "ABSOLUTE_MAX_FLOAT_USD",
     "SHADOW_TRADES_PATH",
+    "PendingAuth",
     "RobinhoodAgenticBroker",
+    "begin_auth",
     "build_broker_from_settings",
+    "complete_auth",
+    "disconnect",
+    "discover_agentic_account_number",
+    "ensure_agentic_account_number",
+    "is_connected",
     "load_shadow_trades",
+    "pending_auth",
+    "resolve_agentic_account_number",
     "resolve_float_cap",
+    "robinhood_account_snapshot",
+    "select_agentic_account",
 ]

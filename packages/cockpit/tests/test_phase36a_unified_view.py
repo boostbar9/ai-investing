@@ -60,7 +60,7 @@ def test_unified_snapshot_best_effort_degradation(monkeypatch) -> None:
     """If one source raises, the response still returns 200 and other\n    sections are populated. We force ``compute_paper_streak`` to raise."""
     import packages.cockpit.web.server as srv_mod
 
-    def boom(*a, **kw):  # noqa: ARG001
+    def boom(*a, **kw):
         raise RuntimeError("simulated streak failure")
 
     monkeypatch.setattr(srv_mod, "compute_paper_streak", boom)

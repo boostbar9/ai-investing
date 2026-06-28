@@ -27,12 +27,11 @@ side-effects on import.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from datetime import time as dtime
 from pathlib import Path

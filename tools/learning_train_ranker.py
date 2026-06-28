@@ -20,7 +20,7 @@ from pathlib import Path
 # Ensure repo root is on sys.path when invoked directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from packages.learning.ranker import build_training_table, fit_ranker  # noqa: E402
+from packages.learning.ranker import build_training_table, fit_ranker
 
 log = logging.getLogger("learning.train_ranker")
 

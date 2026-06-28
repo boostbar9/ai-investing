@@ -61,10 +61,10 @@ from packages.cockpit.web import autonomy as autonomy_brain
 from packages.cockpit.web import bandit as autonomy_bandit
 from packages.cockpit.web import brain_memory as autonomy_memory
 from packages.cockpit.web import chatter as agent_chatter
-from packages.cockpit.web import knowledge_base as autonomy_knowledge
-from packages.cockpit.web import reflection as autonomy_reflection
 from packages.cockpit.web import finnhub_ws as finnhub_ws_mod
+from packages.cockpit.web import knowledge_base as autonomy_knowledge
 from packages.cockpit.web import live_quotes as live_quotes_mod
+from packages.cockpit.web import reflection as autonomy_reflection
 from packages.cockpit.web import regime as autonomy_regime
 from packages.execution.broker import AlpacaPaperBroker, BrokerError, OrderRequest
 from packages.paper.streak import compute_paper_streak
@@ -343,6 +343,60 @@ def latest_account_snapshot() -> dict[str, Any]:
         "strategy": r.get("strategy"),
         "halted": r.get("halted"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Live Robinhood account snapshot (read-only) for the AI agent context.
+#
+# Robinhood reads are async (MCP-over-HTTP) but the agent-context + UI
+# readers here are sync, so we keep a small in-memory cache refreshed on
+# the autonomy loop's quote-warmup tick. Always read-only -- never places
+# or cancels an order, so it is safe in shadow mode.
+# ---------------------------------------------------------------------------
+
+_RH_SNAPSHOT_CACHE: dict[str, Any] = {"snapshot": None, "ts": None}
+
+
+def latest_robinhood_snapshot() -> dict[str, Any] | None:
+    """Return the most recently cached live Robinhood account snapshot.
+
+    Sync + fast: returns whatever the async warmup tick last fetched
+    (or ``None`` before the first refresh / when not connected). The
+    agent context + dashboard read this so the AI knows the user's real
+    buying power, cash, equity, and current positions when reasoning
+    about the market.
+    """
+    return _RH_SNAPSHOT_CACHE.get("snapshot")
+
+
+async def _refresh_robinhood_snapshot() -> dict[str, Any] | None:
+    """Fetch a fresh read-only Robinhood snapshot and update the cache.
+
+    Never raises -- on any failure the cache is left untouched and the
+    previous value (possibly ``None``) is returned. Safe to call from
+    the autonomy loop on every warmup tick.
+    """
+    try:
+        from packages.execution.robinhood import (
+            is_connected as _rh_is_connected,
+        )
+        from packages.execution.robinhood import (
+            robinhood_account_snapshot as _rh_snapshot,
+        )
+
+        if not _rh_is_connected():
+            # Not connected -> clear any stale snapshot so the UI/agent
+            # don't show data for a disconnected account.
+            _RH_SNAPSHOT_CACHE["snapshot"] = None
+            _RH_SNAPSHOT_CACHE["ts"] = None
+            return None
+        snap = await _rh_snapshot()
+        _RH_SNAPSHOT_CACHE["snapshot"] = snap
+        _RH_SNAPSHOT_CACHE["ts"] = snap.get("as_of")
+        return snap
+    except Exception as exc:  # pragma: no cover — defensive
+        log.debug("robinhood snapshot refresh failed: %s", exc)
+        return _RH_SNAPSHOT_CACHE.get("snapshot")
 
 
 def latest_positions() -> list[dict[str, Any]]:
@@ -1883,6 +1937,622 @@ def api_onboarding_reset() -> dict[str, Any]:
     return {"ok": True, "state": load_onboarding().to_dict()}
 
 
+class _FloatCapBody(BaseModel):
+    """Payload for setting the Robinhood live float cap."""
+
+    cap_usd: float
+
+
+@app.get("/api/onboarding/robinhood/cap")
+def api_robinhood_cap_get() -> dict[str, Any]:
+    """Return the active Robinhood live float cap and its absolute max.
+
+    The cap is the user's hard blast-radius limit on live deployment.
+    Reads through the onboarding store so it stays the single source of
+    truth (defaults to $300 when unset)."""
+    from packages.cockpit.onboarding import (
+        ABSOLUTE_MAX_FLOAT_USD,
+        clamp_float_cap,
+        load_onboarding,
+    )
+
+    state = load_onboarding()
+    return {
+        "cap_usd": clamp_float_cap(state.live_float_cap_usd),
+        "absolute_max_usd": ABSOLUTE_MAX_FLOAT_USD,
+        "default_usd": 300.0,
+    }
+
+
+@app.post("/api/onboarding/robinhood/cap")
+def api_robinhood_cap_set(body: _FloatCapBody) -> dict[str, Any]:
+    """Set the Robinhood live float cap, clamped server-side.
+
+    The cap is clamped into ``[0, ABSOLUTE_MAX_FLOAT_USD]``; NaN / inf /
+    non-numeric values are rejected with 400. We never persist a value
+    that could disable the ceiling. Persisted via the onboarding store so
+    ``resolve_float_cap`` (the broker's enforcement path) picks it up."""
+    import math
+
+    from packages.cockpit.onboarding import (
+        ABSOLUTE_MAX_FLOAT_USD,
+        clamp_float_cap,
+        load_onboarding,
+        save_onboarding,
+    )
+
+    try:
+        requested = float(body.cap_usd)
+    except (TypeError, ValueError) as err:
+        raise HTTPException(
+            status_code=400, detail="cap_usd must be a number"
+        ) from err
+    if not math.isfinite(requested):
+        raise HTTPException(
+            status_code=400, detail="cap_usd must be a finite number"
+        )
+    if requested < 0:
+        raise HTTPException(status_code=400, detail="cap_usd must be >= 0")
+
+    clamped = clamp_float_cap(requested)
+    state = load_onboarding()
+    state.live_float_cap_usd = clamped
+    save_onboarding(state)
+    return {
+        "cap_usd": clamped,
+        "requested_usd": requested,
+        "clamped": clamped != requested,
+        "absolute_max_usd": ABSOLUTE_MAX_FLOAT_USD,
+    }
+
+
+# ---------------------------------------------------------------------------
+# /api/onboarding/robinhood/* -- the "Connect your agent" OAuth flow
+#
+# Backed by ``packages/execution/robinhood.py`` (begin_auth / complete_auth
+# / disconnect / is_connected). The flow is OAuth 2.1 authorization-code
+# with PKCE against Robinhood's MCP server. We default the broker to
+# SHADOW mode and a $300 float cap regardless of connection state -- this
+# only wires up *auth*, never flips the user to live trading.
+#
+#   POST /api/onboarding/robinhood/connect    -> returns authorize URL
+#   GET  /callback (loopback redirect)         -> finishes the exchange
+#   POST /api/onboarding/robinhood/finish      -> manual code/state paste
+#   POST /api/onboarding/robinhood/disconnect  -> wipe tokens
+#   GET  /api/onboarding/robinhood/status      -> connected? + rh_status
+# ---------------------------------------------------------------------------
+
+
+class _RhFinishBody(BaseModel):
+    """Manual-paste fallback when the loopback redirect can't reach us
+    (some networks / the Cursor-style 403-on-loopback case). The user
+    pastes the full redirect URL or the code+state from it."""
+
+    code: str = ""
+    state: str = ""
+    redirect_url: str = ""
+
+
+@app.post("/api/onboarding/robinhood/connect")
+def api_rh_connect() -> dict[str, Any]:
+    """Start the Robinhood OAuth flow and return the authorize URL.
+
+    The cockpit opens this URL in the user's browser; Robinhood prompts
+    them to open/confirm their Agentic account and approve, then redirects
+    back to our loopback callback. Returns ``ok=False`` with a message on
+    discovery/registration failure so the UI shows a clear error instead
+    of a dead button.
+    """
+    from packages.execution.robinhood import begin_auth
+
+    try:
+        pending = begin_auth()
+    except BrokerError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "authorize_url": pending.authorize_url,
+        "redirect_uri": pending.redirect_uri,
+        "state": pending.state,
+    }
+
+
+@app.get("/callback", response_class=HTMLResponse)
+def api_rh_callback(request: Request) -> HTMLResponse:
+    """Loopback redirect target for the OAuth flow.
+
+    Robinhood redirects the browser here with ``?code=...&state=...``.
+    We finish the token exchange server-side and render a tiny
+    self-contained page telling the user to return to the cockpit.
+    """
+    from packages.execution.robinhood import complete_auth
+
+    params = request.query_params
+    code = params.get("code", "")
+    state = params.get("state", "")
+    err = params.get("error", "")
+
+    if err:
+        return HTMLResponse(
+            _rh_callback_page(
+                ok=False,
+                msg=f"Robinhood returned an error: {err}. "
+                "Close this tab and try Connect again.",
+            ),
+            status_code=400,
+        )
+    if not code:
+        return HTMLResponse(
+            _rh_callback_page(
+                ok=False, msg="Missing authorization code in callback."
+            ),
+            status_code=400,
+        )
+    try:
+        complete_auth(code=code, state=state)
+    except BrokerError as exc:
+        return HTMLResponse(
+            _rh_callback_page(ok=False, msg=str(exc)), status_code=400
+        )
+
+    # Mark onboarding status granted on a successful connect (the token
+    # check on next probe will confirm; this gives instant UI feedback).
+    try:
+        from packages.cockpit.onboarding import (
+            load_onboarding,
+            save_onboarding,
+        )
+
+        st = load_onboarding()
+        st.robinhood_status = "granted"  # type: ignore[assignment]
+        save_onboarding(st)
+    except Exception:  # pragma: no cover - UI nicety, never fatal
+        pass
+
+    return HTMLResponse(
+        _rh_callback_page(
+            ok=True,
+            msg="Your agent is connected to Robinhood. "
+            "You can close this tab and return to the cockpit.",
+        )
+    )
+
+
+def _rh_callback_page(*, ok: bool, msg: str) -> str:
+    """Minimal standalone HTML for the OAuth callback landing page."""
+    color = "#16a34a" if ok else "#dc2626"
+    icon = "&#10003;" if ok else "&#10007;"
+    title = "Connected" if ok else "Connection failed"
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>Robinhood &middot; {title}</title></head>"
+        "<body style='font-family:system-ui,sans-serif;background:#0b0b0f;"
+        "color:#e5e7eb;display:flex;min-height:100vh;align-items:center;"
+        "justify-content:center;margin:0'>"
+        "<div style='max-width:420px;text-align:center;padding:32px'>"
+        f"<div style='font-size:48px;color:{color}'>{icon}</div>"
+        f"<h1 style='font-size:20px;margin:12px 0 8px'>{title}</h1>"
+        f"<p style='color:#9ca3af;line-height:1.5'>{msg}</p>"
+        "</div></body></html>"
+    )
+
+
+@app.post("/api/onboarding/robinhood/finish")
+def api_rh_finish(body: _RhFinishBody) -> dict[str, Any]:
+    """Manual-paste completion fallback.
+
+    If the browser redirect can't reach the cockpit's loopback listener,
+    the user pastes the full redirect URL (or the code+state) here and we
+    finish the exchange. Accepts either ``code``+``state`` directly or a
+    ``redirect_url`` we parse them out of.
+    """
+    from urllib.parse import parse_qs, urlsplit
+
+    from packages.execution.robinhood import complete_auth
+
+    code, state = body.code, body.state
+    if body.redirect_url and not (code and state):
+        q = parse_qs(urlsplit(body.redirect_url).query)
+        code = code or (q.get("code", [""])[0])
+        state = state or (q.get("state", [""])[0])
+    if not code:
+        raise HTTPException(status_code=400, detail="missing code")
+    try:
+        complete_auth(code=code, state=state)
+    except BrokerError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        from packages.cockpit.onboarding import (
+            load_onboarding,
+            save_onboarding,
+        )
+
+        st = load_onboarding()
+        st.robinhood_status = "granted"  # type: ignore[assignment]
+        save_onboarding(st)
+    except Exception:  # pragma: no cover
+        pass
+    return {"ok": True}
+
+
+@app.post("/api/onboarding/robinhood/disconnect")
+def api_rh_disconnect() -> dict[str, Any]:
+    """Wipe Robinhood tokens + client_id. Backs 'Disconnect Robinhood'."""
+    from packages.execution.robinhood import disconnect
+
+    disconnect()
+    return {"ok": True, "connected": False}
+
+
+@app.get("/api/onboarding/robinhood/status")
+def api_rh_status() -> dict[str, Any]:
+    """Report whether a usable Robinhood token is stored, plus the cached
+    onboarding status and the ACTIVE-broker safety posture. Read-only;
+    never touches the network.
+
+    The ``active_broker`` block surfaces which backend the autonomy loop
+    will trade through (default: alpaca_paper), whether it's shadow or
+    live, the resolved float cap, and the targeted agentic account number
+    MASKED to its last 4 digits -- so the user can confirm at a glance
+    that selecting Robinhood didn't silently enable live trading."""
+    from packages.cockpit.onboarding import load_onboarding
+    from packages.execution.broker_factory import active_broker_status
+    from packages.execution.robinhood import is_connected
+
+    return {
+        "connected": is_connected(),
+        "robinhood_status": load_onboarding().robinhood_status,
+        "active_broker": active_broker_status(),
+    }
+
+
+@app.get("/api/onboarding/robinhood/snapshot")
+async def api_rh_snapshot(refresh: bool = True) -> dict[str, Any]:
+    """Live, read-only snapshot of the connected Robinhood account.
+
+    Surfaces buying power, cash, total equity, and current positions so
+    the dashboard can show the user's real account and the AI agent has
+    live account context when reasoning about the market.
+
+    ALWAYS read-only -- this never places, reviews, or cancels an order,
+    so it is safe even while the bot runs in shadow mode. When
+    ``refresh=true`` (default) it fetches fresh data from Robinhood and
+    updates the in-memory cache the agent reads; ``refresh=false``
+    returns the last cached snapshot without a network call.
+    """
+    if refresh:
+        snap = await _refresh_robinhood_snapshot()
+    else:
+        snap = latest_robinhood_snapshot()
+    if snap is None:
+        # Not connected / never fetched -- report a stable empty shape.
+        from packages.execution.robinhood import is_connected
+
+        return {
+            "connected": is_connected(),
+            "mode": "shadow",
+            "as_of": None,
+            "accounts": [],
+            "portfolio": None,
+            "positions": [],
+            "buying_power": None,
+            "cash": None,
+            "total_equity": None,
+            "errors": [],
+        }
+    return snap
+
+
+@app.post("/api/onboarding/robinhood/select-account")
+async def api_rh_select_account() -> dict[str, Any]:
+    """Discover + persist the agentic-allowed Robinhood account number.
+
+    Calls ``get_accounts`` (read-only) and stores the single account
+    flagged ``agentic_allowed=true`` so the broker targets it for reads +
+    orders. Robinhood rejects trades on non-agentic accounts at the API
+    level, so this MUST succeed before Robinhood live trading is usable.
+    Returns the masked account number on success; ``ok=False`` with a
+    reason when not connected or no agentic account exists (fail safe)."""
+    from packages.execution.robinhood import (
+        ensure_agentic_account_number,
+        is_connected,
+    )
+
+    if not is_connected():
+        return {"ok": False, "reason": "not_connected"}
+    acct = await ensure_agentic_account_number()
+    if not acct:
+        return {"ok": False, "reason": "no_agentic_account"}
+    return {"ok": True, "account_masked": "••••" + acct[-4:]}
+
+
+class _BrokerBackendBody(BaseModel):
+    """Payload for selecting the active broker backend."""
+
+    backend: str
+
+
+@app.get("/api/onboarding/broker-backend")
+def api_broker_backend_get() -> dict[str, Any]:
+    """Return the selected + effective active broker backend and posture.
+
+    Read-only. ``backend`` is what the user selected; the
+    ``active_broker`` block reflects what actually resolved (which may
+    have failed safe back to alpaca_paper)."""
+    from packages.cockpit.onboarding import load_onboarding
+    from packages.execution.broker_factory import active_broker_status
+
+    return {
+        "backend": load_onboarding().broker_backend,
+        "active_broker": active_broker_status(),
+    }
+
+
+@app.post("/api/onboarding/broker-backend")
+def api_broker_backend_set(body: _BrokerBackendBody) -> dict[str, Any]:
+    """Select the active broker backend (``alpaca_paper`` | ``robinhood``).
+
+    Selecting ``robinhood`` only changes WHICH broker the loop trades
+    through -- it does NOT enable live trading (the broker still runs in
+    SHADOW unless the resolve_mode gate + ENABLE_LIVE_TRADING authorize).
+    Rejects unknown backends with 400."""
+    from packages.cockpit.onboarding import (
+        VALID_BROKER_BACKENDS,
+        load_onboarding,
+        save_onboarding,
+    )
+    from packages.execution.broker_factory import active_broker_status
+
+    backend = body.backend.strip().lower()
+    if backend not in VALID_BROKER_BACKENDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"backend must be one of {list(VALID_BROKER_BACKENDS)}",
+        )
+    state = load_onboarding()
+    state.broker_backend = backend  # type: ignore[assignment]
+    save_onboarding(state)
+    return {"ok": True, "backend": backend, "active_broker": active_broker_status()}
+
+
+# ---------------------------------------------------------------------------
+# Robinhood go-live readiness + mode control
+#
+# ``/readiness`` is the Robinhood analogue of ``/api/promote``: an ordered,
+# plain-language checklist of every precondition that must hold before a
+# real Robinhood order can execute, each with a boolean + human label + a
+# "what to do" hint, plus an overall ``ready`` flag and the single most
+# important next action. ``/mode`` flips ``rh_mode`` -- going LIVE requires
+# an explicit confirm AND server-side re-validation of that checklist;
+# going SHADOW is always allowed (turning OFF live never needs a gate).
+# ---------------------------------------------------------------------------
+
+
+def _enable_live_flag() -> bool:
+    """True when ENABLE_LIVE_TRADING is armed in the environment."""
+    return os.getenv("ENABLE_LIVE_TRADING", "").strip().lower() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
+
+
+def _compute_robinhood_readiness() -> dict[str, Any]:
+    """Build the ordered Robinhood go-live checklist (read-only, fail-safe).
+
+    Every check is independent and never raises -- a failure to read any
+    one precondition is reported as that step being unmet, never a 500.
+    The promotion gate is the SAME §16 gate the Alpaca path uses.
+    """
+    from packages.cockpit.onboarding import load_onboarding
+    from packages.execution import robinhood as rh
+    from packages.execution.broker_factory import BACKEND_ROBINHOOD
+
+    # Read each source of truth defensively.
+    try:
+        state = load_onboarding()
+    except Exception:  # pragma: no cover - defensive
+        state = None
+    rh_mode = getattr(state, "rh_mode", "shadow") if state else "shadow"
+    backend = getattr(state, "broker_backend", "alpaca_paper") if state else "alpaca_paper"
+    cap = 0.0
+    try:
+        cap = rh.resolve_float_cap()
+    except Exception:  # pragma: no cover - defensive
+        cap = 0.0
+
+    try:
+        connected = rh.is_connected()
+    except Exception:  # pragma: no cover - defensive
+        connected = False
+
+    try:
+        account = rh.resolve_agentic_account_number()
+    except Exception:  # pragma: no cover - defensive
+        account = None
+
+    # Funded state: only observable from a cached snapshot (never force a
+    # network call here -- this endpoint must stay cheap + read-only).
+    buying_power: float | None = None
+    try:
+        snap = latest_robinhood_snapshot()
+        if isinstance(snap, dict):
+            bp = snap.get("buying_power")
+            buying_power = float(bp) if bp is not None else None
+    except Exception:  # pragma: no cover - defensive
+        buying_power = None
+
+    enable_flag = _enable_live_flag()
+
+    try:
+        promote = _compute_promote_payload()
+        gate_passed = bool(promote.get("readiness", {}).get("ready", False))
+    except Exception:  # pragma: no cover - defensive
+        gate_passed = False
+
+    checks: list[dict[str, Any]] = [
+        {
+            "id": "connected",
+            "ok": bool(connected),
+            "label": "Robinhood account connected",
+            "todo": "Click “Connect Robinhood” and sign in to link your account.",
+        },
+        {
+            "id": "account",
+            "ok": bool(account),
+            "label": "AI trading account found",
+            "todo": "Open your AI (Agentic) account in the Robinhood app, then click “Find my account.”",
+        },
+        {
+            "id": "funded",
+            "ok": (buying_power is None) or (buying_power > 0),
+            "informational": buying_power is None,
+            "label": (
+                "Your AI trading account has money to invest"
+                if buying_power is not None
+                else "Account funding (we'll check once connected)"
+            ),
+            "todo": "Add money to your AI trading account in the Robinhood app.",
+        },
+        {
+            "id": "backend",
+            "ok": backend == BACKEND_ROBINHOOD,
+            "label": "Robinhood is the active broker",
+            "todo": "Switch the active broker to Robinhood in the control center.",
+        },
+        {
+            "id": "cap",
+            "ok": cap > 0,
+            "label": "A spending cap is set",
+            "todo": "Set a dollar cap (how much real money the AI may use).",
+        },
+        {
+            "id": "enable_live",
+            "ok": enable_flag,
+            "label": "Live trading is armed",
+            "todo": "Arm live trading on the Promote page after the practice checks pass.",
+        },
+        {
+            "id": "promotion_gate",
+            "ok": gate_passed,
+            "label": "Practice results are good enough to go live",
+            "todo": "Keep running in practice mode until the readiness checks on the Promote page pass.",
+        },
+        {
+            "id": "rh_mode_live",
+            "ok": rh_mode == "live",
+            "label": "Robinhood set to LIVE",
+            "todo": "Flip the switch to LIVE (you'll be asked to confirm).",
+        },
+    ]
+
+    # ``ready`` ignores the final rh_mode flip + informational funding so it
+    # reflects "is it SAFE to flip to live now" -- the mode endpoint uses
+    # this exact predicate as its server-side gate.
+    blocking = [
+        c
+        for c in checks
+        if c["id"] != "rh_mode_live"
+        and not c.get("informational")
+        and not c["ok"]
+    ]
+    ready = len(blocking) == 0
+
+    # Next action = first unmet step in order (including the rh_mode flip
+    # once everything else is green).
+    next_step = "You're ready - flip the switch to LIVE when you want real trading."
+    for c in checks:
+        if c.get("informational"):
+            continue
+        if not c["ok"]:
+            next_step = c["todo"]
+            break
+
+    return {
+        "ready": ready,
+        "next_step": next_step,
+        "rh_mode": rh_mode,
+        "broker_backend": backend,
+        "cap_usd": cap,
+        "buying_power": buying_power,
+        "account_masked": ("••••" + account[-4:]) if account else None,
+        "checklist": checks,
+    }
+
+
+@app.get("/api/onboarding/robinhood/readiness")
+def api_rh_readiness() -> dict[str, Any]:
+    """Ordered Robinhood go-live checklist + overall ready flag + next step.
+
+    Read-only and fail-safe: never raises, never touches the network, and
+    reports each precondition as a plain-language step the operator can act
+    on. Mirrors ``/api/promote`` but for the Robinhood chain."""
+    return _compute_robinhood_readiness()
+
+
+class _RhModeBody(BaseModel):
+    """Payload for setting Robinhood shadow/live mode."""
+
+    mode: str
+    confirm: bool = False
+
+
+@app.post("/api/onboarding/robinhood/mode")
+def api_rh_mode_set(body: _RhModeBody) -> dict[str, Any]:
+    """Set ``rh_mode`` to ``shadow`` or ``live``.
+
+    SHADOW is always allowed (turning live OFF never needs a gate). Going
+    LIVE requires BOTH an explicit ``confirm=true`` AND a server-side
+    re-validation of the go-live checklist; if either fails we refuse with
+    a clear reason list and leave the mode unchanged. This is the deliberate
+    confirmation barrier -- selecting the Robinhood backend alone can never
+    flip this; only this endpoint, with confirm + readiness, can."""
+    from packages.cockpit.onboarding import (
+        VALID_RH_MODES,
+        load_onboarding,
+        save_onboarding,
+    )
+
+    mode = body.mode.strip().lower()
+    if mode not in VALID_RH_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"mode must be one of {list(VALID_RH_MODES)}",
+        )
+
+    if mode == "live":
+        if not body.confirm:
+            raise HTTPException(
+                status_code=400,
+                detail="going live requires explicit confirmation",
+            )
+        readiness = _compute_robinhood_readiness()
+        if not readiness["ready"]:
+            unmet = [
+                c["label"]
+                for c in readiness["checklist"]
+                if c["id"] != "rh_mode_live"
+                and not c.get("informational")
+                and not c["ok"]
+            ]
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "not_ready",
+                    "reasons": unmet,
+                    "next_step": readiness["next_step"],
+                },
+            )
+
+    state = load_onboarding()
+    state.rh_mode = mode  # type: ignore[assignment]
+    save_onboarding(state)
+    return {"ok": True, "rh_mode": mode}
+
+
 # ---------------------------------------------------------------------------
 # /api/research-sweep -- Phase 1D
 #
@@ -2403,14 +3073,33 @@ async def api_trading_unified_snapshot(
         "decisions": None,
         "window": None,
         "streak": None,
+        "robinhood": None,
+        "active_broker": None,
         "errors": {},
     }
+
+    # Which broker backend is active right now + its shadow/live posture
+    # (read-only; never enables trading). Powers the dual-pipeline view.
+    try:
+        from packages.execution.broker_factory import active_broker_status
+
+        out["active_broker"] = active_broker_status()
+    except Exception as exc:  # pragma: no cover — defensive
+        out["errors"]["active_broker"] = f"{exc.__class__.__name__}: {exc}"
 
     # Alpaca account + positions (best-effort)
     try:
         out["account"] = latest_account_snapshot()
     except Exception as exc:  # pragma: no cover — defensive
         out["errors"]["account"] = f"{exc.__class__.__name__}: {exc}"
+
+    # Live Robinhood account snapshot (read-only) -- gives the agent the
+    # user's REAL buying power / cash / equity / positions when connected.
+    # Cached by the autonomy warmup tick; None when not connected.
+    try:
+        out["robinhood"] = latest_robinhood_snapshot()
+    except Exception as exc:  # pragma: no cover — defensive
+        out["errors"]["robinhood"] = f"{exc.__class__.__name__}: {exc}"
     try:
         out["positions"] = latest_positions()
     except Exception as exc:  # pragma: no cover
@@ -3410,7 +4099,7 @@ async def _autonomy_startup() -> None:  # pragma: no cover
         log.info(
             "finnhub_ws: client built (started=%s, max_symbols=%d)",
             ws_started,
-            ws_client._max_symbols,  # noqa: SLF001 — telemetry only
+            ws_client._max_symbols,
         )
     else:
         log.info("finnhub_ws: no API key, live tick stream disabled")
@@ -3437,13 +4126,37 @@ async def _autonomy_startup() -> None:  # pragma: no cover
     # Phase 25: build the exit_rules / dip_watch tick hooks. The hooks
     # capture _last_price + a broker factory so autonomy.py never has
     # to import the broker directly (keeps it testable in isolation).
+    #
+    # The active broker is obtained through ``resolve_active_broker`` so the
+    # loop trades through whichever backend the user selected (default:
+    # Alpaca paper). Selecting Robinhood doesn't enable live -- the broker
+    # still runs in SHADOW unless the resolve_mode gate + ENABLE_LIVE_TRADING
+    # authorize it. The Alpaca-cred gate below only applies when the active
+    # backend is Alpaca paper; a Robinhood-backed loop doesn't need Alpaca
+    # keys.
+    def _loop_broker() -> Any | None:
+        """Resolve the active loop broker, gating on Alpaca creds only when
+        the effective backend is Alpaca paper. Returns ``None`` (skip the
+        tick) when the paper backend has no creds -- existing behavior."""
+        from packages.execution.broker_factory import (
+            BACKEND_ALPACA_PAPER,
+            resolve_broker_selection,
+        )
+
+        sel = resolve_broker_selection()
+        if sel.effective_backend == BACKEND_ALPACA_PAPER and not (
+            os.getenv("ALPACA_PAPER_KEY_ID") and os.getenv("ALPACA_PAPER_SECRET")
+        ):
+            return None
+        return sel.broker
+
     async def _phase25_exit_rules_tick() -> dict[str, Any]:
         from packages.cockpit.web.dip_watch import arm as dip_arm
         from packages.cockpit.web.exit_rules import run_tick as exit_run_tick
 
-        if not (os.getenv("ALPACA_PAPER_KEY_ID") and os.getenv("ALPACA_PAPER_SECRET")):
+        broker = _loop_broker()
+        if broker is None:
             return {"skipped": True, "reason": "no_broker_creds"}
-        broker = AlpacaPaperBroker()
         try:
             async def _submit_sell(symbol: str, qty: float) -> Any:
                 from packages.execution.broker import OrderRequest
@@ -3485,9 +4198,9 @@ async def _autonomy_startup() -> None:  # pragma: no cover
     async def _phase25_dip_watch_tick() -> dict[str, Any]:
         from packages.cockpit.web.dip_watch import run_tick as dip_run_tick
 
-        if not (os.getenv("ALPACA_PAPER_KEY_ID") and os.getenv("ALPACA_PAPER_SECRET")):
+        broker = _loop_broker()
+        if broker is None:
             return {"skipped": True, "reason": "no_broker_creds"}
-        broker = AlpacaPaperBroker()
         try:
             async def _submit_buy(symbol: str, qty: float) -> Any:
                 from packages.execution.broker import OrderRequest
@@ -3546,23 +4259,32 @@ async def _autonomy_startup() -> None:  # pragma: no cover
             except Exception as exc:  # pragma: no cover — defensive
                 log.debug("finnhub_ws: set_symbols failed: %s", exc)
                 ws_result = {"error": str(exc)[:240]}
+        # Keep the live Robinhood account snapshot warm so the agent
+        # context + dashboard read fresh buying-power / equity / positions
+        # without a per-request network call. Read-only; no-op when the
+        # user hasn't connected Robinhood.
+        rh_ok = False
+        try:
+            rh_snap = await _refresh_robinhood_snapshot()
+            rh_ok = bool(rh_snap and rh_snap.get("connected"))
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("robinhood snapshot warmup failed: %s", exc)
         return {
             "refreshed": ok,
             "attempted": len(symbols),
             "primary": quote_cache.status()["primary_provider"],
             "ws": ws_result,
+            "robinhood": rh_ok,
         }
 
     # Phase 28-R step 2 — EOD flattener. Closes everything at 15:55-16:05
     # ET so the bot stays pure intraday. Idempotent per session.
     from packages.execution.eod_flattener import make_flatten_tick_hook
 
-    def _eod_broker_factory() -> AlpacaPaperBroker | None:
-        if not (
-            os.getenv("ALPACA_PAPER_KEY_ID") and os.getenv("ALPACA_PAPER_SECRET")
-        ):
-            return None
-        return AlpacaPaperBroker()
+    def _eod_broker_factory() -> Any | None:
+        # Same selection seam as the autonomy ticks: the EOD flattener
+        # operates on whichever backend is active (default Alpaca paper).
+        return _loop_broker()
 
     _eod_flatten_hook = make_flatten_tick_hook(_eod_broker_factory)
 
@@ -4891,7 +5613,7 @@ async def api_data_feed_refresh(symbol: str | None = None) -> dict[str, Any]:
     except Exception:
         pass
     results = await live_quotes_mod.refresh_symbols(cache, sorted(syms))
-    return {"refreshed": {k: v for k, v in results.items()}}
+    return {"refreshed": dict(results)}
 
 
 @app.exception_handler(Exception)

@@ -35,9 +35,10 @@ import asyncio
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ DEFAULT_TTL_S = 30.0
 
 # Fallback provider type: a sync callable that returns a list of daily
 # closes (yfinance shape). The cache lifts the last element to a price.
-FallbackProvider = Callable[[str], Optional[list[float]]]
+FallbackProvider = Callable[[str], list[float] | None]
 
 # Async fetch type for the primary (Finnhub) path.
 QuoteFetcher = Callable[[str], Awaitable[float]]
@@ -312,17 +313,6 @@ def reset_default_cache_for_tests() -> None:
 # ---------------------------------------------------------------------------
 # High-level helpers consumed by server.py
 # ---------------------------------------------------------------------------
-
-
-async def build_finnhub_fetcher() -> QuoteFetcher | None:
-    """Construct an async ``QuoteFetcher`` over a shared FinnhubAdapter.
-
-    Returns ``None`` when no API key is configured (so the cache
-    transparently falls back to yfinance). The returned closure owns
-    the adapter lifecycle — callers should call ``aclose()`` on the
-    adapter at shutdown via the returned `(fetcher, adapter)` tuple.
-    """
-    raise NotImplementedError  # see make_finnhub_fetcher below
 
 
 def make_finnhub_fetcher(adapter: Any) -> QuoteFetcher:

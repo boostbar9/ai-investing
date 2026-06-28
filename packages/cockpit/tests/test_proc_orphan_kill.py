@@ -46,7 +46,7 @@ def _seed_orphan(kind: str, pid: int) -> proc_mod.JobInfo:
 class TestOrphanStop:
     def test_orphan_with_live_pid_calls_kill_os(self) -> None:
         """Live orphan PID: stop() must call _kill_pid_os to clean up."""
-        info = _seed_orphan("paper_loop", pid=12345)
+        _seed_orphan("paper_loop", pid=12345)
 
         with mock.patch.object(proc_mod, "_pid_is_running", return_value=True) as alive, \
              mock.patch.object(proc_mod, "_kill_pid_os", return_value=True) as killer:

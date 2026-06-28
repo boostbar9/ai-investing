@@ -112,7 +112,6 @@ async def test_no_pending_orders_is_a_noop() -> None:
 async def test_broker_error_on_open_orders_does_not_block_planning() -> None:
     """If /v2/orders is down we must NOT silently skip every symbol —
     that would replicate the original cascade. We log and proceed."""
-    broker = _FakeBroker(raise_on_open=True)
     # Existing AMZN long so we have a deterministic plan candidate
     # without depending on parquet files.
     class _B(_FakeBroker):

@@ -35,8 +35,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import httpx
-
 from packages.data.adapters.base import DataAdapterError, NewsItem
 from packages.data.adapters.finnhub import FinnhubAdapter
 from packages.data.adapters.sentiment import score_headline
@@ -180,7 +178,7 @@ def aggregate_news_sentiment(
             sample_headlines=(),
         )
 
-    # Weighted sum: each headline contributes (score × recency_weight).
+    # Weighted sum: each headline contributes (score x recency_weight).
     # Recency weight is exponential decay with half-life ``halflife_hours``.
     total_weight = 0.0
     weighted_score = 0.0
@@ -345,7 +343,7 @@ class FinnhubNewsClient:
                 sym, items=[], now=wall_now,
                 halflife_hours=self._halflife_hours,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._errors += 1
             logger.warning("finnhub news %s: transport %s", sym, exc)
             return aggregate_news_sentiment(
@@ -398,8 +396,8 @@ def reset_news_client_for_tests() -> None:
 
 
 __all__ = [
-    "NewsSentiment",
     "FinnhubNewsClient",
+    "NewsSentiment",
     "aggregate_news_sentiment",
     "get_news_client",
     "reset_news_client_for_tests",

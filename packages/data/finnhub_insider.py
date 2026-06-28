@@ -23,6 +23,7 @@ so the brain only acts on corroborated cluster buys.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -297,10 +298,7 @@ def aggregate_insider_signal(
     raw_buy = buy_notional * 2.0
     raw_sell = sell_notional * 1.0
     denom = raw_buy + raw_sell
-    if denom > 0:
-        score = (raw_buy - raw_sell) / denom
-    else:
-        score = 0.0
+    score = (raw_buy - raw_sell) / denom if denom > 0 else 0.0
     score = max(-1.0, min(1.0, score))
 
     unique_buyers_total = len({t.name for t in buys})
@@ -502,17 +500,13 @@ class FinnhubInsiderClient:
             cd = _resolved_default_dir()
             if cd.exists():
                 for path in cd.glob("*.json"):
-                    try:
+                    with contextlib.suppress(OSError):
                         path.unlink()
-                    except OSError:
-                        pass
         else:
             self._cache.pop(symbol.upper(), None)
             path = _cache_path(_resolved_default_dir(), symbol)
-            try:
+            with contextlib.suppress(OSError, FileNotFoundError):
                 path.unlink()
-            except (OSError, FileNotFoundError):
-                pass
 
     async def score_symbol(
         self, symbol: str, *, now: datetime | None = None
@@ -556,7 +550,7 @@ class FinnhubInsiderClient:
             self._errors += 1
             logger.warning("finnhub insider %s: %s", sym, exc)
             return aggregate_insider_signal(sym, transactions=[], now=wall_now)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._errors += 1
             logger.warning("finnhub insider %s: transport %s", sym, exc)
             return aggregate_insider_signal(sym, transactions=[], now=wall_now)
@@ -601,16 +595,16 @@ def reset_insider_client_for_tests() -> None:
 
 
 __all__ = [
-    "InsiderTransaction",
-    "InsiderSignal",
-    "FinnhubInsiderClient",
-    "aggregate_insider_signal",
-    "fetch_insider_transactions",
-    "seniority_weight",
-    "get_insider_client",
-    "reset_insider_client_for_tests",
     "CLUSTER_THRESHOLD",
     "CLUSTER_WINDOW_DAYS",
+    "FinnhubInsiderClient",
+    "InsiderSignal",
+    "InsiderTransaction",
+    "aggregate_insider_signal",
+    "fetch_insider_transactions",
+    "get_insider_client",
+    "reset_insider_client_for_tests",
+    "seniority_weight",
 ]
 
 

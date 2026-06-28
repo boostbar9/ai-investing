@@ -31,6 +31,7 @@ contributes nothing and the rest of the system runs identically.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -115,7 +116,7 @@ def build_training_table(
         if pid:
             by_pick[str(pid)] = o
 
-    X: list[dict[str, Any]] = []
+    X: list[dict[str, Any]] = []  # noqa: N806 - ML convention: capital X = feature matrix
     y: list[int] = []
     pick_ids: list[str] = []
     ts_list: list[str] = []
@@ -158,7 +159,7 @@ def _label_encode(values: Sequence[Any]) -> tuple[list[int], dict[str, int]]:
 
 
 def to_matrix(
-    X: Sequence[Mapping[str, Any]],
+    X: Sequence[Mapping[str, Any]],  # noqa: N803 - ML convention: capital X = feature matrix
     *,
     cat_maps: dict[str, dict[str, int]] | None = None,
 ) -> tuple[list[list[float]], list[str], dict[str, dict[str, int]]]:
@@ -201,10 +202,8 @@ def to_matrix(
             else:
                 v = row.get(k)
                 if v is not None:
-                    try:
-                        matrix[i, j] = float(v)
-                    except (TypeError, ValueError):
-                        pass  # leave as NaN
+                    with contextlib.suppress(TypeError, ValueError):
+                        matrix[i, j] = float(v)  # leave as NaN on failure
     return matrix, feature_columns, cat_maps
 
 
@@ -359,11 +358,11 @@ def fit_ranker(
     # Time-ordered split. Snapshots are appended in cycle order so
     # sorting by ts is enough to make the val set "the future".
     order = sorted(range(n), key=lambda i: table.ts[i] or "")
-    X_sorted = [table.X[i] for i in order]
+    X_sorted = [table.X[i] for i in order]  # noqa: N806 - ML convention: capital X = feature matrix
     y_sorted = [table.y[i] for i in order]
 
     cut = max(MIN_TRAIN_SAMPLES // 2, int(n * (1.0 - val_frac)))
-    X_train, X_val = X_sorted[:cut], X_sorted[cut:]
+    X_train, X_val = X_sorted[:cut], X_sorted[cut:]  # noqa: N806 - ML convention
     y_train, y_val = y_sorted[:cut], y_sorted[cut:]
 
     train_matrix, feat_cols, cat_maps = to_matrix(X_train)

@@ -34,6 +34,7 @@ cross-process and post-restart hits.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -236,10 +237,8 @@ def save_cached_signal(
             os.replace(tmp_name, path)
         except Exception:
             # Best-effort cleanup of the tmp file on any failure.
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_name)
-            except OSError:
-                pass
             raise
     except OSError as exc:
         log.debug("insider cache: write %s failed: %s", path, exc)

@@ -20,14 +20,13 @@ Three test surfaces:
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from packages.backtests.intraday_walk_forward import (
-    DEFAULT_INTRADAY_COST_MODEL,
     DEFAULT_INTRADAY_GRID,
     IntradayCostModel,
     IntradayParamSet,
@@ -39,7 +38,6 @@ from packages.backtests.intraday_walk_forward import (
     run_intraday_walk_forward,
 )
 from packages.strategies.intraday_trend import IntradayTrendFollowing
-
 
 # ---------------------------------------------------------------------------
 # Bar helpers
@@ -59,11 +57,9 @@ def _session_bars(
     timestamps so the audit's tz logic exercises real conversion.
     """
     # 09:30 ET == 14:30 UTC (no DST math; tests use fixed dates).
-    start = datetime(day.year, day.month, day.day, 14, 30, tzinfo=timezone.utc)
+    start = datetime(day.year, day.month, day.day, 14, 30, tzinfo=UTC)
     rows = []
-    price = 100.0
     for i in range(n_bars):
-        ts = start + timedelta(minutes=5 * i)
         if flat:
             close = 100.0
         elif breakout and i >= 8:
@@ -81,7 +77,6 @@ def _session_bars(
                 "volume": 10_000.0,
             }
         )
-        price = close
     idx = pd.DatetimeIndex(
         [start + timedelta(minutes=5 * i) for i in range(n_bars)],
         name="ts",

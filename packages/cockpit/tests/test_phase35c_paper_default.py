@@ -16,7 +16,6 @@ market data, and a clean shadow ledger).
 from __future__ import annotations
 
 import inspect
-import os
 
 from fastapi.testclient import TestClient
 

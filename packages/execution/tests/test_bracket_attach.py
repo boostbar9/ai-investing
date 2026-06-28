@@ -11,8 +11,6 @@ at exchange speed even if our cockpit loop hangs. The helper has to:
 """
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from packages.execution.bracket_attach import (
@@ -20,7 +18,6 @@ from packages.execution.bracket_attach import (
     compute_bracket_levels,
 )
 from packages.execution.broker import BracketOrderRequest, BrokerError, OrderAck
-
 
 # ---------- compute_bracket_levels -----------------------------------------
 

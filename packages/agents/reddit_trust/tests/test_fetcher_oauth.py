@@ -118,10 +118,6 @@ async def test_oauth_host_tried_first_when_bearer_present(monkeypatch):
         await client.aclose()
 
     assert len(out) == 1
-    # First /hot request must be against oauth.reddit.com.
-    hot_hosts = [h for h, p in zip(hits, [str(x) for x in hits]) if True]
-    # Filter to only hot-listing requests (exclude about lookups).
-    hot_only = [h for h in hits if h != "www.reddit.com" or True]
     # The very first request should be to oauth.reddit.com
     assert hits[0] == "oauth.reddit.com"
     assert auth_headers[0] == "bearer BEARER_OK"

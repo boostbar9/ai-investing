@@ -85,7 +85,7 @@ class CuriosityAction:
     payload: dict[str, Any] = field(default_factory=dict)
     ts: str = ""
 
-    def with_ts(self, now: datetime | None = None) -> "CuriosityAction":
+    def with_ts(self, now: datetime | None = None) -> CuriosityAction:
         stamp = (now or datetime.now(UTC)).isoformat(timespec="seconds")
         return CuriosityAction(
             kind=self.kind, rationale=self.rationale, payload=self.payload, ts=stamp

@@ -39,12 +39,12 @@ import pandas as pd
 
 from packages.agents.paper_bridge import advise as agent_advise
 from packages.cockpit.state import load_state as load_cockpit_state
+from packages.execution.bracket_attach import attach_bracket_after_entry
 from packages.execution.broker import (
     AlpacaPaperBroker,
     BrokerError,
     OrderRequest,
 )
-from packages.execution.bracket_attach import attach_bracket_after_entry
 from packages.paper.streak import compute_paper_streak
 from packages.persistence import connect as _db_connect
 from packages.persistence import insert_cycle as _db_insert_cycle
@@ -717,7 +717,7 @@ def compute_intraday_trend_weights() -> dict[str, float]:
                     bars = await adapter.get_intraday_bars(
                         sym, interval="5m", range_="5d"
                     )
-                except Exception as exc:  # noqa: BLE001 - skip bad ticker
+                except Exception as exc:
                     log.warning("intraday-trend: %s fetch failed: %s", sym, exc)
                     continue
                 if not bars:
@@ -1390,6 +1390,34 @@ async def run(
 
         submitted = []
         errors = []
+        # Order-routing seam: orders go to the *active* broker (the user's
+        # selected backend) while account/positions/risk reads above keep
+        # using the Alpaca paper broker as the data source. Default / unset
+        # / any error resolves to Alpaca paper, so existing behavior is
+        # unchanged; only an explicit, connected, gated Robinhood selection
+        # routes orders to Robinhood (still SHADOW unless the live gate
+        # authorizes). Never raises — falls back to the Alpaca ``broker``.
+        order_broker: Any = broker
+        order_broker_backend = "alpaca_paper"
+        try:
+            from packages.execution.broker_factory import (
+                resolve_broker_selection,
+            )
+
+            sel = resolve_broker_selection()
+            order_broker = sel.broker
+            order_broker_backend = sel.effective_backend
+            if sel.fell_back:
+                log.warning("active broker fell back to paper: %s", sel.reason)
+            else:
+                log.info("active order broker: %s (%s)", sel.effective_backend, sel.reason)
+        except Exception as e:  # pragma: no cover - fail safe to paper
+            log.warning("broker selection failed (%s) -- using alpaca paper", e)
+            order_broker = broker
+            order_broker_backend = "alpaca_paper"
+        # Brackets are an Alpaca-paper-specific OCO affordance; only attach
+        # them when orders actually route to the Alpaca paper broker.
+        _alpaca_order_path = order_broker_backend == "alpaca_paper"
         # Phase 35 — collect bracket-attach results per entry for the
         # cycle audit record. Each row gets the outcome of
         # ``attach_bracket_after_entry`` so the operator can see whether
@@ -1414,13 +1442,14 @@ async def run(
                         type="market",
                         time_in_force="day",
                     )
-                    ack = await broker.submit(req)
+                    ack = await order_broker.submit(req)
                     submitted.append({
                         "symbol": po.symbol,
                         "side": po.side,
                         "qty": po.qty,
                         "broker_order_id": ack.broker_order_id,
                         "status": ack.status,
+                        "broker": order_broker_backend,
                     })
                     log.info("submitted %s %s %.4f -> %s", po.side, po.symbol, po.qty, ack.status)
                     # Phase 35 — attach OCO bracket on successful long
@@ -1428,7 +1457,8 @@ async def run(
                     # our loop hangs. Best-effort: any failure here
                     # must never unwind the parent fill.
                     if (
-                        _bracket_th is not None
+                        _alpaca_order_path
+                        and _bracket_th is not None
                         and not _bracket_th.is_off()
                         and po.side == "buy"
                         and po.last_price
@@ -1531,6 +1561,7 @@ async def run(
                 str(s).upper() for s, w in (target or {}).items()
                 if abs(float(w or 0.0)) >= 1e-6
             }
+            sweep_candidates = _load_latest_sweep_candidates()
             snap_rows = [
                 c for c in (sweep_candidates or [])
                 if isinstance(c, dict)
@@ -1657,7 +1688,7 @@ def main() -> int:
         default=None,
         help=(
             "Trading strategy to run. Default: intraday-trend during "
-            "RTH (9:30–16:00 ET, Mon–Fri), mean-reversion otherwise."
+            "RTH (9:30-16:00 ET, Mon-Fri), mean-reversion otherwise."
         ),
     )
     ap.add_argument("--dry-run", action="store_true", help="Plan orders but do not submit.")

@@ -55,9 +55,43 @@ VALID_RH_STATUS: tuple[RobinhoodStatus, ...] = (
 RhMode = Literal["shadow", "live"]
 VALID_RH_MODES: tuple[RhMode, ...] = ("shadow", "live")
 
+# ---------------------------------------------------------------------------
+# Active broker backend. Selects which broker the autonomy loop trades
+# through. Defaults to the existing Alpaca paper path so unset / fresh
+# installs keep the current behavior (and all current tests pass). Only an
+# explicit ``robinhood`` selection routes orders through the Robinhood
+# agentic broker -- and even then SHADOW stays the default unless the
+# resolve_mode promotion gate + ENABLE_LIVE_TRADING authorize live.
+# ---------------------------------------------------------------------------
+BrokerBackend = Literal["alpaca_paper", "robinhood"]
+VALID_BROKER_BACKENDS: tuple[BrokerBackend, ...] = ("alpaca_paper", "robinhood")
+
 # Defensive default: $300 first-float cap per the user's stated comfort.
 # Can be raised after 14 days of positive shadow-trading PnL (Phase 6).
 DEFAULT_FLOAT_CAP_USD = 300.0
+
+# Hard upper bound on the user-configurable float cap. Mirrors
+# ``packages.execution.robinhood.ABSOLUTE_MAX_FLOAT_USD`` -- duplicated here
+# (not imported) to keep the onboarding layer free of an execution-layer
+# dependency. Any value the user sets is clamped into ``[0, this]``.
+ABSOLUTE_MAX_FLOAT_USD = 10_000.0
+
+
+def clamp_float_cap(value: float) -> float:
+    """Clamp a requested float cap into ``[0, ABSOLUTE_MAX_FLOAT_USD]``.
+
+    Rejects non-finite input (NaN / inf) by falling back to the safe
+    default -- a NaN cap would otherwise make every comparison False and
+    silently disable the ceiling."""
+    import math
+
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_FLOAT_CAP_USD
+    if not math.isfinite(v):
+        return DEFAULT_FLOAT_CAP_USD
+    return max(0.0, min(v, ABSOLUTE_MAX_FLOAT_USD))
 
 
 @dataclass
@@ -84,6 +118,18 @@ class OnboardingState:
 
     # Robinhood broker mode (shadow vs live). Defaults to shadow.
     rh_mode: RhMode = "shadow"
+
+    # Which broker the autonomy loop trades through. Defaults to the
+    # existing Alpaca paper path; ``robinhood`` opts into the Robinhood
+    # agentic broker (still shadow unless the live gate authorizes).
+    broker_backend: BrokerBackend = "alpaca_paper"
+
+    # Robinhood agentic account number to target for reads + orders. Empty
+    # until discovered (the only account with agentic_allowed=true). Stored
+    # so the broker doesn't re-discover on every call; refreshed by the
+    # auto-select helper. Robinhood rejects trades on non-agentic accounts
+    # at the API level, so this MUST point at the agentic account.
+    rh_account_number: str = ""
 
     # Wizard lifecycle timestamps. Useful for telemetry & support.
     wizard_started_at: str = ""
@@ -125,6 +171,11 @@ def load_onboarding(path: Path | None = None) -> OnboardingState:
     mode_raw = raw.get("rh_mode", "shadow")
     mode: RhMode = mode_raw if mode_raw in VALID_RH_MODES else "shadow"
 
+    backend_raw = raw.get("broker_backend", "alpaca_paper")
+    backend: BrokerBackend = (
+        backend_raw if backend_raw in VALID_BROKER_BACKENDS else "alpaca_paper"
+    )
+
     # Float cap is clamped to non-negative; a corrupted negative value
     # would otherwise nuke risk gating downstream.
     try:
@@ -140,6 +191,8 @@ def load_onboarding(path: Path | None = None) -> OnboardingState:
         live_float_cap_usd=cap,
         accepted_disclaimer_at=str(raw.get("accepted_disclaimer_at", "")),
         rh_mode=mode,
+        broker_backend=backend,
+        rh_account_number=str(raw.get("rh_account_number", "")),
         wizard_started_at=str(raw.get("wizard_started_at", "")),
         wizard_completed_at=str(raw.get("wizard_completed_at", "")),
         display_name=str(raw.get("display_name", "")),

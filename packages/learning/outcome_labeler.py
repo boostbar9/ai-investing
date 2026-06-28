@@ -110,7 +110,7 @@ class Pick:
     extras: dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
-    def from_prediction_row(row: Mapping[str, Any]) -> "Pick | None":
+    def from_prediction_row(row: Mapping[str, Any]) -> Pick | None:
         sym = (row.get("symbol") or "").upper()
         ts_raw = row.get("ts")
         dec = row.get("decision_id") or ""
@@ -175,7 +175,7 @@ class Outcome:
 
 def make_pick_id(decision_id: str, symbol: str) -> str:
     """Stable 16-char hex id so re-runs don't duplicate."""
-    payload = f"{decision_id}|{symbol.upper()}".encode("utf-8")
+    payload = f"{decision_id}|{symbol.upper()}".encode()
     return hashlib.sha1(payload).hexdigest()[:16]
 
 
@@ -238,9 +238,7 @@ def is_pick_settled(
         # Allow late same-day labeling if we're past ~17:00 ET (~22:00 UTC
         # in winter, 21:00 in summer). Conservative: require now to be
         # at least 9h after the pick AND past 21:00 UTC.
-        if now.hour >= 21:
-            return True
-        return False
+        return now.hour >= 21
     return True
 
 
@@ -300,7 +298,7 @@ def resolve_entry_and_exits(
     Bars are expected pre-sorted ascending by ts.
     """
     if not bars:
-        return None, {h: None for h in horizons}
+        return None, dict.fromkeys(horizons)
     if pick_ts.tzinfo is None:
         pick_ts = pick_ts.replace(tzinfo=UTC)
     pick_ts = pick_ts.astimezone(UTC)
@@ -313,7 +311,7 @@ def resolve_entry_and_exits(
             entry_idx = i
             break
     if entry is None or entry_idx is None:
-        return None, {h: None for h in horizons}
+        return None, dict.fromkeys(horizons)
 
     entry_ts = _bar_ts_utc(entry)
     entry_session = _session_date(entry_ts)
@@ -581,7 +579,7 @@ async def backfill_outcomes(
                 now=now,
                 bars_loader=bars_loader,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("outcome labeler %s: %s", pick.symbol, exc)
             report.errors += 1
             continue
@@ -700,7 +698,7 @@ def summary_stats(outcomes: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         if isinstance(r.get("return_eod"), (int, float)):
             slot["sumeod"] += float(r["return_eod"])
             slot["neod"] += 1
-    for reg, slot in by_regime.items():
+    for slot in by_regime.values():
         slot["win_rate"] = round(slot["wins"] / slot["decided"], 4) if slot["decided"] else 0.0
         slot["avg_return_eod"] = round(slot["sumeod"] / slot["neod"], 6) if slot["neod"] else 0.0
         # Trim the working sums from the public payload.
@@ -727,15 +725,15 @@ def backfill_outcomes_sync(
 
 
 __all__ = [
+    "DEFAULT_AGENTS_LOG_PATH",
+    "DEFAULT_HORIZONS",
+    "DEFAULT_OUTCOMES_PATH",
+    "DEFAULT_PREDICTIONS_PATH",
+    "INTRADAY_HORIZONS_MINUTES",
     "AgentScore",
     "BackfillReport",
     "Outcome",
     "Pick",
-    "DEFAULT_HORIZONS",
-    "DEFAULT_OUTCOMES_PATH",
-    "DEFAULT_PREDICTIONS_PATH",
-    "DEFAULT_AGENTS_LOG_PATH",
-    "INTRADAY_HORIZONS_MINUTES",
     "append_outcome",
     "backfill_outcomes",
     "backfill_outcomes_sync",
