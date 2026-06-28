@@ -51,9 +51,11 @@ class _FakeKeyring:
 
 
 @pytest.fixture
-def fake_kr(monkeypatch):
+def fake_kr(monkeypatch, tmp_path):
     fake = _FakeKeyring()
     monkeypatch.setattr(rt, "_keyring", lambda: fake)
+    # Keep the encrypted on-disk store out of the real data/cockpit dir.
+    monkeypatch.setenv("ROBINHOOD_TOKEN_DIR", str(tmp_path))
     return fake
 
 

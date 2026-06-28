@@ -39,9 +39,12 @@ class _FakeKeyring:
 
 
 @pytest.fixture
-def fake_kr(monkeypatch):
+def fake_kr(monkeypatch, tmp_path):
     fake = _FakeKeyring()
     monkeypatch.setattr(rt, "_keyring", lambda: fake)
+    # Redirect the encrypted on-disk store to a tmp dir so tests stay
+    # hermetic and never touch the user's real data/cockpit.
+    monkeypatch.setenv("ROBINHOOD_TOKEN_DIR", str(tmp_path))
     return fake
 
 
@@ -140,6 +143,145 @@ def test_clear_tokens_is_idempotent(fake_kr):
     'Disconnect Robinhood' button should always succeed."""
     rt.clear_tokens()  # no entry stored
     rt.clear_tokens()  # second call also fine
+
+
+# ---------------------------------------------------------------------------
+# Encrypted-file storage: the Windows CredWrite 2.5 KB regression
+# ---------------------------------------------------------------------------
+
+
+def test_save_load_round_trip_large_blob(fake_kr):
+    """A >2.5 KB token set is the exact case that broke Windows Credential
+    Manager (CredWrite 1703). It must now round-trip through the encrypted
+    file store and clear cleanly."""
+    big = "x" * 3000  # > 2560-byte Windows credential limit on its own
+    tokens = rt.TokenSet(
+        access_token=big,
+        refresh_token="y" * 1500,
+        expires_at=98765.0,
+        scope="internal",
+        token_type="Bearer",
+    )
+    payload_len = len(
+        __import__("json").dumps(tokens.to_dict(), separators=(",", ":"))
+    )
+    assert payload_len > 2560, "fixture must exceed the Windows cap to be valid"
+
+    rt.save_tokens(tokens)
+    loaded = rt.load_tokens()
+    assert loaded is not None
+    assert loaded.access_token == big
+    assert loaded.refresh_token == "y" * 1500
+    assert loaded.expires_at == 98765.0
+
+    rt.clear_tokens()
+    assert rt.load_tokens() is None
+
+
+def test_big_blob_is_not_written_to_keyring(fake_kr):
+    """The big secret must live in the file; only the tiny key may hit the
+    keyring (otherwise we'd reproduce the Windows size failure)."""
+    rt.save_tokens(
+        rt.TokenSet(access_token="a" * 4000, refresh_token="r", expires_at=1.0)
+    )
+    # No keyring value may exceed the Windows 2.5 KB credential cap.
+    for value in fake_kr.store.values():
+        assert len(value) <= 2560
+    # The encrypted file must exist on disk.
+    assert rt._token_file().exists()
+
+
+def test_load_migrates_legacy_keyring_blob(fake_kr):
+    """Existing mac/linux users stored the blob directly in keyring. We must
+    read it, return it, and migrate it to the encrypted file."""
+    blob = (
+        '{"access_token":"old-a","refresh_token":"old-r",'
+        '"expires_at":42.0,"scope":"internal","token_type":"Bearer"}'
+    )
+    fake_kr.set_password(rt.KEYRING_SERVICE, rt.KEYRING_USERNAME, blob)
+
+    loaded = rt.load_tokens()
+    assert loaded is not None
+    assert loaded.access_token == "old-a"
+    # Migration: legacy keyring entry gone, encrypted file now present.
+    assert (
+        fake_kr.store.get((rt.KEYRING_SERVICE, rt.KEYRING_USERNAME)) is None
+    )
+    assert rt._token_file().exists()
+    # Subsequent loads come from the file and still match.
+    again = rt.load_tokens()
+    assert again is not None and again.access_token == "old-a"
+
+
+def test_save_succeeds_when_keyring_key_write_fails(fake_kr, monkeypatch):
+    """A keyring failure (the Windows CredWrite case) must NOT crash connect.
+    The key falls back to a 0600 file and the round-trip still works."""
+
+    class _BrokenKeyring(_FakeKeyring):
+        def set_password(self, service, username, value):
+            raise RuntimeError("(1703, 'CredWrite', 'The stub received bad data')")
+
+        def get_password(self, service, username):
+            return None
+
+    monkeypatch.setattr(rt, "_keyring", lambda: _BrokenKeyring())
+
+    tokens = rt.TokenSet(
+        access_token="z" * 3000, refresh_token="r", expires_at=7.0
+    )
+    rt.save_tokens(tokens)  # must not raise
+    assert rt._key_file().exists()  # key fell back to a local file
+    loaded = rt.load_tokens()
+    assert loaded is not None and loaded.access_token == "z" * 3000
+    rt.clear_tokens()
+    assert rt.load_tokens() is None
+
+
+# ---------------------------------------------------------------------------
+# client_id persistence
+# ---------------------------------------------------------------------------
+
+
+def test_client_id_round_trip(fake_kr):
+    rt.save_client_id("client-abc")
+    assert rt.load_client_id() == "client-abc"
+    rt.clear_client_id()
+    assert rt.load_client_id() is None
+
+
+def test_client_id_env_override_wins(fake_kr, monkeypatch):
+    rt.save_client_id("stored-id")
+    monkeypatch.setenv("ROBINHOOD_OAUTH_CLIENT_ID", "env-id")
+    assert rt.load_client_id() == "env-id"
+
+
+def test_client_id_migrates_legacy_keyring(fake_kr):
+    fake_kr.set_password(
+        rt.KEYRING_SERVICE, rt.KEYRING_CLIENT_ID_USERNAME, "legacy-id"
+    )
+    assert rt.load_client_id() == "legacy-id"
+    assert (
+        fake_kr.store.get((rt.KEYRING_SERVICE, rt.KEYRING_CLIENT_ID_USERNAME))
+        is None
+    )
+    assert rt._client_id_file().exists()
+
+
+def test_disconnect_removes_shared_key(fake_kr):
+    """After both tokens and client_id are cleared, the shared Fernet key
+    must be gone too -- a full reset leaves nothing behind."""
+    rt.save_tokens(
+        rt.TokenSet(access_token="a", refresh_token="r", expires_at=1.0)
+    )
+    rt.save_client_id("cid")
+    rt.clear_tokens()
+    rt.clear_client_id()
+    assert (
+        fake_kr.store.get((rt.KEYRING_SERVICE, rt.KEYRING_ENC_KEY_USERNAME))
+        is None
+    )
+    assert not rt._token_file().exists()
+    assert not rt._client_id_file().exists()
 
 
 # ---------------------------------------------------------------------------

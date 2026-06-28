@@ -50,6 +50,11 @@ dependencies = [
   "pyjwt>=2.9",
   # Secrets storage (Windows Credential Manager + cross-platform fallback)
   "keyring>=25.0",
+  # Fernet encryption for the on-disk OAuth token store. Declared explicitly
+  # because on Windows keyring uses Credential Manager and does NOT pull in
+  # cryptography transitively (unlike Linux/SecretStorage); the encrypted
+  # file store needs it present regardless of platform.
+  "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]

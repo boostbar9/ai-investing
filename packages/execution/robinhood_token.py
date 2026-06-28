@@ -2,14 +2,26 @@
 
 Robinhood's agentic-trading platform uses OAuth 2.1 with PKCE (browser-
 based, no client secret). Tokens are short-lived access + long-lived
-refresh; both live in the OS keychain via the ``keyring`` library so
-they don't end up on disk in plaintext.
+refresh.
 
-Why keyring and not a chmod'd file:
-  * Cross-platform: Windows Credential Manager on the user's box,
-    Keychain on macOS, SecretService on Linux.
-  * Survives a workspace wipe (the tokens live in the OS, not the repo).
-  * One less ``did I get the permissions right'' failure mode.
+Storage design (the why):
+  * The OAuth token blob (access + refresh + metadata) routinely exceeds
+    2.5 KB. Windows Credential Manager caps a single credential's secret
+    at ~2560 bytes, so writing the whole blob via ``keyring`` fails on
+    Windows with ``CredWrite (1703, 'The stub received bad data')``.
+  * So the *big* ciphertext lives in an encrypted file under
+    ``data/cockpit/`` (not size-limited), while only the *small* 44-byte
+    Fernet key lives in the OS keychain via ``keyring`` (well under the
+    2.5 KB limit, so that write always succeeds). Small key in keyring,
+    big ciphertext in file.
+  * Encryption at rest uses ``cryptography.fernet`` when available. If
+    that import is missing we degrade to a permission-restricted (0600)
+    obfuscated file and warn -- the connect flow must never crash.
+  * Every keyring call is wrapped in try/except: a keyring failure falls
+    back to a restricted local key file so connect succeeds end-to-end.
+  * Legacy: older installs stored the whole JSON blob directly in keyring.
+    ``load_*`` transparently reads that on miss and migrates to the new
+    encrypted-file store; ``clear_*`` removes both old and new locations.
 
 Public surface intentionally small:
   * save_tokens(access, refresh, expires_at)
@@ -25,6 +37,7 @@ loopback. This module only handles the *storage* side.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import logging
@@ -32,6 +45,7 @@ import os
 import secrets
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -86,9 +100,45 @@ OAUTH_HTTP_TIMEOUT_S = 10.0
 # knows exactly what these secrets are for.
 KEYRING_SERVICE = "ai-investing.robinhood-agentic"
 
-# We store one JSON blob under this username; simpler than juggling three
-# separate keyring entries for access/refresh/expiry.
+# Legacy username: older installs stored the whole token JSON blob here.
+# We still read it for backward-compatible migration, but never write it.
 KEYRING_USERNAME = "default"
+
+# Keyring username for the small (44-byte) Fernet key that encrypts the
+# on-disk token/client_id files. Tiny, so the Windows 2.5 KB cap is a
+# non-issue for *this* entry even though it broke the full token blob.
+KEYRING_ENC_KEY_USERNAME = "enc_key"
+
+# Directory + filenames for the encrypted on-disk stores. ``data/cockpit``
+# is already gitignored. Overridable via env so tests stay hermetic.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_TOKEN_FILE_NAME = ".rh_tokens.enc"
+_CLIENT_ID_FILE_NAME = ".rh_client_id.enc"
+_KEY_FILE_NAME = ".rh_key"  # last-resort key store when keyring is unusable
+
+
+def _storage_dir() -> Path:
+    """Resolve (and create) the directory holding the encrypted stores.
+
+    Honors ``ROBINHOOD_TOKEN_DIR`` so tests can redirect to a tmp path
+    without touching the user's real ``data/cockpit``.
+    """
+    override = os.getenv("ROBINHOOD_TOKEN_DIR")
+    base = Path(override) if override else (REPO_ROOT / "data" / "cockpit")
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _token_file() -> Path:
+    return _storage_dir() / _TOKEN_FILE_NAME
+
+
+def _client_id_file() -> Path:
+    return _storage_dir() / _CLIENT_ID_FILE_NAME
+
+
+def _key_file() -> Path:
+    return _storage_dir() / _KEY_FILE_NAME
 
 # When the access token is within this many seconds of expiry we treat
 # it as stale and force a refresh on the next call. Robinhood tokens
@@ -121,34 +171,173 @@ class TokenSet:
 def _keyring():
     """Lazy import so a test env without keyring backends doesn't blow up
     at module load. The real broker only calls into this when it actually
-    needs to read or write a token."""
+    needs to read or write a key."""
     import keyring
 
     return keyring
 
 
-def save_tokens(tokens: TokenSet) -> None:
-    """Persist the token set to the OS keychain. Atomic on the keyring
-    side -- a partial write can't happen because we serialize the whole
-    blob in one keyring set_password call.
-    """
-    payload = json.dumps(tokens.to_dict(), separators=(",", ":"))
-    _keyring().set_password(KEYRING_SERVICE, KEYRING_USERNAME, payload)
+# ---------------------------------------------------------------------------
+# Encrypted-file storage primitives
+# ---------------------------------------------------------------------------
+#
+# Big ciphertext -> file (no size cap). Small Fernet key -> keyring (or a
+# 0600 file if keyring is unusable). Every keyring touch is wrapped so a
+# CredWrite/CredRead failure on Windows can never crash the connect flow.
+
+# Scheme markers prefixing each on-disk secret so reads can self-describe.
+_SCHEME_FERNET = b"FERNET"
+_SCHEME_PLAIN = b"PLAIN"
 
 
-def load_tokens() -> TokenSet | None:
-    """Return the persisted ``TokenSet`` or ``None`` if no tokens are
-    stored (fresh install, user revoked, etc.). NEVER raises on a
-    missing/corrupt entry -- we return ``None`` so the broker can
-    gracefully degrade to 'not yet connected to Robinhood'.
-    """
+def _fernet():
+    """Return the ``Fernet`` class, or ``None`` if ``cryptography`` isn't
+    importable (we then degrade to a permission-restricted plaintext file)."""
     try:
-        raw = _keyring().get_password(KEYRING_SERVICE, KEYRING_USERNAME)
-    except Exception as exc:  # pragma: no cover - keyring backend issues
-        logger.warning("keyring read failed: %s", exc.__class__.__name__)
+        from cryptography.fernet import Fernet
+
+        return Fernet
+    except Exception:  # pragma: no cover - only when dep is absent
         return None
-    if not raw:
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write bytes with restrictive (0600) perms, replacing atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_bytes(data)
+    # chmod is a no-op-ish on Windows but harmless; suppress fs variance.
+    with contextlib.suppress(OSError):  # pragma: no cover - platform variance
+        os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    with contextlib.suppress(OSError):  # pragma: no cover - platform variance
+        os.chmod(path, 0o600)
+
+
+def _read_key_material() -> bytes | None:
+    """Return the existing Fernet key from keyring, then the 0600 key file,
+    or ``None`` if no key has been provisioned yet."""
+    try:
+        v = _keyring().get_password(KEYRING_SERVICE, KEYRING_ENC_KEY_USERNAME)
+        if v:
+            return v.encode("ascii")
+    except Exception as exc:  # pragma: no cover - backend variance
+        logger.warning("keyring key read failed: %s", exc.__class__.__name__)
+    kf = _key_file()
+    if kf.exists():
+        try:
+            raw = kf.read_bytes().strip()
+            if raw:
+                return raw
+        except OSError as exc:  # pragma: no cover - fs variance
+            logger.warning("key file read failed: %s", exc.__class__.__name__)
+    return None
+
+
+def _get_or_create_key() -> bytes:
+    """Return the encryption key, generating + persisting one on first use.
+
+    Tries keyring first (44 bytes -> well under the Windows 2.5 KB cap). If
+    keyring is unusable, falls back to a 0600 local key file so connect
+    still succeeds end-to-end on a broken-keyring box.
+    """
+    existing = _read_key_material()
+    if existing:
+        return existing
+    fernet = _fernet()
+    key = fernet.generate_key() if fernet else base64.urlsafe_b64encode(os.urandom(32))
+    stored = False
+    try:
+        _keyring().set_password(
+            KEYRING_SERVICE, KEYRING_ENC_KEY_USERNAME, key.decode("ascii")
+        )
+        stored = True
+    except Exception as exc:
+        logger.warning(
+            "keyring key write failed (%s); falling back to 0600 key file",
+            exc.__class__.__name__,
+        )
+    if not stored:
+        _atomic_write_bytes(_key_file(), key)
+    return key
+
+
+def _write_secret(path: Path, plaintext: str) -> None:
+    """Encrypt (if possible) and atomically persist ``plaintext`` to ``path``."""
+    fernet = _fernet()
+    if fernet is not None:
+        key = _get_or_create_key()
+        token = fernet(key).encrypt(plaintext.encode("utf-8"))
+        data = _SCHEME_FERNET + b"\n" + token
+    else:
+        logger.warning(
+            "cryptography unavailable; storing Robinhood secret obfuscated "
+            "in a 0600 file (no real encryption at rest)"
+        )
+        data = _SCHEME_PLAIN + b"\n" + base64.b64encode(plaintext.encode("utf-8"))
+    _atomic_write_bytes(path, data)
+
+
+def _read_secret(path: Path) -> str | None:
+    """Return the decrypted plaintext stored at ``path``, or ``None`` if the
+    file is absent / unreadable / undecryptable."""
+    if not path.exists():
         return None
+    try:
+        data = path.read_bytes()
+    except OSError as exc:  # pragma: no cover - fs variance
+        logger.warning("secret file read failed: %s", exc.__class__.__name__)
+        return None
+    scheme, _, body = data.partition(b"\n")
+    try:
+        if scheme == _SCHEME_FERNET:
+            fernet = _fernet()
+            if fernet is None:
+                return None
+            key = _read_key_material()
+            if key is None:
+                return None
+            return fernet(key).decrypt(body).decode("utf-8")
+        if scheme == _SCHEME_PLAIN:
+            return base64.b64decode(body).decode("utf-8")
+    except Exception as exc:
+        logger.warning("secret decrypt failed: %s", exc.__class__.__name__)
+    return None
+
+
+def _read_old_keyring(username: str) -> str | None:
+    """Best-effort read of the legacy keyring blob (pre-encrypted-file)."""
+    try:
+        return _keyring().get_password(KEYRING_SERVICE, username)
+    except Exception as exc:  # pragma: no cover - backend variance
+        logger.warning("legacy keyring read failed: %s", exc.__class__.__name__)
+        return None
+
+
+def _delete_keyring(username: str) -> None:
+    """Best-effort delete of a keyring entry; missing entry is fine."""
+    try:
+        _keyring().delete_password(KEYRING_SERVICE, username)
+    except Exception as exc:  # pragma: no cover - backend variance
+        logger.debug("keyring delete no-op: %s", exc.__class__.__name__)
+
+
+def _maybe_remove_key() -> None:
+    """Drop the shared Fernet key once no encrypted store references it, so a
+    full disconnect leaves nothing behind."""
+    if _token_file().exists() or _client_id_file().exists():
+        return
+    _delete_keyring(KEYRING_ENC_KEY_USERNAME)
+    kf = _key_file()
+    try:
+        kf.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:  # pragma: no cover - fs variance
+        logger.debug("key file unlink no-op: %s", exc.__class__.__name__)
+
+
+def _parse_token_blob(raw: str) -> TokenSet | None:
     try:
         data = json.loads(raw)
         return TokenSet(
@@ -163,14 +352,60 @@ def load_tokens() -> TokenSet | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Public token API (signatures unchanged)
+# ---------------------------------------------------------------------------
+
+
+def save_tokens(tokens: TokenSet) -> None:
+    """Persist the token set to the encrypted on-disk store.
+
+    The big OAuth blob goes to ``data/cockpit/.rh_tokens.enc`` (no size
+    cap); only the tiny Fernet key touches the OS keychain. This sidesteps
+    the Windows Credential Manager 2.5 KB limit that made the old
+    single-keyring-blob approach fail with CredWrite 1703.
+    """
+    payload = json.dumps(tokens.to_dict(), separators=(",", ":"))
+    _write_secret(_token_file(), payload)
+
+
+def load_tokens() -> TokenSet | None:
+    """Return the persisted ``TokenSet`` or ``None`` if none is stored.
+
+    Reads the new encrypted file first; on miss, falls back to the legacy
+    keyring blob and transparently migrates it to the new store. NEVER
+    raises on a missing/corrupt entry -- returns ``None`` so the broker can
+    degrade to 'not yet connected to Robinhood'.
+    """
+    raw = _read_secret(_token_file())
+    if raw is not None:
+        return _parse_token_blob(raw)
+
+    legacy = _read_old_keyring(KEYRING_USERNAME)
+    if not legacy:
+        return None
+    tokens = _parse_token_blob(legacy)
+    if tokens is not None:
+        # Transparent migration: write to the new store, then drop the old.
+        try:
+            save_tokens(tokens)
+            _delete_keyring(KEYRING_USERNAME)
+        except Exception as exc:  # pragma: no cover - best-effort migration
+            logger.warning("token migration failed: %s", exc.__class__.__name__)
+    return tokens
+
+
 def clear_tokens() -> None:
-    """Delete the stored tokens. Used by the 'Disconnect Robinhood' button
-    in settings and by the reset-onboarding affordance."""
+    """Delete the stored tokens. Removes BOTH the encrypted file and the
+    legacy keyring blob so 'Disconnect Robinhood' fully resets. Idempotent."""
     try:
-        _keyring().delete_password(KEYRING_SERVICE, KEYRING_USERNAME)
-    except Exception as exc:  # pragma: no cover - backend variance
-        # Idempotent: 'delete nonexistent' is fine.
-        logger.debug("keyring delete no-op: %s", exc.__class__.__name__)
+        _token_file().unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:  # pragma: no cover - fs variance
+        logger.debug("token file unlink no-op: %s", exc.__class__.__name__)
+    _delete_keyring(KEYRING_USERNAME)
+    _maybe_remove_key()
 
 
 # ---------------------------------------------------------------------------
@@ -570,31 +805,41 @@ KEYRING_CLIENT_ID_USERNAME = "client_id"
 
 def save_client_id(client_id: str) -> None:
     """Persist the dynamically-registered client_id so refreshes after a
-    restart don't need to re-register."""
-    _keyring().set_password(
-        KEYRING_SERVICE, KEYRING_CLIENT_ID_USERNAME, client_id
-    )
+    restart don't need to re-register. Uses the same encrypted-file store as
+    the tokens (consistent + resilient), not a raw keyring write."""
+    _write_secret(_client_id_file(), client_id)
 
 
 def load_client_id() -> str | None:
-    """Load the persisted client_id, or env override, or None."""
+    """Load the persisted client_id, or env override, or None.
+
+    Reads the new encrypted file first; on miss, falls back to the legacy
+    keyring entry and migrates it forward."""
     env = os.getenv("ROBINHOOD_OAUTH_CLIENT_ID", "")
     if env:
         return env
-    try:
-        return _keyring().get_password(
-            KEYRING_SERVICE, KEYRING_CLIENT_ID_USERNAME
-        )
-    except Exception as exc:  # pragma: no cover - backend variance
-        logger.warning("client_id read failed: %s", exc.__class__.__name__)
+    raw = _read_secret(_client_id_file())
+    if raw:
+        return raw
+    legacy = _read_old_keyring(KEYRING_CLIENT_ID_USERNAME)
+    if not legacy:
         return None
+    try:
+        save_client_id(legacy)
+        _delete_keyring(KEYRING_CLIENT_ID_USERNAME)
+    except Exception as exc:  # pragma: no cover - best-effort migration
+        logger.warning("client_id migration failed: %s", exc.__class__.__name__)
+    return legacy
 
 
 def clear_client_id() -> None:
-    """Remove the stored client_id (part of full disconnect)."""
+    """Remove the stored client_id (part of full disconnect). Removes both
+    the encrypted file and the legacy keyring entry. Idempotent."""
     try:
-        _keyring().delete_password(
-            KEYRING_SERVICE, KEYRING_CLIENT_ID_USERNAME
-        )
-    except Exception as exc:  # pragma: no cover - backend variance
-        logger.debug("client_id delete no-op: %s", exc.__class__.__name__)
+        _client_id_file().unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:  # pragma: no cover - fs variance
+        logger.debug("client_id file unlink no-op: %s", exc.__class__.__name__)
+    _delete_keyring(KEYRING_CLIENT_ID_USERNAME)
+    _maybe_remove_key()

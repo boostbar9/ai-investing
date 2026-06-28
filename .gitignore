@@ -86,3 +86,10 @@ data/audit/
 data/db/
 backups/
 data._tmp/
+
+# Robinhood OAuth secrets (encrypted token/client_id stores + key file).
+# Belt-and-suspenders: data/cockpit/ is already ignored above, but never
+# let these slip in even if the dir rule changes.
+.rh_tokens.enc
+.rh_client_id.enc
+.rh_key
