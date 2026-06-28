@@ -391,6 +391,25 @@ def _score_candidate(
             except Exception:  # pragma: no cover — defensive
                 pass
 
+    # LLM thesis sanity-check nudge. Applied LAST — AFTER scoring, bandit,
+    # regime, and agent-weight steps — and CLAMPED to [-0.10, +0.10] so the
+    # model can only nudge, never override. Absent / rule-based candidates
+    # carry confidence_adjustment == 0.0, so this is a no-op for them and the
+    # rule-based scoring output stays byte-for-byte unchanged. A bear/neutral
+    # verdict on a bullish-scored candidate lowers the score (within clamp);
+    # the risk_flag is surfaced separately on the candidate for the UI.
+    try:
+        adj = float(c.get("confidence_adjustment") or 0.0)
+    except (TypeError, ValueError):
+        adj = 0.0
+    if adj:
+        adj = max(-0.10, min(0.10, adj))
+        score += adj
+        if adj > 0:
+            reasons.append(f"AI thesis +{adj:.2f}")
+        else:
+            reasons.append(f"AI thesis {adj:.2f}")
+
     return (round(score, 4), reasons, features)
 
 

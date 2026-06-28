@@ -126,6 +126,14 @@ class Candidate:
     stocktwits_trending: bool = False
     stocktwits_watchlist: int = 0
     yahoo_news_count: int = 0
+    # LLM thesis enrichment (top-N only). Defaults describe the rule-based
+    # path so a candidate that never went through the LLM looks exactly
+    # like it did before this feature existed (thesis_source="rule",
+    # no direction/risk_flag, zero confidence nudge).
+    thesis_source: str = "rule"          # "rule" | "llm:<model>"
+    direction: str = ""                  # "bull" | "bear" | "neutral" | ""
+    risk_flag: str = ""                  # short plain-language risk, or ""
+    confidence_adjustment: float = 0.0   # bounded nudge in [-0.10, +0.10]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -146,6 +154,11 @@ class SweepResult:
     # source name -> ``{"ok": bool, "count": int, "latency_ms": float}``.
     # Powers the /data-sources cockpit page.
     sources_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # LLM thesis-enrichment status for the dashboard ("AI reasoning: ON
+    # (model: X)" vs OFF). Empty by default so a sweep that never touched
+    # the LLM path serializes the same shape it always did, plus an empty
+    # map. See packages/agents/llm_thesis.enrich_top_candidates.
+    llm_meta: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -157,6 +170,7 @@ class SweepResult:
             "candidates": [c.to_dict() for c in self.candidates],
             "error": self.error,
             "sources_meta": self.sources_meta,
+            "llm_meta": self.llm_meta,
         }
 
 
@@ -877,6 +891,21 @@ async def run_sweep(
                 stocktwits_trending=trending_symbols,
             )
 
+        # Real local-LLM thesis enrichment for the TOP candidates only.
+        # ON by default but gated on a live Ollama + installed model, and
+        # fully fail-safe: any problem leaves the rule-based thesis intact.
+        # When the flag is off / Ollama is unreachable this is a no-op that
+        # leaves every candidate byte-for-byte as the rule-based path
+        # produced it (thesis_source="rule", confidence_adjustment=0.0).
+        llm_meta: dict[str, Any] = {}
+        try:
+            from packages.agents.llm_thesis import enrich_top_candidates
+
+            llm_meta = await enrich_top_candidates(cands)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("llm thesis enrichment skipped: %s", exc)
+            llm_meta = {}
+
         finished = datetime.now(UTC)
         return SweepResult(
             status="done",
@@ -886,6 +915,7 @@ async def run_sweep(
             candidates=cands,
             portfolio_symbols=pf_symbols,
             sources_meta=sources_meta,
+            llm_meta=llm_meta,
         )
 
     except TimeoutError:

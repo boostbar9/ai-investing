@@ -126,6 +126,7 @@
         <div>
           <h2 class="section-h mb-0">Research candidates</h2>
           <div id="research-meta" class="text-xs mt-1" style="color:var(--text-muted);">loading…</div>
+          <div id="research-ai" class="text-xs mt-1" style="color:var(--text-muted);"></div>
         </div>
         <div class="flex items-center gap-2">
           <span id="research-status-pill" class="pill pill-unknown" style="display:none"></span>
@@ -151,6 +152,12 @@
       .pill-idle    { background: #1f2937; color: #9ca3af; }
       .pill-portfolio { background: #064e3b; color: #6ee7b7; }
       .pill-sentiment { background: #1e293b; color: #93c5fd; }
+      /* AI-reasoning provenance + risk badges for the research tile. */
+      .pill-ai   { background: #312e81; color: #c7d2fe; }
+      .pill-rule { background: #1f2937; color: #9ca3af; }
+      .pill-risk { background: #422006; color: #fcd34d; }
+      .ai-on  { color: #6ee7b7; }
+      .ai-off { color: #9ca3af; }
     </style>
     <script>
       // {# Single-file, dependency-free poller. Caches the last fetch so
@@ -159,11 +166,21 @@
       (function(){
         const $list = document.getElementById("research-list");
         const $meta = document.getElementById("research-meta");
+        const $ai = document.getElementById("research-ai");
         const $pill = document.getElementById("research-status-pill");
         const $empty = document.getElementById("research-empty");
         const $refresh = document.getElementById("research-refresh");
         let lastPayload = "";
         let pollTimer = null;
+
+        function esc(s) {
+          // {# Escape untrusted text (LLM-authored thesis / risk flag)
+          //    before injecting into innerHTML. #}
+          return String(s == null ? "" : s).replace(/[&<>"']/g, function (ch) {
+            return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;",
+                      '"': "&quot;", "'": "&#39;" })[ch];
+          });
+        }
 
         const STATUS_LABEL = {
           idle: "idle", running: "running…", done: "done", failed: "failed",
@@ -191,14 +208,24 @@
           for (const c of sweep.candidates.slice(0, 5)) {
             const row = document.createElement("div");
             row.className = "py-2 flex items-center justify-between gap-3";
+            const isLlm = typeof c.thesis_source === "string"
+              && c.thesis_source.indexOf("llm:") === 0;
+            const provBadge = isLlm
+              ? `<span class="pill pill-ai" title="${esc(c.thesis_source)}">AI</span>`
+              : `<span class="pill pill-rule" title="rule-based thesis">rule</span>`;
+            const riskBadge = (c.risk_flag && String(c.risk_flag).trim())
+              ? `<div class="mt-1"><span class="pill pill-risk">⚠ ${esc(c.risk_flag)}</span></div>`
+              : "";
             row.innerHTML = `
               <div class="min-w-0 flex-1">
                 <div class="flex items-center gap-2 mb-1">
-                  <span class="font-mono text-sm font-semibold text-gray-100">${c.symbol}</span>
-                  <span class="pill pill-${c.signal_kind === 'portfolio' ? 'portfolio' : 'sentiment'}">${c.signal_kind}</span>
+                  <span class="font-mono text-sm font-semibold text-gray-100">${esc(c.symbol)}</span>
+                  <span class="pill pill-${c.signal_kind === 'portfolio' ? 'portfolio' : 'sentiment'}">${esc(c.signal_kind)}</span>
+                  ${provBadge}
                   <span class="text-xs text-gray-500">${c.mentions} mentions</span>
                 </div>
-                <div class="text-xs text-gray-400 truncate">${c.thesis}</div>
+                <div class="text-xs text-gray-400 truncate">${esc(c.thesis)}</div>
+                ${riskBadge}
               </div>
               <div class="text-sm font-semibold text-gray-200 whitespace-nowrap">${fmtConfidence(c.confidence)}</div>
             `;
@@ -221,6 +248,24 @@
           }
           if (st && st.status === "running") line += " · sweep in progress…";
           $meta.textContent = line;
+
+          // AI reasoning status (real local-LLM thesis enrichment).
+          if ($ai) {
+            const m = (s && s.llm_meta) || null;
+            if (!m || !m.enabled) {
+              $ai.textContent = "AI reasoning: OFF" + (m && m.reason ? ` — ${esc(m.reason)}` : "");
+              $ai.className = "text-xs mt-1 ai-off";
+            } else if (m.active) {
+              const model = m.model ? ` (model: ${esc(m.model)})` : "";
+              const cnt = (typeof m.enriched === "number" && typeof m.attempted === "number")
+                ? ` · ${m.enriched}/${m.attempted} enriched` : "";
+              $ai.textContent = `AI reasoning: ON${model}${cnt}`;
+              $ai.className = "text-xs mt-1 ai-on";
+            } else {
+              $ai.textContent = "AI reasoning: OFF — model not ready" + (m.reason ? ` (${esc(m.reason)})` : "");
+              $ai.className = "text-xs mt-1 ai-off";
+            }
+          }
         }
 
         async function fetchOnce() {
