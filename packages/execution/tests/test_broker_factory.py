@@ -82,13 +82,18 @@ def _no_env_override(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_default_is_alpaca_paper(isolated_onboarding):
-    """No config file at all -> Alpaca paper."""
-    broker = bf.resolve_active_broker()
-    assert isinstance(broker, AlpacaPaperBroker)
+def test_default_is_robinhood_paper(isolated_onboarding):
+    """No config file at all -> Robinhood-realistic paper simulator (the
+    new training-ready default). Read-only; never live."""
+    from packages.execution.robinhood_paper import RobinhoodPaperBroker
+
+    sel = bf.resolve_broker_selection()
+    assert isinstance(sel.broker, RobinhoodPaperBroker)
+    assert sel.effective_backend == bf.BACKEND_ROBINHOOD_PAPER
+    assert not sel.fell_back
 
 
-def test_unset_backend_is_alpaca_paper(isolated_onboarding):
+def test_explicit_alpaca_paper_still_selectable(isolated_onboarding):
     _write_onboarding(isolated_onboarding, backend="alpaca_paper")
     sel = bf.resolve_broker_selection()
     assert isinstance(sel.broker, AlpacaPaperBroker)
@@ -102,10 +107,14 @@ def test_unknown_backend_falls_back_to_paper(isolated_onboarding, monkeypatch):
     assert isinstance(broker, AlpacaPaperBroker)
 
 
-def test_corrupt_onboarding_falls_back_to_paper(isolated_onboarding):
+def test_corrupt_onboarding_falls_back_to_shadow_default(isolated_onboarding):
+    """Corrupt config => the safe shadow default (Robinhood-realistic sim),
+    which is read-only and never live."""
+    from packages.execution.robinhood_paper import RobinhoodPaperBroker
+
     isolated_onboarding.write_text("{ not valid json")
     broker = bf.resolve_active_broker()
-    assert isinstance(broker, AlpacaPaperBroker)
+    assert isinstance(broker, RobinhoodPaperBroker)
 
 
 def test_robinhood_selected_but_not_connected_falls_back(
@@ -172,9 +181,11 @@ def test_robinhood_selected_stays_shadow_without_live_gate(
 # ---------------------------------------------------------------------------
 
 
-def test_status_default_alpaca(isolated_onboarding):
+def test_status_default_robinhood_paper(isolated_onboarding):
+    """Default now resolves to the read-only Robinhood-realistic sim, which
+    is always shadow / never live."""
     status = bf.active_broker_status()
-    assert status["effective_backend"] == bf.BACKEND_ALPACA_PAPER
+    assert status["effective_backend"] == bf.BACKEND_ROBINHOOD_PAPER
     assert status["shadow"] is True
     assert status["live"] is False
     assert status["cap_usd"] == 300.0

@@ -127,9 +127,9 @@
         <div class="mt-3">
           <div class="flex items-center justify-between text-sm mb-1">
             <span style="color:var(--text-secondary);">Minimum confidence</span>
-            <span class="mono" id="tc-conf-label">60%</span>
+            <span class="mono" id="tc-conf-label">55%</span>
           </div>
-          <input id="tc-conf-slider" type="range" min="0" max="100" step="1" value="60" class="w-full" />
+          <input id="tc-conf-slider" type="range" min="0" max="100" step="1" value="55" class="w-full" />
           <div class="tc-help">Moving this switches you to a <strong>Custom</strong> setting.</div>
         </div>
       </details>
@@ -155,7 +155,7 @@
           <option value="robinhood_paper">Robinhood-realistic paper (live prices, spread + slippage)</option>
           <option value="robinhood">Robinhood agentic (shadow / live-gated)</option>
         </select>
-        <div class="tc-help">Pick how practice trades are simulated. Default is unchanged unless you switch it.</div>
+        <div class="tc-help">Pick how practice trades are simulated. Ships on <strong>Robinhood-realistic paper</strong> (read-only, never places a real order); switch any time.</div>
       </div>
 
       <div class="tc-field">

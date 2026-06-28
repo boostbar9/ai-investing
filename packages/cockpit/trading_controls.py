@@ -73,7 +73,7 @@ VALID_PENDING_MODES: tuple[PendingMode, ...] = ("auto_when_qualified",)
 # Safe defaults.
 DEFAULT_MAX_TRADES_PER_DAY = 5
 DEFAULT_MAX_OPEN_POSITIONS = 3
-DEFAULT_MIN_CONFIDENCE = 0.60  # = Balanced-ish; user can move it.
+DEFAULT_MIN_CONFIDENCE = 0.55  # = Balanced preset; user can move it.
 DEFAULT_PER_TRADE_FALLBACK = 50.0  # capped at total budget on load.
 
 # Clamp ceilings (FAIL SAFE bounds).
@@ -169,7 +169,7 @@ class TradingControls:
     max_trades_per_day: int = DEFAULT_MAX_TRADES_PER_DAY
     max_open_positions: int = DEFAULT_MAX_OPEN_POSITIONS
     min_confidence: float = DEFAULT_MIN_CONFIDENCE
-    risk_preset: RiskPreset = "custom"
+    risk_preset: RiskPreset = "balanced"
     pending_mode: PendingMode = "auto_when_qualified"
 
     # --- Paper realism (Robinhood-realistic simulator) ---
@@ -250,7 +250,7 @@ def _coerce(raw: dict[str, Any], budget: float) -> TradingControls:
         budget,
         min(DEFAULT_PER_TRADE_FALLBACK, budget),
     )
-    preset = normalize_preset(raw.get("risk_preset", "custom"))
+    preset = normalize_preset(raw.get("risk_preset", "balanced"))
     # If a known preset is stored, the threshold it implies wins (keeps the
     # two coherent even if the file was hand-edited).
     if preset in PRESET_CONFIDENCE:

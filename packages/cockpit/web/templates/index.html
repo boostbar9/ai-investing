@@ -45,6 +45,79 @@
       })();
     </script>
 
+    <!-- ==== Training-mode banner: status badge + one-tap Go Live ====
+         Always-visible reassurance that the bot is safe (practice only)
+         plus a single obvious path to the GATED promotion flow. The
+         "Go live" button only NAVIGATES to /promote (the existing
+         confirmed + readiness-gated page) — it never flips to live here. -->
+    <section id="training-banner" class="card mb-5"
+             style="border:1px solid var(--border-strong);padding:16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+      <span id="training-badge" class="pill"
+            style="flex:none;font-weight:700;letter-spacing:.02em;background:#064e3b;color:#6ee7b7;padding:6px 12px;font-size:12px;">
+        TRAINING MODE — practice, no real money
+      </span>
+      <div style="flex:1 1 260px;min-width:220px;">
+        <div class="text-sm" style="color:var(--text-primary);font-weight:600;">
+          You're in training mode. Go live when you're ready — we'll walk you through it.
+        </div>
+        <div id="training-autopilot" class="text-xs mt-1" style="color:var(--text-secondary);">
+          Checking autopilot…
+        </div>
+      </div>
+      <a id="go-live-btn" href="/promote" class="btn btn-primary btn-sm"
+         style="flex:none;white-space:nowrap;"
+         title="Opens the go-live checklist — nothing goes live until you confirm there.">
+        Go live →
+      </a>
+    </section>
+    <script>
+      // {# Self-contained poller for the training banner. Reads the active
+      //    broker posture (shadow vs live) + the autopilot status. Fails
+      //    safe: any error keeps the reassuring TRAINING badge shown. #}
+      (function(){
+        const $badge = document.getElementById("training-badge");
+        const $auto  = document.getElementById("training-autopilot");
+        const $btn   = document.getElementById("go-live-btn");
+        function setLive() {
+          $badge.textContent = "LIVE — real money";
+          $badge.style.background = "#7f1d1d";
+          $badge.style.color = "#fecaca";
+          $btn.textContent = "Manage live →";
+        }
+        function setTraining() {
+          $badge.textContent = "TRAINING MODE — practice, no real money";
+          $badge.style.background = "#064e3b";
+          $badge.style.color = "#6ee7b7";
+          $btn.textContent = "Go live →";
+        }
+        async function refresh() {
+          let live = false;
+          try {
+            const r = await fetch("/api/onboarding/robinhood/status");
+            if (r.ok) {
+              const s = await r.json();
+              live = !!(s && s.active_broker && s.active_broker.live);
+            }
+          } catch (_) { /* fail safe: stay training */ }
+          live ? setLive() : setTraining();
+          try {
+            const a = await fetch("/api/autonomy");
+            if (a.ok) {
+              const j = await a.json();
+              const running = !!(j && (j.running || j.enabled));
+              $auto.textContent = running
+                ? (live
+                    ? "Autopilot running — LIVE"
+                    : "Autopilot running in training mode")
+                : "Autopilot is paused — open Autopilot to start it.";
+            }
+          } catch (_) { $auto.textContent = ""; }
+        }
+        refresh();
+        setInterval(refresh, 15000);
+      })();
+    </script>
+
     <!-- {# Research Candidates tile (Phase 1D). Renders a compact list of
          top candidates from the latest boot-time sweep. Polls /api/research-sweep
          once on load and again every 15s while a sweep is running. #} -->

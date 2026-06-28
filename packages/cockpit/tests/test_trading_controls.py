@@ -205,6 +205,11 @@ def test_defaults_when_unset(isolated):
     assert c.max_per_trade_usd == pytest.approx(50.0)
     assert c.max_trades_per_day == 5
     assert c.max_open_positions == 3
+    # Training-ready defaults: Balanced preset (>=55%) + real RH cash.
+    assert c.risk_preset == "balanced"
+    assert c.min_confidence == pytest.approx(0.55)
+    assert c.paper_use_real_cash is True
+    assert c.paper_start_balance_usd is None
 
 
 def test_budget_clamped_to_ceiling(isolated):

@@ -56,11 +56,13 @@ def _good_tokens() -> TokenSet:
 # ---------------------------------------------------------------------------
 
 
-def test_status_reports_default_alpaca_paper(isolated_onboarding, client):
+def test_status_reports_default_robinhood_paper(isolated_onboarding, client):
+    """Default now resolves to the read-only Robinhood-realistic sim; still
+    always shadow / never live."""
     r = client.get("/api/onboarding/robinhood/status")
     assert r.status_code == 200
     ab = r.json()["active_broker"]
-    assert ab["effective_backend"] == "alpaca_paper"
+    assert ab["effective_backend"] == "robinhood_paper"
     assert ab["shadow"] is True
     assert ab["live"] is False
     assert ab["cap_usd"] == pytest.approx(300.0)
@@ -105,10 +107,10 @@ def test_status_robinhood_not_connected_falls_back(isolated_onboarding, client):
 # ---------------------------------------------------------------------------
 
 
-def test_get_backend_defaults_to_alpaca_paper(isolated_onboarding, client):
+def test_get_backend_defaults_to_robinhood_paper(isolated_onboarding, client):
     r = client.get("/api/onboarding/broker-backend")
     assert r.status_code == 200
-    assert r.json()["backend"] == "alpaca_paper"
+    assert r.json()["backend"] == "robinhood_paper"
 
 
 def test_set_backend_robinhood_persists_and_stays_shadow(

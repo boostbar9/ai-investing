@@ -124,9 +124,13 @@ class OnboardingState:
     rh_mode: RhMode = "shadow"
 
     # Which broker the autonomy loop trades through. Defaults to the
-    # existing Alpaca paper path; ``robinhood`` opts into the Robinhood
-    # agentic broker (still shadow unless the live gate authorizes).
-    broker_backend: BrokerBackend = "alpaca_paper"
+    # Robinhood-realistic paper simulator (``robinhood_paper``): live
+    # read-only RH quotes + your real buying power + spread/slippage, with
+    # SIMULATED fills. It NEVER places a real order and selecting it does
+    # NOT enable live trading (still shadow unless the live gate authorizes).
+    # ``alpaca_paper`` and the live ``robinhood`` agentic broker stay
+    # selectable.
+    broker_backend: BrokerBackend = "robinhood_paper"
 
     # Robinhood agentic account number to target for reads + orders. Empty
     # until discovered (the only account with agentic_allowed=true). Stored
@@ -175,9 +179,9 @@ def load_onboarding(path: Path | None = None) -> OnboardingState:
     mode_raw = raw.get("rh_mode", "shadow")
     mode: RhMode = mode_raw if mode_raw in VALID_RH_MODES else "shadow"
 
-    backend_raw = raw.get("broker_backend", "alpaca_paper")
+    backend_raw = raw.get("broker_backend", "robinhood_paper")
     backend: BrokerBackend = (
-        backend_raw if backend_raw in VALID_BROKER_BACKENDS else "alpaca_paper"
+        backend_raw if backend_raw in VALID_BROKER_BACKENDS else "robinhood_paper"
     )
 
     # Float cap is clamped to non-negative; a corrupted negative value
