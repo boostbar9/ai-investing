@@ -1106,3 +1106,89 @@ kbd {
   .card { background: white; border: 1px solid #ddd; box-shadow: none; backdrop-filter: none; }
   .topbar { display: none; }
 }
+
+/* ----------------- Primary nav ----------------- */
+
+/* On desktop the page nav is a wrapping row of pill links. The trailing
+ * shortcuts (?) button keeps its ml-auto push. */
+.nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: var(--sp-5);
+}
+
+/* ----------------- Mobile-first responsive (tablet ≤768px) ----------------- */
+
+@media (max-width: 768px) {
+  /* Slightly tighter gutters + card padding on tablets. */
+  .max-w-7xl.mx-auto { padding-left: var(--sp-4); padding-right: var(--sp-4); }
+  .card.p-5 { padding: var(--sp-4); }
+}
+
+/* ----------------- Mobile-first responsive (phone ≤640px) ----------------- */
+
+@media (max-width: 640px) {
+  /* Tighter page gutters so cards get more usable width. */
+  .max-w-7xl.mx-auto { padding-left: var(--sp-3); padding-right: var(--sp-3); }
+
+  /* Nav becomes a single horizontal-scroll strip — no awkward tall wrap. */
+  .nav {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    gap: var(--sp-2);
+    margin-bottom: var(--sp-4);
+    padding-bottom: 4px;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .nav::-webkit-scrollbar { display: none; }
+  .nav-link { flex: 0 0 auto; white-space: nowrap; }
+  /* Keep the shortcuts button inline at the end of the strip, not pushed
+   * off-screen by an auto margin in an overflow container. */
+  .nav .ml-auto { margin-left: var(--sp-1); }
+
+  /* Compact cards — less padding, slightly tighter radius. */
+  .card { border-radius: var(--r-md); }
+  .card.p-5, .card.p-4 { padding: var(--sp-3); }
+
+  /* Tighten the global vertical rhythm (Tailwind utilities → !important). */
+  .mb-5 { margin-bottom: var(--sp-4) !important; }
+  .mb-4 { margin-bottom: var(--sp-3) !important; }
+  .gap-4 { gap: var(--sp-3) !important; }
+
+  /* Stat tiles: smaller numerics so 2-col tiles stay compact. */
+  .stat-val { font-size: 1.3rem; }
+  .stat-val.small { font-size: 1.05rem; }
+  .stat-label { font-size: 0.66rem; margin-bottom: 4px; }
+
+  /* Hero: trim padding and headline size for narrow screens. */
+  .seer-hero { padding: var(--sp-4); gap: var(--sp-3); }
+  .seer-hero-title { font-size: 1.45rem; }
+  .seer-hero-sub { font-size: 0.88rem; }
+  .seer-hero-right { gap: var(--sp-2); }
+
+  /* Connection banner reads cleanly when stacked. */
+  #conn-banner { padding: var(--sp-3); gap: 10px; }
+
+  /* Comfortable tap targets for the compact buttons used across the page. */
+  .btn-sm { padding: 9px 14px; min-height: 38px; }
+
+  /* Section heads sit closer to their content. */
+  .seer-row-head { margin-bottom: var(--sp-2) !important; }
+
+  /* Compact the internal vertical rhythm inside cards (scoped so it only
+   * tightens dense card internals, never global layout). These beat the
+   * single-class Tailwind utilities on specificity alone. */
+  .card .mt-4 { margin-top: var(--sp-3); }
+  .card .pt-4 { padding-top: var(--sp-3); }
+  .card .mt-3 { margin-top: var(--sp-2); }
+  .card .mb-3 { margin-bottom: var(--sp-2); }
+  .card .p-3 { padding: var(--sp-2); }
+  .card .section-h { margin-bottom: var(--sp-2); }
+
+  /* Pipeline diagrams use a roomy 1.8 line-height — trim on phones. */
+  #pipe-alpaca .mono, #pipe-robinhood .mono { line-height: 1.55 !important; }
+}
