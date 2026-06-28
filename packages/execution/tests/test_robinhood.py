@@ -755,7 +755,7 @@ def test_first_float_picks_first_parseable_key():
 
 class _MultiToolMcpClient:
     """MCP fake that returns a different payload per tool name so we can
-    exercise ``account_snapshot`` (which calls get_accounts + portfolio +
+    exercise ``account_snapshot`` (which calls get_accounts + get_portfolio +
     get_equity_positions). Records every call for assertions."""
 
     def __init__(self, *, responses=None, raises_for=None):
@@ -814,7 +814,7 @@ async def test_account_snapshot_is_read_only_in_shadow_mode(
                     {"buying_power": "500.00", "cash": "123.45"}
                 ]
             },
-            "portfolio": {"equity": "1750.00"},
+            "get_portfolio": {"equity": "1750.00"},
             "get_equity_positions": {
                 "positions": [
                     {"symbol": "NVDA", "qty": 2, "avg_price": 100.0}
@@ -831,7 +831,7 @@ async def test_account_snapshot_is_read_only_in_shadow_mode(
 
     called = {name for name, _ in fake.calls}
     # ONLY read tools -- nothing that mutates the account.
-    assert called <= {"get_accounts", "portfolio", "get_equity_positions"}
+    assert called <= {"get_accounts", "get_portfolio", "get_equity_positions"}
     assert "place_equity_order" not in called
     assert "cancel_order" not in called
     # Parsed top-line numbers.
@@ -856,7 +856,7 @@ async def test_account_snapshot_parses_mcp_content_blocks(
             "get_accounts": [
                 {"type": "text", "text": '{"accounts": [{"buying_power": 300}]}'}
             ],
-            "portfolio": [
+            "get_portfolio": [
                 {"type": "text", "text": '{"market_value": "2200.50"}'}
             ],
             "get_equity_positions": [
@@ -885,7 +885,7 @@ async def test_account_snapshot_degrades_on_partial_failure(
     monkeypatch.setattr(rh_mod, "is_connected", lambda: True)
     fake = _MultiToolMcpClient(
         responses={
-            "portfolio": {"equity": "999.00"},
+            "get_portfolio": {"equity": "999.00"},
             "get_equity_positions": {"positions": []},
         },
         raises_for={"get_accounts": McpError("accounts endpoint down")},

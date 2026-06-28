@@ -305,6 +305,35 @@ def _first_float(obj: dict[str, Any], keys: tuple[str, ...]) -> float | None:
     return None
 
 
+def _shape_hint(content: Any) -> str:
+    """Describe the STRUCTURE of an MCP payload without leaking any values.
+
+    Returns something like ``dict(keys=[accounts,results])`` or
+    ``list[dict(keys=[account_number,type])]`` so an unexpected empty
+    response is debuggable from the cockpit's ``errors`` array without ever
+    exposing account numbers, balances, or other PII."""
+    obj = _unwrap_content(content)
+    if isinstance(obj, dict):
+        return f"dict(keys=[{','.join(sorted(map(str, obj.keys())))}])"
+    if isinstance(obj, list):
+        if not obj:
+            return "list[empty]"
+        first = obj[0]
+        if isinstance(first, dict):
+            return f"list[dict(keys=[{','.join(sorted(map(str, first.keys())))}])]"
+        return f"list[{type(first).__name__}]"
+    return type(obj).__name__
+
+
+def _mask_account(number: str) -> str:
+    """Mask an account number to its last 4 chars for display (``...1234``).
+    Short/empty numbers degrade safely."""
+    s = str(number or "").strip()
+    if len(s) <= 4:
+        return s
+    return f"...{s[-4:]}"
+
+
 # ---------------------------------------------------------------------------
 # Broker
 # ---------------------------------------------------------------------------
@@ -531,8 +560,8 @@ class RobinhoodAgenticBroker(Broker):
         it never submits, reviews, or cancels an order. It calls the
         real Robinhood agentic-trading read tools:
 
-          * ``get_accounts``  -> account list (cash / buying power)
-          * ``portfolio``     -> portfolio equity + day change
+          * ``get_accounts``   -> account list (cash / buying power)
+          * ``get_portfolio``  -> portfolio equity + day change
           * ``get_equity_positions`` (via :meth:`positions`)
 
         Returns a plain dict (never raises) shaped for the cockpit +
@@ -558,6 +587,7 @@ class RobinhoodAgenticBroker(Broker):
             "mode": "shadow" if self._is_shadow() else "live",
             "as_of": datetime.now(UTC).isoformat(timespec="seconds"),
             "accounts": [],
+            "account_masked": None,
             "portfolio": None,
             "positions": [],
             "buying_power": None,
@@ -580,6 +610,10 @@ class RobinhoodAgenticBroker(Broker):
             return snap
 
         # ---- accounts (cash + buying power) -----------------------------
+        # MUST run first: the agentic-trading server's account-scoped tools
+        # (``get_portfolio``, ``get_equity_positions``) require an
+        # ``account_number`` argument, so we resolve it from the account
+        # list before any downstream call.
         try:
             res = await client.call_tool("get_accounts", {})
             accounts = _normalize_rows(
@@ -593,8 +627,21 @@ class RobinhoodAgenticBroker(Broker):
                     self._account_number = picked
             if isinstance(accounts, list):
                 snap["accounts"] = [a for a in accounts if isinstance(a, dict)]
+            if not snap["accounts"]:
+                # Valid tool, empty list -- record a keys-only structural
+                # diagnostic (never values/secrets) so a shape change is
+                # debuggable from the cockpit without re-deploying.
+                snap["errors"].append(
+                    f"get_accounts: empty; payload shape="
+                    f"{_shape_hint(res.content)}"
+                )
         except McpError as exc:
             snap["errors"].append(f"get_accounts: {exc}")
+
+        # Expose a masked form of the resolved account so the UI can show
+        # *which* account is wired up without leaking the full number.
+        if self._account_number:
+            snap["account_masked"] = _mask_account(self._account_number)
 
         # Derive top-line cash / buying power from the first account that
         # exposes them (field names vary across server versions).
@@ -609,8 +656,11 @@ class RobinhoodAgenticBroker(Broker):
                 )
 
         # ---- portfolio (total equity + day change) ----------------------
+        # Real agentic-trading tool name is ``get_portfolio`` (NOT the bare
+        # ``portfolio`` we guessed before, which 404'd as an unknown tool).
+        # Carries ``account_number`` via _acct_args now that it's resolved.
         try:
-            res = await client.call_tool("portfolio", self._acct_args())
+            res = await client.call_tool("get_portfolio", self._acct_args())
             portfolio = _normalize_obj(res.content)
             if portfolio:
                 snap["portfolio"] = portfolio
@@ -1184,28 +1234,62 @@ def _account_number_of(acct: dict[str, Any]) -> str:
     return ""
 
 
-def select_agentic_account(accounts: list[Any]) -> str | None:
-    """Pick the agentic-allowed account number from a ``get_accounts`` list.
+def _account_is_active(acct: dict[str, Any]) -> bool:
+    """True if an account dict isn't flagged deactivated/closed/inactive.
+    (Looser than :func:`_is_agentic_account` -- does NOT require the agentic
+    flag; used only for the single-account auto-select fallback.)"""
+    for dead_key in ("deactivated", "is_deactivated", "closed", "is_closed"):
+        if bool(acct.get(dead_key)):
+            return False
+    status = str(acct.get("status") or acct.get("state") or "active").lower()
+    return status not in {"deactivated", "closed", "inactive", "disabled"}
 
-    Returns the FIRST active ``agentic_allowed=true`` account's number, or
-    ``None`` if none qualifies (fail safe -- the caller must NOT enable
-    Robinhood trading without one). Logs which account was chosen and warns
-    if multiple agentic accounts exist (we take the first active one)."""
+
+def select_agentic_account(accounts: list[Any]) -> str | None:
+    """Pick the account number to target from a ``get_accounts`` list.
+
+    Resolution order:
+      1. The FIRST active ``agentic_allowed=true`` account (the canonical
+         case; warns if several exist and takes the first active one).
+      2. **Single-account auto-select** -- if NO account carries the agentic
+         flag but exactly ONE active account exists, target it. The user is
+         often remote (phone) and can't click a chooser, and Robinhood only
+         exposes agentic-eligible accounts through this server anyway. Reads
+         are harmless; the live order path is still gated independently and
+         Robinhood itself rejects orders on a non-agentic account.
+      3. Otherwise ``None`` (fail safe -- ambiguous multi-account with no
+         agentic flag must be resolved by an explicit user choice).
+    """
     agentic = [
         a
         for a in accounts
         if isinstance(a, dict) and _is_agentic_account(a) and _account_number_of(a)
     ]
-    if not agentic:
-        return None
-    if len(agentic) > 1:
-        logger.warning(
-            "robinhood: %d agentic accounts found -- using the first active one",
-            len(agentic),
+    if agentic:
+        if len(agentic) > 1:
+            logger.warning(
+                "robinhood: %d agentic accounts found -- using the first active one",
+                len(agentic),
+            )
+        chosen = _account_number_of(agentic[0])
+        logger.info("robinhood: selected agentic account ...%s", chosen[-4:])
+        return chosen
+
+    # Fallback: exactly one active account with a number, no agentic flag set.
+    active = [
+        a
+        for a in accounts
+        if isinstance(a, dict) and _account_is_active(a) and _account_number_of(a)
+    ]
+    if len(active) == 1:
+        chosen = _account_number_of(active[0])
+        logger.info(
+            "robinhood: single active account ...%s auto-selected (no agentic "
+            "flag present)",
+            chosen[-4:],
         )
-    chosen = _account_number_of(agentic[0])
-    logger.info("robinhood: selected agentic account ...%s", chosen[-4:])
-    return chosen
+        return chosen
+    return None
 
 
 async def discover_agentic_account_number(
