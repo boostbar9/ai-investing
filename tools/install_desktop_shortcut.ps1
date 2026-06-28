@@ -26,7 +26,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-$Launcher = Join-Path $RepoRoot "tools\start_cockpit.ps1"
+# Prefer the root one-click START.cmd entry point; fall back to the
+# PS1 launcher if the cmd wrapper is somehow missing.
+$StartCmd = Join-Path $RepoRoot "START.cmd"
+$Launcher = if (Test-Path $StartCmd) { $StartCmd } else { Join-Path $RepoRoot "tools\start_cockpit.ps1" }
 $IconSource = Join-Path $env:SystemRoot "System32\imageres.dll"   # built-in Windows icons
 $DesktopPath = [Environment]::GetFolderPath("Desktop")
 $ShortcutPath = Join-Path $DesktopPath ("$Name.lnk")
@@ -45,8 +48,14 @@ Write-Host ""
 
 $shell = New-Object -ComObject WScript.Shell
 $lnk = $shell.CreateShortcut($ShortcutPath)
-$lnk.TargetPath = "powershell.exe"
-$lnk.Arguments = "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$Launcher`""
+if ($Launcher -like "*.cmd") {
+    # Point straight at the cmd wrapper -- simplest, no policy flags needed.
+    $lnk.TargetPath = $Launcher
+    $lnk.Arguments = ""
+} else {
+    $lnk.TargetPath = "powershell.exe"
+    $lnk.Arguments = "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$Launcher`""
+}
 $lnk.WorkingDirectory = $RepoRoot
 $lnk.WindowStyle = 1
 $lnk.Description = "Starts the ai-investing cockpit and remote tunnel."

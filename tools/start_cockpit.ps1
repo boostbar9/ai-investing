@@ -73,6 +73,58 @@ function New-RemoteToken {
     return -join ($bytes | ForEach-Object { $_.ToString("x2") })
 }
 
+function Publish-HandleViaGh {
+    # Fallback publisher: when `git push` fails (commonly because local
+    # git has no GitHub credentials configured), use the GitHub CLI to
+    # PUT the handle file straight onto the cockpit-handle branch via the
+    # REST contents API. `gh` carries its own auth (gh auth login), so it
+    # works even when plain git push gets exit=128.
+    #
+    # Returns $true on success, $false if gh is missing/unauthenticated
+    # or the API call fails -- caller then falls back to manual paste.
+    param(
+        [string]$HandlePath,
+        [string]$Branch
+    )
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    if (-not $gh) {
+        Write-Host "  gh CLI not installed; cannot use API fallback." -ForegroundColor DarkGray
+        return $false
+    }
+    try {
+        # Resolve owner/repo from origin remote.
+        $originUrl = (& git remote get-url origin 2>$null)
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($originUrl)) { return $false }
+        if ($originUrl -match "github\.com[:/]([^/]+)/([^/.]+)") {
+            $owner = $matches[1]; $repo = $matches[2]
+        } else { return $false }
+
+        $apiPath = "repos/$owner/$repo/contents/data/cockpit/remote_handle.json"
+        $contentB64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($HandlePath))
+        $msg = "cockpit: publish handle " + (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+
+        # Need the current blob sha on that branch (if the file exists) to update it.
+        $sha = $null
+        $existing = (& gh api "$apiPath`?ref=$Branch" 2>$null | ConvertFrom-Json)
+        if ($LASTEXITCODE -eq 0 -and $existing.sha) { $sha = $existing.sha }
+
+        $args = @("api", "--method", "PUT", $apiPath,
+                  "-f", "message=$msg",
+                  "-f", "content=$contentB64",
+                  "-f", "branch=$Branch")
+        if ($sha) { $args += @("-f", "sha=$sha") }
+
+        & gh @args *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Published handle via gh API to origin/$Branch" -ForegroundColor Green
+            return $true
+        }
+        return $false
+    } catch {
+        return $false
+    }
+}
+
 function Install-Cloudflared {
     if (Test-Path $CloudflaredExe) { return $CloudflaredExe }
     Write-Host "cloudflared not found -- downloading to $BinDir ..." -ForegroundColor Yellow
@@ -298,8 +350,13 @@ if (-not $NoPublish) {
                     Write-Host "Published handle to origin/$branchName" -ForegroundColor Green
                     $publishOk = $true
                 } else {
-                    Write-Host "Publish to origin failed (exit=$LASTEXITCODE)." -ForegroundColor Yellow
-                    Write-Host "Handle is still available locally at $HandlePath" -ForegroundColor Yellow
+                    Write-Host "git push failed (exit=$LASTEXITCODE); trying GitHub CLI fallback..." -ForegroundColor Yellow
+                    $publishOk = Publish-HandleViaGh -HandlePath $HandlePath -Branch $branchName
+                    if (-not $publishOk) {
+                        Write-Host "Publish to origin failed (git push + gh both unavailable)." -ForegroundColor Yellow
+                        Write-Host "Handle is still available locally at $HandlePath" -ForegroundColor Yellow
+                        Write-Host "  Agent fallback: paste the Public URL + Token shown below." -ForegroundColor DarkGray
+                    }
                 }
             } finally {
                 Pop-Location

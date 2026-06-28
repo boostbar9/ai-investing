@@ -248,6 +248,26 @@
       </div>
     </header>
 
+    <!-- ==== Connection status banner (always visible, top of page) ==== -->
+    <!-- One glance answers: which broker is active, am I on real money
+         or practice, and is the agent connected? This is the core thing
+         the user asked to be crystal clear. -->
+    <a id="conn-banner" href="#rh-control-center"
+       class="card p-3 mb-5 block"
+       style="text-decoration:none;border:1px solid var(--border);display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+      <span id="conn-banner-dot" class="pill pill-muted" style="flex:none;">checking…</span>
+      <div style="flex:1 1 280px;min-width:240px;">
+        <div class="font-semibold text-sm" style="color:var(--text-primary);">
+          <span id="conn-banner-broker">Loading broker…</span>
+          <span id="conn-banner-mode-pill" class="pill pill-muted" style="margin-left:8px;">—</span>
+        </div>
+        <div id="conn-banner-sub" class="text-xs mt-0.5" style="color:var(--text-secondary);">
+          Click to open the Brokerage &amp; Live Trading control center.
+        </div>
+      </div>
+      <span class="btn btn-ghost btn-sm" style="flex:none;pointer-events:none;">Manage connection →</span>
+    </a>
+
     <!-- Top row: stat tiles -->
     <section class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-5">
       <div class="card p-4 card-hover">
@@ -1687,6 +1707,35 @@
           ? (isLive ? 'var(--danger)' : 'var(--success)') : 'var(--border)';
         $('rh-pick-alpaca').className = 'btn btn-sm ' + (alpacaActive ? 'btn-primary' : 'btn-ghost');
         $('rh-pick-robinhood').className = 'btn btn-sm ' + (rhActive ? 'btn-primary' : 'btn-ghost');
+
+        // --- top-of-page connection banner ---
+        // Mirrors the control center so the user sees broker + mode at a
+        // glance without scrolling. Red only when REAL money is armed.
+        const brokerLabel = rhActive ? 'Robinhood · your real account' : 'Paper trading · Alpaca (practice)';
+        const bEl = $('conn-banner-broker');
+        if (bEl) bEl.textContent = brokerLabel;
+        const modePill = $('conn-banner-mode-pill');
+        const dot = $('conn-banner-dot');
+        const sub = $('conn-banner-sub');
+        const banner = $('conn-banner');
+        if (rhActive && isLive) {
+          setPill(modePill, 'pill-live', 'LIVE · real money');
+          setPill(dot, 'pill-live', 'LIVE');
+          if (sub) sub.textContent = 'Real orders are armed in your Robinhood account, capped at your dollar limit. Click to manage.';
+          if (banner) banner.style.borderColor = 'var(--danger)';
+        } else if (rhActive) {
+          setPill(modePill, 'pill-success', 'SHADOW · practice');
+          setPill(dot, connected ? 'pill-success' : 'pill-warn', connected ? 'Connected' : 'Link needed');
+          if (sub) sub.textContent = connected
+            ? 'Robinhood is the active broker, but still practicing — no real money until you flip to LIVE.'
+            : 'Robinhood is selected but not linked yet. Click to connect your account.';
+          if (banner) banner.style.borderColor = 'var(--border)';
+        } else {
+          setPill(modePill, 'pill-success', 'SHADOW · practice');
+          setPill(dot, 'pill-success', 'Safe');
+          if (sub) sub.textContent = 'Running on pretend money to train the strategy. Connect Robinhood to trade your real account.';
+          if (banner) banner.style.borderColor = 'var(--border)';
+        }
       }
 
       // --- actions ---
