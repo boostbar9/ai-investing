@@ -239,3 +239,148 @@ async def test_rh_vix_level_resolves_and_reads():
 async def test_rh_vix_level_none_when_no_vix_index():
     rh_live.set_broker_for_test(FakeBroker(indexes=[{"symbol": "DJX", "id": "x"}]))
     assert await rh_live.rh_vix_level() is None
+
+
+# ---------------------------------------------------------------------------
+# rh_bars: get_equity_historicals param build + empty-on-closed-market
+# ---------------------------------------------------------------------------
+class _RecordingBroker(FakeBroker):
+    """FakeBroker that records the kwargs passed to equity_historicals."""
+
+    def __init__(self, **overrides):
+        super().__init__(**overrides)
+        self.historicals_args: list[dict] = []
+
+    async def equity_historicals(self, symbol, *, start_time=None, interval=None, span=None):
+        self.calls.append("equity_historicals")
+        self.historicals_args.append(
+            {"symbol": symbol, "start_time": start_time, "interval": interval, "span": span}
+        )
+        return self._overrides.get(
+            "bars", [{"close_price": 10.0}, {"close_price": 11.0}, {"close_price": 12.0}]
+        )
+
+
+async def test_daily_closes_always_sends_start_time():
+    # get_equity_historicals REQUIRES symbols + start_time; the regime
+    # daily-closes path must always supply start_time (interval/span too).
+    broker = _RecordingBroker()
+    rh_live.set_broker_for_test(broker)
+    closes = await rh_live.rh_daily_closes("SPY", days=30)
+    assert closes == [10.0, 11.0, 12.0]
+    args = broker.historicals_args[-1]
+    assert args["start_time"] is not None and args["start_time"].endswith("Z")
+    assert args["interval"] == "day" and args["span"] == "year"
+
+
+async def test_bars_empty_market_closed_is_success_empty_not_failure():
+    # Empty bars (market closed -- Sunday) is a SUCCESSFUL-but-empty response:
+    # record a health SUCCESS, fall back quietly, NEVER a recorded failure.
+    rh_live.set_broker_for_test(FakeBroker(bars=[]))
+    fb = await _fallback_factory([{"close_price": 5.0}], "parquet")
+    res = await rh_live.get_bars("AAPL", start_time="2025-01-01", fallback=fb)
+    assert res.ok is True and res.source == "parquet"   # quiet fallback
+    snap = rh_live.get_registry().snapshot(rh_live.SRC_BARS)
+    assert snap["consecutive_failures"] == 0
+    assert snap["total_successes"] >= 1
+    assert snap["status"] != "down"
+
+
+async def test_bars_empty_no_fallback_is_absent_not_down():
+    rh_live.set_broker_for_test(FakeBroker(bars=[]))
+    res = await rh_live.get_bars("AAPL", start_time="2025-01-01")  # no fallback
+    assert res.ok is False and res.source == "none" and res.value is None
+    snap = rh_live.get_registry().snapshot(rh_live.SRC_BARS)
+    assert snap["consecutive_failures"] == 0   # empty != failure
+    assert snap["status"] != "down"
+
+
+async def test_bars_real_error_records_failure_and_falls_back():
+    class Boom(FakeBroker):
+        async def equity_historicals(self, symbol, *, start_time=None, interval=None, span=None):
+            raise RuntimeError("rh historicals down")
+
+    rh_live.set_broker_for_test(Boom())
+    fb = await _fallback_factory([{"close_price": 9.0}], "yfinance")
+    res = await rh_live.get_bars("AAPL", start_time="2025-01-01", fallback=fb)
+    assert res.source == "yfinance"          # fail safe, never fabricated
+    snap = rh_live.get_registry().snapshot(rh_live.SRC_BARS)
+    assert snap["consecutive_failures"] >= 1  # a genuine error IS a failure
+
+
+# ---------------------------------------------------------------------------
+# rh_indexes: id-resolution + parse, OK-when-reachable, real-failure
+# ---------------------------------------------------------------------------
+async def test_index_id_resolution_and_quote_parse():
+    # Mixed catalog (e.g. NDX + VIX); resolve VIX's id (instrument_id key) and
+    # parse the level from the returned quote.
+    broker = FakeBroker(
+        indexes=[
+            {"symbol": "NDX", "id": "ndx-id"},
+            {"symbol": "VIX", "instrument_id": "vix-2"},
+        ],
+        index_quotes=[{"value": 19.25}],
+    )
+    rh_live.set_broker_for_test(broker)
+    assert await rh_live.rh_vix_level() == 19.25
+    assert "index_quotes" in broker.calls
+
+
+async def test_indexes_ok_when_reachable_without_vix():
+    # get_indexes works (NDX present) but no VIX -> rh_indexes reports OK and we
+    # fall back to yfinance ^VIX (None here). NOT a health failure.
+    broker = FakeBroker(indexes=[{"symbol": "NDX", "id": "ndx-id"}])
+    rh_live.set_broker_for_test(broker)
+    assert await rh_live.rh_vix_level() is None
+    snap = rh_live.get_registry().snapshot(rh_live.SRC_INDEXES)
+    assert snap["status"] == "ok"
+    assert snap["consecutive_failures"] == 0
+    assert "index_quotes" not in broker.calls   # no VIX id -> no quote call
+
+
+async def test_indexes_empty_records_failure():
+    # get_indexes returning nothing IS a real RH outage -> recorded failure.
+    rh_live.set_broker_for_test(FakeBroker(indexes=[]))
+    assert await rh_live.rh_vix_level() is None
+    snap = rh_live.get_registry().snapshot(rh_live.SRC_INDEXES)
+    assert snap["consecutive_failures"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Sync->async bridge: callable repeatedly without "Event loop is closed"
+# ---------------------------------------------------------------------------
+def test_bridge_vix_provider_repeatable_no_loop_closed():
+    rh_live.reset_for_test()
+    rh_live.set_broker_for_test(FakeBroker())
+    try:
+        # Repeated calls must NOT raise "Event loop is closed": the worker loop
+        # is persistent (the old asyncio.run-per-call closed it each time).
+        for _ in range(4):
+            assert rh_live.regime_vix_provider() == 17.5
+    finally:
+        rh_live.reset_for_test()
+
+
+def test_bridge_price_provider_repeatable_no_loop_closed():
+    rh_live.reset_for_test()
+    rh_live.set_broker_for_test(FakeBroker())
+    try:
+        for _ in range(4):
+            assert rh_live.regime_price_provider("SPY", days=90) == [10.0, 11.0, 12.0]
+    finally:
+        rh_live.reset_for_test()
+
+
+def test_bridge_falls_back_to_none_when_rh_errors():
+    class Boom(FakeBroker):
+        async def indexes(self):
+            raise RuntimeError("rh boom")
+
+    rh_live.reset_for_test()
+    rh_live.set_broker_for_test(Boom())
+    try:
+        # Bridge error -> None -> caller uses its yfinance default (fail safe).
+        assert rh_live.regime_vix_provider() is None
+        assert rh_live.regime_vix_provider() is None   # still no loop-closed
+    finally:
+        rh_live.reset_for_test()
