@@ -1275,24 +1275,30 @@ def learning_page() -> HTMLResponse:
 
 @app.get("/api/learning/summary")
 def api_learning_summary() -> dict[str, Any]:
-    """Top-line stats + per-regime breakdown + per-agent scores.
+    """Plain-language learning state for the Learning page + dashboard card.
 
-    Returns an empty (but well-formed) payload when no outcomes have
-    been labeled yet, so the page can render gracefully on first run.
+    Keeps the legacy keys (``summary``, ``agents``, ``total_rows``) and
+    adds the close-the-loop view: calibration trustworthiness, win rate
+    over the last 7/30 days, what's working by symbol/strategy/regime,
+    recent adjustments the bot made, and cold-start status. No secrets —
+    only aggregate stats. Returns a well-formed payload on first run.
     """
+    from packages.learning.feedback import build_learning_report
     from packages.learning.outcome_labeler import (
         DEFAULT_OUTCOMES_PATH,
         load_outcomes,
-        per_agent_scores,
-        summary_stats,
     )
 
     rows = load_outcomes(DEFAULT_OUTCOMES_PATH)
-    return {
-        "summary": summary_stats(rows),
-        "agents": [s.to_dict() for s in per_agent_scores(rows)],
-        "total_rows": len(rows),
-    }
+    return build_learning_report(rows)
+
+
+@app.get("/api/learning/status")
+def api_learning_status() -> dict[str, Any]:
+    """When did the learning loop last run, and how much has it seen?"""
+    from packages.learning.feedback import load_status
+
+    return load_status()
 
 
 @app.get("/api/learning/picks")
@@ -1335,7 +1341,12 @@ async def api_learning_backfill(req: _BackfillRequest | None = None) -> dict[str
     backfill without blocking the event loop for too long.
     """
     from packages.data.adapters.yfinance import YFinanceAdapter
-    from packages.learning.outcome_labeler import backfill_outcomes
+    from packages.learning.feedback import recalibrate_from_outcomes, write_status
+    from packages.learning.outcome_labeler import (
+        DEFAULT_OUTCOMES_PATH,
+        backfill_outcomes,
+        load_outcomes,
+    )
 
     max_picks = (req.max_picks if req else None)
     adapter = YFinanceAdapter()
@@ -1343,7 +1354,24 @@ async def api_learning_backfill(req: _BackfillRequest | None = None) -> dict[str
         report = await backfill_outcomes(adapter, max_picks=max_picks)
     finally:
         await adapter.aclose()
-    return {"report": report.to_dict()}
+
+    # Close the loop: feed the freshly-labeled outcomes back into the
+    # confidence calibrator (bounded + cold-start-safe) and record status.
+    cal_info = recalibrate_from_outcomes()
+    rows = load_outcomes(DEFAULT_OUTCOMES_PATH)
+    status = {
+        "last_run": datetime.now(UTC).isoformat(),
+        "outcomes_total": len(rows),
+        "labeled_last_run": report.labeled,
+        "calibration_active": cal_info["fitted"],
+        "calibrated_ece": cal_info["calibrated_ece"],
+        "cold_start": cal_info["cold_start"],
+    }
+    try:
+        write_status(status)
+    except Exception:  # pragma: no cover — defensive
+        pass
+    return {"report": report.to_dict(), "calibration": cal_info, "status": status}
 
 
 @app.post("/api/pause")
@@ -4500,6 +4528,16 @@ async def _autonomy_startup() -> None:  # pragma: no cover
         candidates: list[tc.TradeCandidate] = []
         seen: set[str] = set()
 
+        # Apply the learned calibration so the confidence the gate checks
+        # means what it says (a 60% really wins ~60% of the time). On cold
+        # start the calibrator is the identity map, so this is a no-op.
+        from packages.agents.calibration import IsotonicCalibrator
+
+        _calibrator = IsotonicCalibrator.load()
+
+        def _calibrated(raw: Any) -> float:
+            return _calibrator(float(raw or 0.0))
+
         def _price_for(sym: str) -> float | None:
             try:
                 return _last_price(sym)
@@ -4521,7 +4559,7 @@ async def _autonomy_startup() -> None:  # pragma: no cover
                 tc.TradeCandidate(
                     symbol=sym,
                     side="buy",
-                    confidence=float(conf or 0.0),
+                    confidence=_calibrated(conf),
                     notional=float(notional),
                 )
             )
@@ -4534,7 +4572,7 @@ async def _autonomy_startup() -> None:  # pragma: no cover
                 tc.TradeCandidate(
                     symbol=sym,
                     side=str(e.get("side", "buy")).lower(),
-                    confidence=float(e.get("confidence") or 0.0),
+                    confidence=_calibrated(e.get("confidence")),
                     notional=float(e.get("notional") or controls.max_per_trade_usd),
                 )
             )

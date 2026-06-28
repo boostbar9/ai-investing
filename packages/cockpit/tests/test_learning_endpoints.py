@@ -122,6 +122,36 @@ def test_picks_endpoint_filters(client):
     assert body["picks"][0]["symbol"] == "MSFT"
 
 
+def test_summary_endpoint_has_close_loop_keys(client):
+    """The summary now carries the close-the-loop view alongside legacy keys."""
+    c, _ = client
+    data = c.get("/api/learning/summary").json()
+    for key in (
+        "decided",
+        "cold_start",
+        "accuracy_7d",
+        "accuracy_30d",
+        "calibration",
+        "what_works",
+        "recent_adjustments",
+    ):
+        assert key in data
+    # Empty journal -> still learning, never crashes.
+    assert data["cold_start"] is True
+    assert data["calibration"]["trust"]["level"] == "learning"
+    assert data["what_works"] == {"symbols": [], "strategies": [], "regimes": []}
+
+
+def test_status_endpoint_cold_start(client):
+    c, _ = client
+    r = c.get("/api/learning/status")
+    assert r.status_code == 200
+    s = r.json()
+    # Well-formed empty payload before the loop has ever run.
+    assert "last_run" in s
+    assert s["cold_start"] is True
+
+
 def test_picks_endpoint_respects_limit(client):
     c, out = client
     rows = [

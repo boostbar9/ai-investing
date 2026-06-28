@@ -257,6 +257,49 @@
       })();
     </script>
 
+    <!-- ==== Learning summary (what the AI is learning) ==== -->
+    <a id="learn-summary" href="/learning"
+       class="card p-4 mb-4 block"
+       style="text-decoration:none;border:1px solid var(--border);">
+      <div class="flex items-center justify-between mb-2" style="flex-wrap:wrap;gap:8px;">
+        <h2 class="section-h mb-0">What the AI is learning</h2>
+        <span class="text-xs" style="color:var(--text-muted);">See details →</span>
+      </div>
+      <div class="grid grid-cols-3 gap-4 items-center">
+        <div>
+          <div class="text-xs" style="color:var(--text-secondary);">Ideas graded</div>
+          <div class="font-semibold mono"><span id="learn-sum-decided">—</span></div>
+        </div>
+        <div>
+          <div class="text-xs" style="color:var(--text-secondary);">Right so far</div>
+          <div class="font-semibold mono"><span id="learn-sum-winrate">—</span></div>
+        </div>
+        <div>
+          <div class="text-xs" style="color:var(--text-secondary);">Confidence</div>
+          <div class="font-semibold"><span id="learn-sum-trust" class="pill pill-muted">—</span></div>
+        </div>
+      </div>
+    </a>
+    <script>
+      (async () => {
+        try {
+          const d = await fetch('/api/learning/summary').then(r => r.ok ? r.json() : null);
+          if (!d) return;
+          const decided = d.decided || 0;
+          document.getElementById('learn-sum-decided').textContent = decided;
+          const wr = (d.summary && d.summary.win_rate);
+          document.getElementById('learn-sum-winrate').textContent =
+            (decided && wr != null) ? Math.round(wr * 100) + '%' : '—';
+          const trust = (d.calibration && d.calibration.trust) || {};
+          const pill = document.getElementById('learn-sum-trust');
+          pill.textContent = trust.headline || (decided ? '—' : 'still learning');
+          const cls = trust.level === 'high' ? 'pill-good' : trust.level === 'medium' ? 'pill-warn'
+                    : trust.level === 'low' ? 'pill-bad' : 'pill-info';
+          pill.className = 'pill ' + cls;
+        } catch (_) { /* swallow — card just shows placeholders */ }
+      })();
+    </script>
+
     <!-- ==== Connection status banner (always visible, top of page) ==== -->
     <!-- One glance answers: which broker is active, am I on real money
          or practice, and is the agent connected? This is the core thing

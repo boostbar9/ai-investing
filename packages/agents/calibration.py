@@ -69,6 +69,19 @@ DEFAULT_CALIBRATOR_PATH = Path(
 # is just noise; the raw composite score is a better estimator.
 MIN_SAMPLES_FOR_FIT = 30
 
+# --- Safer-learning guardrails (used by ``fit_bounded``) -------------------
+# Pseudo-count for shrinkage toward the identity (raw == calibrated) map.
+# A fitted curve only gets full weight once we have many more outcomes than
+# this; with few outcomes the calibrated value stays close to the raw value.
+# w = n / (n + DEFAULT_PRIOR_STRENGTH).
+DEFAULT_PRIOR_STRENGTH = 40.0
+
+# Hard cap on how far a single calibration may move a confidence away from
+# its raw value. Stops a handful of lucky/unlucky trades from swinging the
+# displayed confidence wildly (e.g. raw 0.60 can never read below 0.35 or
+# above 0.85 with the default 0.25 bound).
+DEFAULT_MAX_DELTA = 0.25
+
 # Default bucket count for the reliability curve. 10 is the standard
 # choice in the calibration literature (Niculescu-Mizil & Caruana 2005).
 DEFAULT_RELIABILITY_BUCKETS = 10
@@ -336,6 +349,78 @@ class IsotonicCalibrator:
         )
         return self
 
+    def fit_bounded(
+        self,
+        pairs: Iterable[tuple[float, int]],
+        *,
+        min_samples: int = MIN_SAMPLES_FOR_FIT,
+        prior_strength: float = DEFAULT_PRIOR_STRENGTH,
+        max_delta: float = DEFAULT_MAX_DELTA,
+    ) -> IsotonicCalibrator:
+        """Fit, but *safely* — for use on small, growing outcome journals.
+
+        Three guardrails make the learning steady instead of jumpy:
+
+        1. **Minimum sample size.** Below ``min_samples`` we leave the
+           identity map (cold start); calibrated == raw.
+        2. **Shrinkage toward identity.** The fitted curve is blended with
+           the raw==calibrated line, weighted ``n / (n + prior_strength)``.
+           Few outcomes → calibrated stays near raw; many outcomes → the
+           empirical curve dominates.
+        3. **Bounded movement.** No point may move more than ``max_delta``
+           from its raw value, so a couple of trades can't yank the number.
+
+        The result is still monotone non-decreasing. Returns ``self``.
+        """
+        clean = [
+            (float(p), int(bool(y)))
+            for p, y in pairs
+            if _is_valid_pair(p, y)
+        ]
+        n = len(clean)
+        self.n_samples_fit = n
+        if n < min_samples:
+            log.info(
+                "calibration(bounded): %d samples < min %d, identity map", n, min_samples
+            )
+            return self
+
+        # Base (unshrunk) isotonic fit. Reuse the well-tested ``fit`` path so
+        # we get a monotone curve sampled on a stable grid.
+        base = IsotonicCalibrator().fit(clean)
+        if not base.is_fitted:
+            # sklearn missing or fit declined — stay identity, fail safe.
+            return self
+
+        w = n / (n + max(0.0, prior_strength))
+        bound = max(0.0, float(max_delta))
+        xs = list(base.x_breakpoints)
+        ys: list[float] = []
+        for x, y in zip(base.x_breakpoints, base.y_breakpoints, strict=False):
+            blended = (1.0 - w) * x + w * y  # shrink toward identity (y == x)
+            blended = max(x - bound, min(x + bound, blended))  # bound movement
+            ys.append(max(0.0, min(1.0, blended)))
+        # Re-enforce monotonicity (clamping can introduce tiny inversions).
+        for i in range(1, len(ys)):
+            if ys[i] < ys[i - 1]:
+                ys[i] = ys[i - 1]
+
+        self.x_breakpoints = xs
+        self.y_breakpoints = ys
+        self.n_samples_fit = n
+
+        raw_curve = ReliabilityCurve.from_pairs(clean)
+        cal_curve = ReliabilityCurve.from_pairs([(self(p), y) for p, y in clean])
+        self.raw_brier = raw_curve.brier_score
+        self.raw_ece = raw_curve.ece
+        self.calibrated_brier = cal_curve.brier_score
+        self.calibrated_ece = cal_curve.ece
+        log.info(
+            "calibration(bounded) fitted on %d samples (w=%.2f): ECE %.3f -> %.3f",
+            n, w, self.raw_ece, self.calibrated_ece,
+        )
+        return self
+
     def save(self, path: Path | None = None) -> Path:
         """Persist as JSON atomically. Returns the path written.
 
@@ -459,6 +544,46 @@ def extract_calibration_pairs(
     return pairs
 
 
+def trustworthiness(
+    ece: float | None,
+    n_samples: int,
+    *,
+    min_samples: int = MIN_SAMPLES_FOR_FIT,
+) -> dict[str, str]:
+    """Turn calibration error + sample size into a plain-language verdict.
+
+    Returns ``{"level": ..., "headline": ..., "detail": ...}`` where level
+    is one of ``learning`` / ``high`` / ``medium`` / ``low``. Designed for a
+    non-technical reader: it answers "can I trust the % the AI shows me?".
+    """
+    if n_samples < min_samples or ece is None:
+        return {
+            "level": "learning",
+            "headline": "Still learning",
+            "detail": (
+                f"Only {n_samples} trades resolved so far — need "
+                f"{min_samples} before the confidence number can be trusted."
+            ),
+        }
+    if ece <= 0.05:
+        return {
+            "level": "high",
+            "headline": "Well calibrated",
+            "detail": "When it says ~60%, it really does win about 60% of the time.",
+        }
+    if ece <= 0.12:
+        return {
+            "level": "medium",
+            "headline": "Roughly trustworthy",
+            "detail": "The confidence number is in the right ballpark, with some drift.",
+        }
+    return {
+        "level": "low",
+        "headline": "Not trustworthy yet",
+        "detail": "Confidence is off from reality right now — treat the % loosely.",
+    }
+
+
 def _is_valid_pair(p: Any, y: Any) -> bool:
     """Both predicted confidence and label must be parseable."""
     try:
@@ -471,10 +596,13 @@ def _is_valid_pair(p: Any, y: Any) -> bool:
 
 __all__ = [
     "DEFAULT_CALIBRATOR_PATH",
+    "DEFAULT_MAX_DELTA",
+    "DEFAULT_PRIOR_STRENGTH",
     "DEFAULT_RELIABILITY_BUCKETS",
     "MIN_SAMPLES_FOR_FIT",
     "IsotonicCalibrator",
     "ReliabilityBucket",
     "ReliabilityCurve",
     "extract_calibration_pairs",
+    "trustworthiness",
 ]

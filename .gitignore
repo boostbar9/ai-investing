@@ -84,6 +84,8 @@ data/agent_scorecard.jsonl
 data/promotion_candidates.jsonl
 data/audit/
 data/db/
+data/learning/
+data/calibration/
 backups/
 data._tmp/
 

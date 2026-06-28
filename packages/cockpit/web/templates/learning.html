@@ -3,108 +3,135 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0B0F14" />
   <title>Learning · The Seer</title>
   {% include "_head_icons.html" %}
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="/static/cockpit.css" />
   <script src="/static/cockpit.js"></script>
   <style>
-    .card { background: #131A24; border: 1px solid #1f2937; border-radius: 12px; padding: 14px 16px; }
-    .stat-num { font-size: 26px; font-weight: 600; letter-spacing: -0.01em; }
-    .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #6b7280; margin-bottom: 6px; }
-    .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 500; }
-    .pill-green { background: rgba(16,185,129,0.18); color: #6ee7b7; }
-    .pill-red { background: rgba(239,68,68,0.18); color: #fca5a5; }
-    .pill-gray { background: #1f2937; color: #9ca3af; }
-    .pill-yellow { background: rgba(245,158,11,0.18); color: #fcd34d; }
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .stat-num { font-size: 26px; font-weight: 600; letter-spacing: -0.01em; color: var(--text-primary); }
+    .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); margin-bottom: 6px; }
+    .lead-num { font-size: 40px; font-weight: 700; letter-spacing: -0.02em; line-height: 1; }
+    .good { color: var(--success, #34D399); }
+    .bad { color: var(--danger, #FB7185); }
+    .muted { color: var(--text-muted); }
+    /* Reliability: predicted (track) vs actual (fill) */
+    .rel-row { display: grid; grid-template-columns: 64px 1fr 92px; gap: 10px; align-items: center; margin-bottom: 8px; }
+    .rel-track { height: 14px; border-radius: 999px; background: rgba(255,255,255,.06); position: relative; overflow: hidden; }
+    .rel-actual { height: 100%; border-radius: 999px; background: linear-gradient(90deg,#00E5C4,#8B5CF6); }
+    .rel-pred { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text-secondary); }
+    .bar-track { height: 7px; border-radius: 999px; background: rgba(255,255,255,.07); overflow: hidden; }
+    .bar-fill { display: block; height: 100%; background: linear-gradient(90deg,#00E5C4,#8B5CF6); }
     table.journal { width: 100%; border-collapse: collapse; font-size: 12px; }
-    table.journal th { text-align: left; padding: 8px 10px; color: #6b7280; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; font-size: 10px; border-bottom: 1px solid #1f2937; cursor: pointer; user-select: none; }
-    table.journal th:hover { color: #d1d5db; }
-    table.journal td { padding: 8px 10px; border-bottom: 1px solid #0f1620; color: #d1d5db; }
-    table.journal tr:hover { background: #0f1620; }
+    table.journal th { text-align: left; padding: 8px 10px; color: var(--text-dim); font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; font-size: 10px; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; white-space: nowrap; }
+    table.journal th:hover { color: var(--text-secondary); }
+    table.journal td { padding: 8px 10px; border-bottom: 1px solid var(--border-faint); color: var(--text-secondary); }
+    table.journal tr:hover { background: var(--bg-glass); }
     table.journal td.num { font-variant-numeric: tabular-nums; }
-    .ret-pos { color: #6ee7b7; }
-    .ret-neg { color: #fca5a5; }
-    .empty-state { background: #131A24; border: 1px dashed #1f2937; border-radius: 12px; padding: 48px 24px; text-align: center; color: #9ca3af; }
-    .empty-state .icon { font-size: 36px; opacity: 0.4; margin-bottom: 12px; }
-    .agent-bar { height: 6px; border-radius: 999px; background: #1f2937; overflow: hidden; }
-    .agent-bar > span { display: block; height: 100%; background: linear-gradient(90deg, #00E5C4, #8B5CF6); }
-    .filter-input { background: #0b1220; border: 1px solid #1f2937; color: #f9fafb; border-radius: 6px; padding: 6px 10px; font-size: 13px; }
-    .btn-primary { background: #00E5C4; color: #0B0F14; padding: 8px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity .15s; border: none; }
-    .btn-primary:hover { opacity: 0.85; }
-    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .filter-input { background: var(--bg-deeper); border: 1px solid var(--border); color: var(--text-primary); border-radius: 8px; padding: 6px 10px; font-size: 13px; }
+    .btn-primary { background: var(--accent); color: #0B0F14; padding: 8px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; transition: opacity .15s; }
+    .btn-primary:hover { opacity: .85; }
+    .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+    .chip { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--bg-glass); color: var(--text-muted); }
   </style>
 </head>
 <body class="min-h-screen">
   {% include "_nav.html" %}
 
-  <main class="container mx-auto px-6 py-8 max-w-7xl">
-    <div class="flex items-center justify-between mb-6">
+  <main id="seer-main" class="max-w-5xl mx-auto p-4 md:p-6">
+    <header class="flex items-start justify-between gap-3 mb-5">
       <div>
-        <h1 class="text-2xl font-semibold text-gray-100">Learning · Trade Journal</h1>
-        <p class="text-sm text-gray-400 mt-1">
-          Outcome labels for every day-trade pick the brain has made. We measure
-          return at +30m, +2h, and end-of-day; "correct" is judged at EOD (the round-trip P&L).
+        <h1 class="text-2xl font-semibold" style="color:var(--text-primary);">Learning</h1>
+        <p class="text-sm mt-1" style="color:var(--text-secondary);">
+          How the AI gets smarter: it grades every past idea against what
+          actually happened, then adjusts how confident it should be next time.
         </p>
       </div>
-      <button id="backfill-btn" class="btn-primary">Backfill outcomes</button>
-    </div>
+      <button id="backfill-btn" class="btn-primary shrink-0" title="Grade any picks that have now finished, and re-learn">Update now</button>
+    </header>
 
-    <!-- Top-line stat cards -->
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-      <div class="card">
-        <div class="stat-label">Total labeled picks</div>
-        <div class="stat-num text-gray-100" id="stat-total">—</div>
+    <!-- ============ THE STORY (plain English) ============ -->
+    <section class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="section-h">The story so far</h2>
+        <span id="story-updated" class="chip">—</span>
       </div>
-      <div class="card">
-        <div class="stat-label">Decided (have EOD data)</div>
-        <div class="stat-num text-gray-100" id="stat-decided">—</div>
+      <p id="story-text" class="text-base" style="color:var(--text-secondary); line-height:1.6;">Loading…</p>
+      <div id="trust-banner" class="mt-4 flex items-center gap-3" style="display:none;">
+        <span id="trust-pill" class="pill">—</span>
+        <span id="trust-detail" class="text-sm muted"></span>
       </div>
-      <div class="card">
-        <div class="stat-label">Win rate (EOD)</div>
-        <div class="stat-num" id="stat-winrate">—</div>
-      </div>
-      <div class="card">
-        <div class="stat-label">Avg return EOD</div>
-        <div class="stat-num" id="stat-avgret">—</div>
-      </div>
-    </div>
+    </section>
 
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
-      <!-- Per-agent leaderboard -->
-      <div class="card col-span-1">
-        <div class="text-sm font-semibold text-gray-100 mb-3">Per-agent win rate</div>
-        <div id="agent-list" class="space-y-3">
-          <div class="text-xs text-gray-500">Loading…</div>
+    <!-- ============ TOP-LINE STATS ============ -->
+    <section class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+      <div class="card p-4"><div class="stat-label">Ideas graded</div><div class="stat-num" id="stat-decided">—</div></div>
+      <div class="card p-4"><div class="stat-label">Right (all time)</div><div class="stat-num" id="stat-winrate">—</div></div>
+      <div class="card p-4"><div class="stat-label">Right (last 7 days)</div><div class="stat-num" id="stat-win7">—</div></div>
+      <div class="card p-4"><div class="stat-label">Avg day-trade P&amp;L</div><div class="stat-num" id="stat-avgret">—</div></div>
+    </section>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+      <!-- ============ CALIBRATION / RELIABILITY ============ -->
+      <section class="card p-5">
+        <h2 class="section-h mb-1">Is its confidence honest?</h2>
+        <p class="text-xs muted mb-4">
+          The bar shows how often picks actually won; the vertical line is how
+          confident the AI <em>said</em> it was. Close together = honest confidence.
+        </p>
+        <div id="reliability">
+          <div class="text-xs muted">Loading…</div>
         </div>
-      </div>
-
-      <!-- Per-regime breakdown -->
-      <div class="card col-span-2">
-        <div class="text-sm font-semibold text-gray-100 mb-3">By market regime</div>
-        <div id="regime-list" class="space-y-3">
-          <div class="text-xs text-gray-500">Loading…</div>
+        <div class="mt-3 text-xs muted">
+          Calibration error (lower is better): <span id="ece-val" class="mono">—</span>
         </div>
-      </div>
+      </section>
+
+      <!-- ============ RECENT ADJUSTMENTS ============ -->
+      <section class="card p-5">
+        <h2 class="section-h mb-1">What it just learned</h2>
+        <p class="text-xs muted mb-4">Corrections the AI is currently applying to its own confidence.</p>
+        <ul id="adjustments" class="space-y-2 text-sm" style="color:var(--text-secondary);">
+          <li class="text-xs muted">Loading…</li>
+        </ul>
+      </section>
     </div>
 
-    <!-- Journal table -->
-    <div class="card">
-      <div class="flex items-center justify-between mb-4">
-        <div class="text-sm font-semibold text-gray-100">Recent picks</div>
+    <!-- ============ WHAT'S WORKING ============ -->
+    <section class="card p-5 mb-4">
+      <h2 class="section-h mb-3">What's working best</h2>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+        <div><div class="stat-label mb-2">Top symbols</div><div id="works-symbols" class="space-y-3"><div class="text-xs muted">—</div></div></div>
+        <div><div class="stat-label mb-2">Top strategies</div><div id="works-strategies" class="space-y-3"><div class="text-xs muted">—</div></div></div>
+        <div><div class="stat-label mb-2">By market regime</div><div id="works-regimes" class="space-y-3"><div class="text-xs muted">—</div></div></div>
+      </div>
+    </section>
+
+    <!-- ============ PER-AGENT ============ -->
+    <section class="card p-5 mb-4">
+      <h2 class="section-h mb-3">Which agents earn their keep</h2>
+      <div id="agent-list" class="space-y-3"><div class="text-xs muted">Loading…</div></div>
+    </section>
+
+    <!-- ============ TRADE JOURNAL ============ -->
+    <section class="card p-5">
+      <div class="flex items-center justify-between mb-4 gap-2 flex-wrap">
+        <h2 class="section-h">Trade Journal</h2>
         <div class="flex gap-2">
           <input id="filter-symbol" class="filter-input" placeholder="symbol" />
           <input id="filter-regime" class="filter-input" placeholder="regime" />
         </div>
       </div>
-      <div id="journal-wrap" class="overflow-x-auto">
+      <div class="overflow-x-auto">
         <table class="journal" id="journal-table">
           <thead>
             <tr>
               <th data-sort="ts">Date</th>
               <th data-sort="symbol">Symbol</th>
               <th data-sort="regime_at_pick">Regime</th>
-              <th data-sort="confidence" class="num">Confidence</th>
+              <th data-sort="confidence" class="num">Conf.</th>
               <th data-sort="entry_price" class="num">Entry</th>
               <th data-sort="return_30m" class="num">+30m</th>
               <th data-sort="return_2h" class="num">+2h</th>
@@ -114,140 +141,189 @@
             </tr>
           </thead>
           <tbody id="journal-tbody">
-            <tr><td colspan="10" class="text-center text-gray-500 py-6">Loading…</td></tr>
+            <tr><td colspan="10" class="text-center muted py-6">Loading…</td></tr>
           </tbody>
         </table>
       </div>
-    </div>
+    </section>
   </main>
 
   <script>
-    const fmtPct = (v) => v == null ? "—" : (v * 100).toFixed(2) + "%";
+    const fmtPct = (v) => v == null ? "—" : (v * 100).toFixed(1) + "%";
+    const fmtPct2 = (v) => v == null ? "—" : (v * 100).toFixed(2) + "%";
     const fmtNum = (v) => v == null ? "—" : Number(v).toFixed(2);
-    const escape = (s) => String(s ?? "").replace(/[<>&"]/g, (c) => ({ "<":"&lt;",">":"&gt;","&":"&amp;","\"":"&quot;" }[c]));
+    const esc = (s) => String(s ?? "").replace(/[<>&"]/g, (c) => ({ "<":"&lt;",">":"&gt;","&":"&amp;","\"":"&quot;" }[c]));
 
     function returnCell(v) {
       if (v == null) return `<td class="num">—</td>`;
-      const cls = v > 0 ? "ret-pos" : v < 0 ? "ret-neg" : "";
-      return `<td class="num ${cls}">${fmtPct(v)}</td>`;
+      const cls = v > 0 ? "good" : v < 0 ? "bad" : "";
+      return `<td class="num ${cls}">${fmtPct2(v)}</td>`;
     }
-
-    function outcomePill(correct) {
-      if (correct === true) return `<span class="pill pill-green">win</span>`;
-      if (correct === false) return `<span class="pill pill-red">loss</span>`;
-      return `<span class="pill pill-gray">—</span>`;
+    function outcomePill(c) {
+      if (c === true) return `<span class="pill pill-good">win</span>`;
+      if (c === false) return `<span class="pill pill-bad">loss</span>`;
+      return `<span class="pill">—</span>`;
     }
-
     function regimePill(r) {
-      const m = { risk_on: "pill-green", chop: "pill-gray", risk_off: "pill-yellow", crisis: "pill-red", neutral: "pill-gray" };
-      return `<span class="pill ${m[r] || "pill-gray"}">${escape(r || "—")}</span>`;
+      const m = { risk_on: "pill-good", chop: "pill-info", risk_off: "pill-warn", crisis: "pill-bad", neutral: "pill-info" };
+      return `<span class="pill ${m[r] || "pill-info"}">${esc(r || "—")}</span>`;
+    }
+    function trustClass(level) {
+      return level === "high" ? "pill-good" : level === "medium" ? "pill-warn"
+           : level === "low" ? "pill-bad" : "pill-info";
+    }
+
+    function renderStory(d) {
+      const decided = d.decided || 0;
+      const total = (d.summary && d.summary.total_picks) || 0;
+      const wr = (d.summary && d.summary.win_rate) || 0;
+      const trust = (d.calibration && d.calibration.trust) || {};
+      let story;
+      if (decided === 0) {
+        story = `The AI hasn't had any ideas finish yet. As soon as its day-trades `
+              + `close out, it'll start grading itself here and learning from the results.`;
+      } else {
+        story = `The AI has reviewed <strong>${decided}</strong> of its past ideas`
+              + (total > decided ? ` (${total} logged so far)` : "")
+              + `. It's been right <strong class="${wr >= 0.5 ? "good" : ""}">${fmtPct(wr)}</strong> of the time. `
+              + (trust.headline ? `Its confidence is currently <strong>${esc(trust.headline.toLowerCase())}</strong>.` : "");
+      }
+      document.getElementById("story-text").innerHTML = story;
+
+      const banner = document.getElementById("trust-banner");
+      if (trust.level) {
+        banner.style.display = "flex";
+        const pill = document.getElementById("trust-pill");
+        pill.className = "pill " + trustClass(trust.level);
+        pill.textContent = trust.headline || "—";
+        document.getElementById("trust-detail").textContent = trust.detail || "";
+      } else {
+        banner.style.display = "none";
+      }
+    }
+
+    function setStat(id, txt, cls) {
+      const el = document.getElementById(id);
+      el.textContent = txt;
+      el.className = "stat-num" + (cls ? " " + cls : "");
+    }
+
+    function renderReliability(cal) {
+      const host = document.getElementById("reliability");
+      const rows = (cal && cal.reliability) || [];
+      document.getElementById("ece-val").textContent =
+        (cal && cal.calibrated_ece != null) ? cal.calibrated_ece
+        : (cal && cal.raw_ece != null) ? cal.raw_ece : "—";
+      if (!rows.length) {
+        host.innerHTML = `<div class="text-xs muted">Not enough graded ideas to chart yet.</div>`;
+        return;
+      }
+      host.innerHTML = rows.map(b => {
+        const actual = Math.max(0, Math.min(1, b.actual || 0));
+        const pred = Math.max(0, Math.min(1, b.predicted || 0));
+        return `<div class="rel-row">
+          <span class="text-xs muted">${esc(b.label)}</span>
+          <div class="rel-track">
+            <div class="rel-actual" style="width:${(actual*100).toFixed(0)}%"></div>
+            <div class="rel-pred" style="left:${(pred*100).toFixed(0)}%" title="said ${(pred*100).toFixed(0)}%"></div>
+          </div>
+          <span class="text-xs mono muted">${(actual*100).toFixed(0)}% won · n=${b.count}</span>
+        </div>`;
+      }).join("");
+    }
+
+    function renderAdjustments(list) {
+      const host = document.getElementById("adjustments");
+      if (!list || !list.length) {
+        host.innerHTML = `<li class="text-xs muted">No corrections yet — still gathering enough graded trades.</li>`;
+        return;
+      }
+      host.innerHTML = list.map(t => `<li>• ${esc(t)}</li>`).join("");
+    }
+
+    function renderWorks(id, items) {
+      const host = document.getElementById(id);
+      if (!items || !items.length) { host.innerHTML = `<div class="text-xs muted">Not enough data yet.</div>`; return; }
+      host.innerHTML = items.map(it => {
+        const w = Math.round((it.win_rate || 0) * 100);
+        return `<div>
+          <div class="flex items-center justify-between text-xs mb-1">
+            <span style="color:var(--text-primary);font-weight:500;">${esc(it.name)}</span>
+            <span class="muted">${w}% · ${it.decided}</span>
+          </div>
+          <div class="bar-track"><span class="bar-fill" style="width:${w}%"></span></div>
+        </div>`;
+      }).join("");
+    }
+
+    function renderAgents(agents) {
+      const host = document.getElementById("agent-list");
+      if (!agents || !agents.length) { host.innerHTML = `<div class="text-xs muted">No graded picks yet.</div>`; return; }
+      host.innerHTML = agents.map(a => {
+        const w = Math.round((a.win_rate || 0) * 100);
+        return `<div>
+          <div class="flex items-center justify-between text-xs mb-1">
+            <span style="color:var(--text-primary);font-weight:500;">${esc(a.agent)}</span>
+            <span class="muted">${w}% · ${a.picks} picks</span>
+          </div>
+          <div class="bar-track"><span class="bar-fill" style="width:${w}%"></span></div>
+        </div>`;
+      }).join("");
     }
 
     async function loadSummary() {
-      try {
-        const r = await fetch("/api/learning/summary");
-        const data = await r.json();
-        renderSummary(data);
-      } catch (e) { /* swallow */ }
-    }
-
-    function renderSummary(data) {
-      const s = (data && data.summary) || {};
-      document.getElementById("stat-total").textContent = s.total_picks ?? 0;
-      document.getElementById("stat-decided").textContent = s.decided_picks ?? 0;
-      const wr = document.getElementById("stat-winrate");
-      const rate = s.win_rate ?? 0;
-      wr.textContent = fmtPct(rate);
-      wr.className = "stat-num " + (rate >= 0.5 ? "ret-pos" : rate > 0 ? "" : "text-gray-100");
-      const ar = document.getElementById("stat-avgret");
+      const r = await fetch("/api/learning/summary");
+      const d = await r.json();
+      const s = d.summary || {};
+      renderStory(d);
+      setStat("stat-decided", d.decided ?? 0);
+      const wr = s.win_rate ?? 0;
+      setStat("stat-winrate", fmtPct(wr), wr >= 0.5 ? "good" : (wr > 0 ? "" : ""));
+      const w7 = (d.accuracy_7d && d.accuracy_7d.decided) ? d.accuracy_7d.win_rate : null;
+      setStat("stat-win7", w7 == null ? "—" : fmtPct(w7));
       const avg = s.avg_return_eod ?? 0;
-      ar.textContent = fmtPct(avg);
-      ar.className = "stat-num " + (avg > 0 ? "ret-pos" : avg < 0 ? "ret-neg" : "text-gray-100");
-
-      // Agents.
-      const agents = data.agents || [];
-      const host = document.getElementById("agent-list");
-      if (!agents.length) {
-        host.innerHTML = `<div class="text-xs text-gray-500">No labeled picks yet.</div>`;
-      } else {
-        host.innerHTML = agents.map(a => {
-          const wPct = Math.round((a.win_rate || 0) * 100);
-          return `
-            <div>
-              <div class="flex items-center justify-between text-xs mb-1">
-                <span class="font-medium text-gray-200">${escape(a.agent)}</span>
-                <span class="text-gray-400">${wPct}% · ${a.picks} picks</span>
-              </div>
-              <div class="agent-bar"><span style="width:${wPct}%"></span></div>
-            </div>`;
-        }).join("");
-      }
-
-      // Regimes.
-      const regimes = s.by_regime || {};
-      const rhost = document.getElementById("regime-list");
-      const names = Object.keys(regimes);
-      if (!names.length) {
-        rhost.innerHTML = `<div class="text-xs text-gray-500">No regime data yet.</div>`;
-      } else {
-        rhost.innerHTML = names.map(name => {
-          const slot = regimes[name];
-          const ret = slot.avg_return_eod ?? 0;
-          const retCls = ret > 0 ? "ret-pos" : ret < 0 ? "ret-neg" : "";
-          return `
-            <div class="flex items-center justify-between">
-              <div class="flex items-center gap-2">
-                ${regimePill(name)}
-                <span class="text-xs text-gray-400">${slot.picks} picks</span>
-              </div>
-              <div class="text-xs">
-                <span class="text-gray-400">win </span><span class="text-gray-100">${fmtPct(slot.win_rate)}</span>
-                <span class="ml-3 text-gray-400">avg EOD </span><span class="${retCls}">${fmtPct(ret)}</span>
-              </div>
-            </div>`;
-        }).join("");
-      }
+      setStat("stat-avgret", fmtPct2(avg), avg > 0 ? "good" : avg < 0 ? "bad" : "");
+      renderReliability(d.calibration || {});
+      renderAdjustments(d.recent_adjustments || []);
+      const ww = d.what_works || {};
+      renderWorks("works-symbols", ww.symbols);
+      renderWorks("works-strategies", ww.strategies);
+      renderWorks("works-regimes", ww.regimes);
+      renderAgents(d.agents || []);
     }
 
-    let JOURNAL = [];
-    let sortKey = "ts";
-    let sortDir = -1;  // -1 = desc
+    async function loadStatus() {
+      try {
+        const r = await fetch("/api/learning/status");
+        const s = await r.json();
+        const el = document.getElementById("story-updated");
+        el.textContent = s.last_run ? ("updated " + new Date(s.last_run).toLocaleString()) : "not run yet";
+      } catch (e) { /* ignore */ }
+    }
 
+    let JOURNAL = [], sortKey = "ts", sortDir = -1;
     function rowToHTML(r) {
-      const date = (r.ts || "").slice(0, 10);
-      return `
-        <tr>
-          <td>${escape(date)}</td>
-          <td class="font-medium text-gray-100">${escape(r.symbol)}</td>
-          <td>${regimePill(r.regime_at_pick)}</td>
-          <td class="num">${(r.confidence ?? 0).toFixed(2)}</td>
-          <td class="num">${fmtNum(r.entry_price)}</td>
-          ${returnCell(r.return_30m)}
-          ${returnCell(r.return_2h)}
-          ${returnCell(r.return_eod)}
-          <td>${outcomePill(r.correct)}</td>
-          <td class="text-xs text-gray-400">${escape((r.agents_voted || []).join(", "))}</td>
-        </tr>`;
+      return `<tr>
+        <td>${esc((r.ts || "").slice(0,10))}</td>
+        <td style="color:var(--text-primary);font-weight:500;">${esc(r.symbol)}</td>
+        <td>${regimePill(r.regime_at_pick)}</td>
+        <td class="num">${(r.confidence ?? 0).toFixed(2)}</td>
+        <td class="num">${fmtNum(r.entry_price)}</td>
+        ${returnCell(r.return_30m)}${returnCell(r.return_2h)}${returnCell(r.return_eod)}
+        <td>${outcomePill(r.correct)}</td>
+        <td class="text-xs muted">${esc((r.agents_voted || []).join(", "))}</td>
+      </tr>`;
     }
-
     function renderJournal() {
-      const tbody = document.getElementById("journal-tbody");
-      if (!JOURNAL.length) {
-        tbody.innerHTML = `<tr><td colspan="10" class="text-center text-gray-500 py-6">No labeled picks yet — click "Backfill outcomes".</td></tr>`;
-        return;
-      }
-      const sorted = [...JOURNAL].sort((a, b) => {
-        const av = a[sortKey], bv = b[sortKey];
-        if (av == null && bv == null) return 0;
-        if (av == null) return 1;
-        if (bv == null) return -1;
-        if (av < bv) return -1 * sortDir;
-        if (av > bv) return 1 * sortDir;
-        return 0;
+      const tb = document.getElementById("journal-tbody");
+      if (!JOURNAL.length) { tb.innerHTML = `<tr><td colspan="10" class="text-center muted py-6">No graded picks yet — click "Update now".</td></tr>`; return; }
+      const sorted = [...JOURNAL].sort((a,b)=>{
+        const av=a[sortKey], bv=b[sortKey];
+        if (av==null&&bv==null) return 0; if (av==null) return 1; if (bv==null) return -1;
+        if (av<bv) return -sortDir; if (av>bv) return sortDir; return 0;
       });
-      tbody.innerHTML = sorted.map(rowToHTML).join("");
+      tb.innerHTML = sorted.map(rowToHTML).join("");
     }
-
     async function loadJournal() {
       const sym = document.getElementById("filter-symbol").value.trim();
       const reg = document.getElementById("filter-regime").value.trim();
@@ -256,24 +332,17 @@
       if (reg) url.searchParams.set("regime", reg);
       try {
         const r = await fetch(url.toString());
-        const data = await r.json();
-        JOURNAL = data.picks || [];
+        const d = await r.json();
+        JOURNAL = d.picks || [];
         renderJournal();
       } catch (e) {
-        document.getElementById("journal-tbody").innerHTML =
-          `<tr><td colspan="10" class="text-center text-gray-500 py-6">Failed to load.</td></tr>`;
+        document.getElementById("journal-tbody").innerHTML = `<tr><td colspan="10" class="text-center muted py-6">Failed to load.</td></tr>`;
       }
     }
 
-    document.getElementById("filter-symbol").addEventListener("input", () => {
-      clearTimeout(window.__filterT);
-      window.__filterT = setTimeout(loadJournal, 200);
-    });
-    document.getElementById("filter-regime").addEventListener("input", () => {
-      clearTimeout(window.__filterT);
-      window.__filterT = setTimeout(loadJournal, 200);
-    });
-
+    const debounce = (fn) => { clearTimeout(window.__ft); window.__ft = setTimeout(fn, 200); };
+    document.getElementById("filter-symbol").addEventListener("input", () => debounce(loadJournal));
+    document.getElementById("filter-regime").addEventListener("input", () => debounce(loadJournal));
     document.querySelectorAll("#journal-table th[data-sort]").forEach(th => {
       th.addEventListener("click", () => {
         const k = th.getAttribute("data-sort");
@@ -284,28 +353,20 @@
 
     document.getElementById("backfill-btn").addEventListener("click", async () => {
       const btn = document.getElementById("backfill-btn");
-      btn.disabled = true;
-      btn.textContent = "Backfilling…";
+      btn.disabled = true; btn.textContent = "Updating…";
       try {
-        const r = await fetch("/api/learning/backfill", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        });
-        const data = await r.json();
-        const rep = (data && data.report) || {};
-        btn.textContent = `Labeled ${rep.labeled || 0} · scanned ${rep.scanned || 0}`;
-        await loadSummary();
-        await loadJournal();
-        setTimeout(() => { btn.textContent = "Backfill outcomes"; btn.disabled = false; }, 2500);
-      } catch (e) {
-        btn.textContent = "Backfill failed";
-        setTimeout(() => { btn.textContent = "Backfill outcomes"; btn.disabled = false; }, 2500);
-      }
+        const r = await fetch("/api/learning/backfill", { method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" });
+        const d = await r.json();
+        const rep = (d && d.report) || {};
+        btn.textContent = `Graded ${rep.labeled || 0}`;
+        await loadSummary(); await loadJournal(); await loadStatus();
+      } catch (e) { btn.textContent = "Update failed"; }
+      setTimeout(() => { btn.textContent = "Update now"; btn.disabled = false; }, 2500);
     });
 
-    loadSummary();
-    loadJournal();
+    // Auto-refresh via the shared visibility-aware poller.
+    Cockpit.poll(async () => { await loadSummary(); await loadStatus(); }, 20000, { name: "learning-summary" });
+    Cockpit.poll(loadJournal, 30000, { name: "learning-journal" });
   </script>
 </body>
 </html>

@@ -737,6 +737,22 @@ async def run_one_tick(
     STATE.last_judged_count = judged_count
 
     # ------------------------------------------------------------------
+    # Close the confidence loop: refit the bounded calibrator from the
+    # outcome journal. Network-free (reads data/learning/outcomes.jsonl),
+    # cold-start-safe (identity map until enough resolved trades), and
+    # fully guarded so a calibration hiccup can never break the tick.
+    # The labeling half of the loop (which needs price bars) runs on the
+    # /api/learning/backfill endpoint and the schedule.
+    # ------------------------------------------------------------------
+    if cfg.self_improve_enabled:
+        try:
+            from packages.learning.feedback import recalibrate_from_outcomes
+
+            recalibrate_from_outcomes()
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("learning recalibration failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Phase 21-B: detect current market regime.
     # ------------------------------------------------------------------
     regime_snap = None
