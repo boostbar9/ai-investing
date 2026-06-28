@@ -79,7 +79,7 @@ MAX_CANDIDATES = 10
 MIN_MENTIONS = 3
 
 
-SignalKind = Literal["portfolio", "sentiment", "news"]
+SignalKind = Literal["portfolio", "sentiment", "news", "scan"]
 SweepStatus = Literal["idle", "running", "done", "failed"]
 
 
@@ -365,6 +365,46 @@ def merge_portfolio_candidates(
     return base
 
 
+def merge_scan_candidates(
+    base: list[Candidate],
+    scan_symbols: list[str],
+) -> list[Candidate]:
+    """ADDITIVELY union Robinhood screener hits into the candidate list.
+
+    Screener tickers that aren't already candidates are appended as low-
+    confidence ``scan`` candidates so the research view surfaces them, but
+    they never displace or down-rank sentiment/portfolio candidates. An empty
+    ``scan_symbols`` (the common case -- the user has no saved scans, or RH is
+    off) leaves ``base`` untouched, so the universe only ever grows, never
+    shrinks. A scan hit is NEVER bearish: it's a 'worth a look' nudge.
+    """
+    if not scan_symbols:
+        return base
+    existing = {c.symbol.upper() for c in base}
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    for raw in scan_symbols:
+        sym = str(raw or "").strip().upper()
+        if not sym or sym in existing:
+            continue
+        existing.add(sym)
+        base.append(
+            Candidate(
+                symbol=sym,
+                signal_kind="scan",
+                thesis=(
+                    f"{sym}: surfaced by a Robinhood screener. No sentiment "
+                    "signal yet -- worth a look before next session."
+                ),
+                confidence=0.3,
+                sentiment_score=0.0,
+                mentions=0,
+                sources=["rh_scans"],
+                created_at=now,
+            )
+        )
+    return base
+
+
 # ---------------------------------------------------------------------------
 # Async gatherers (network)
 # ---------------------------------------------------------------------------
@@ -382,6 +422,20 @@ async def _gather_portfolio() -> list[str]:
         return [p.symbol for p in positions if getattr(p, "symbol", None)]
     except Exception as exc:  # pragma: no cover - broker config varies
         logger.warning("portfolio gather failed: %s", exc.__class__.__name__)
+        return []
+
+
+async def _gather_rh_scans() -> list[str]:
+    """Robinhood saved-screener tickers (read-only), ADDITIVE candidate
+    sourcing. Returns ``[]`` on any failure / when RH is off or has no saved
+    scans -- the caller then just keeps the existing universe. Never raises."""
+    try:
+        from packages.data import rh_live
+
+        res = await rh_live.get_scan_candidates()
+        return list(res.value) if res.ok and isinstance(res.value, list) else []
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("rh scans gather failed: %s", exc.__class__.__name__)
         return []
 
 
@@ -744,6 +798,20 @@ async def run_sweep(
         aggregated = aggregate_sentiment(news_items, window_hours=24)
         cands = candidates_from_sentiment(aggregated)
         cands = merge_portfolio_candidates(cands, pf_symbols)
+
+        # ADDITIVE candidate sourcing from Robinhood saved screeners. Only
+        # runs when RH is actually connected, so in tests / when RH is off
+        # this is a no-op: no new candidates and no sources_meta entry, which
+        # keeps the existing tested sweep behaviour byte-for-byte unchanged.
+        try:
+            from packages.execution.robinhood import is_connected as _rh_connected
+        except Exception:  # pragma: no cover — import safety
+            _rh_connected = lambda: False  # noqa: E731
+        if _rh_connected():
+            scan_t0 = time.monotonic()
+            scan_symbols = await _gather_rh_scans()
+            _meta("rh_scans", True, len(scan_symbols), scan_t0)
+            cands = merge_scan_candidates(cands, scan_symbols)
 
         # Phase 10: per-ticker fan-out for Yahoo + EDGAR + per-ticker
         # Reddit. Runs AFTER first-pass candidate generation so we

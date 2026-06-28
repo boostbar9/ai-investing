@@ -3050,6 +3050,42 @@ _HEALTH_SOURCE_DISPLAY: dict[str, dict[str, str]] = {
         "help": "Real-time quotes and company news. Needs an API key; the "
         "REST path keeps working even when the live websocket is down.",
     },
+    "rh_quotes": {
+        "label": "Robinhood live quotes",
+        "tier": "market",
+        "help": "Real bid/ask/last from Robinhood (read-only). Primary price "
+        "source for research/scoring; falls back to Yahoo when off or down.",
+    },
+    "rh_bars": {
+        "label": "Robinhood historical bars",
+        "tier": "market",
+        "help": "Daily/intraday history from Robinhood (read-only). Primary "
+        "bar source; falls back to Yahoo/parquet when off or down.",
+    },
+    "rh_fundamentals": {
+        "label": "Robinhood fundamentals",
+        "tier": "fundamentals",
+        "help": "Market cap, P/E, 52-week range from Robinhood (read-only). "
+        "Falls back to the existing fundamentals feed when off or down.",
+    },
+    "rh_earnings": {
+        "label": "Robinhood earnings calendar",
+        "tier": "fundamentals",
+        "help": "Upcoming earnings dates + EPS estimates from Robinhood "
+        "(read-only). Used to flag imminent earnings; optional signal.",
+    },
+    "rh_indexes": {
+        "label": "Robinhood index levels (regime)",
+        "tier": "market",
+        "help": "Live index levels (e.g. VIX) from Robinhood (read-only) for "
+        "market-regime detection. Falls back to Yahoo ^VIX when off or down.",
+    },
+    "rh_scans": {
+        "label": "Robinhood screeners (candidates)",
+        "tier": "market",
+        "help": "Tickers from your saved Robinhood screeners, added to the "
+        "research universe. Additive only — never shrinks the universe.",
+    },
 }
 
 
@@ -4844,12 +4880,32 @@ async def _autonomy_startup() -> None:  # pragma: no cover
             log.warning("trading-controls processing failed: %s", exc)
             return {"error": str(exc)[:200]}
 
+    # Regime inputs: Robinhood live as PRIMARY, yfinance defaults as fallback.
+    # rh_live returns None whenever RH is disabled/disconnected/failing (incl.
+    # in tests, where is_connected() is False), so the existing yfinance path
+    # is used unchanged -- the protected regime/yfinance behaviour is intact.
+    def _regime_price_provider(symbol: str, *, days: int = 90) -> list[float] | None:
+        from packages.data import rh_live
+
+        rh = rh_live.regime_price_provider(symbol, days=days)
+        if rh:
+            return rh
+        return autonomy_regime.default_price_provider(symbol, days=days)
+
+    def _regime_vix_provider() -> float | None:
+        from packages.data import rh_live
+
+        rh = rh_live.regime_vix_provider()
+        if rh is not None:
+            return rh
+        return autonomy_regime.default_vix_provider()
+
     autonomy_brain.configure(
         on_curiosity_focus=_agent_sched_set_symbols,
         portfolio_symbols_getter=_portfolio_symbols_snapshot,
         price_lookup=_last_price,
-        regime_price_provider=autonomy_regime.default_price_provider,
-        regime_vix_provider=autonomy_regime.default_vix_provider,
+        regime_price_provider=_regime_price_provider,
+        regime_vix_provider=_regime_vix_provider,
         exit_rules_tick=_phase25_exit_rules_tick,
         dip_watch_tick=_phase25_dip_watch_tick,
         quote_warmup_tick=_phase25_quote_warmup_tick,

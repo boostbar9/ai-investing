@@ -919,6 +919,278 @@ class RobinhoodAgenticBroker(Broker):
         obj = _normalize_obj(res.content)
         return obj or None
 
+    # ---- extended read-only market-data tools (safe in shadow) ----------
+    #
+    # These back the RH-backed live data feed
+    # (``packages/data/rh_live.py``) that supplies the AI's
+    # research/scoring/regime decisions with a primary, more-reliable
+    # source than some free feeds. They are STRICTLY read-only: each calls
+    # a Robinhood read tool and NEVER touches ``place_equity_order`` /
+    # ``cancel_*``. Every one fails safe -- any error or missing field
+    # returns ``None`` / ``[]`` so a caller falls back to the existing feed
+    # rather than fabricating a value or treating absence as bearish.
+
+    async def equity_historicals(
+        self,
+        symbol: str,
+        *,
+        start_time: str | None = None,
+        interval: str | None = None,
+        span: str | None = None,
+        bounds: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Historical/intraday bars for ``symbol`` via ``get_equity_historicals``.
+
+        Verified required args are ``symbols`` + ``start_time``. The optional
+        ``interval`` / ``span`` / ``bounds`` knobs are forwarded only when
+        supplied so we match whatever the live tool's input schema accepts
+        without guessing defaults. Returns a list of raw bar-row dicts
+        (``begins_at``/``open_price``/``close_price``/...); ``[]`` on any
+        failure. Never raises, never trades.
+        """
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return []
+        args: dict[str, Any] = {"symbols": [sym]}
+        if start_time is not None:
+            args["start_time"] = start_time
+        if interval is not None:
+            args["interval"] = interval
+        if span is not None:
+            args["span"] = span
+        if bounds is not None:
+            args["bounds"] = bounds
+        try:
+            client = await self._client()
+            res = await client.call_tool(
+                "get_equity_historicals", self._acct_args(args)
+            )
+        except (BrokerError, McpError) as exc:
+            logger.warning(
+                "robinhood historicals failed for %s: %s",
+                sym,
+                exc.__class__.__name__,
+            )
+            return []
+        rows = _normalize_rows(
+            res.content,
+            keys=("historicals", "results", "items", "data", "bars"),
+        )
+        # Some servers nest per-symbol: ``[{"symbol":..,"historicals":[...]}]``.
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            nested = r.get("historicals")
+            if isinstance(nested, list):
+                out.extend(b for b in nested if isinstance(b, dict))
+            else:
+                out.append(r)
+        return out
+
+    async def equity_fundamentals(self, symbol: str) -> dict[str, Any] | None:
+        """Company fundamentals for ``symbol`` via ``get_equity_fundamentals``.
+        Returns the row dict (market_cap/pe_ratio/high_52/low_52/...) or
+        ``None`` on any failure. Never raises, never trades."""
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return None
+        try:
+            client = await self._client()
+            res = await client.call_tool(
+                "get_equity_fundamentals", self._acct_args({"symbols": [sym]})
+            )
+        except (BrokerError, McpError) as exc:
+            logger.warning(
+                "robinhood fundamentals failed for %s: %s",
+                sym,
+                exc.__class__.__name__,
+            )
+            return None
+        rows = _normalize_rows(
+            res.content, keys=("fundamentals", "results", "items", "data")
+        )
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            rsym = str(r.get("symbol") or r.get("instrument") or "").upper()
+            if not rsym or rsym == sym:
+                return r
+        obj = _normalize_obj(res.content)
+        return obj or None
+
+    async def earnings_calendar(
+        self, symbol: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Upcoming earnings via ``get_earnings_calendar`` (no args required;
+        optionally filtered by ``symbol``). Returns a list of earnings rows
+        (date/timing/eps estimate+actual); ``[]`` on any failure."""
+        args: dict[str, Any] = {}
+        sym = str(symbol or "").strip().upper()
+        if sym:
+            args["symbols"] = [sym]
+        try:
+            client = await self._client()
+            res = await client.call_tool(
+                "get_earnings_calendar", self._acct_args(args)
+            )
+        except (BrokerError, McpError) as exc:
+            logger.warning(
+                "robinhood earnings calendar failed: %s", exc.__class__.__name__
+            )
+            return []
+        return [
+            r
+            for r in _normalize_rows(
+                res.content, keys=("earnings", "calendar", "results", "items", "data")
+            )
+            if isinstance(r, dict)
+        ]
+
+    async def earnings_results(self, symbol: str) -> list[dict[str, Any]]:
+        """Historical earnings results for ``symbol`` via
+        ``get_earnings_results``. Returns a list of result rows; ``[]`` on
+        any failure."""
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return []
+        try:
+            client = await self._client()
+            res = await client.call_tool(
+                "get_earnings_results", self._acct_args({"symbols": [sym]})
+            )
+        except (BrokerError, McpError) as exc:
+            logger.warning(
+                "robinhood earnings results failed for %s: %s",
+                sym,
+                exc.__class__.__name__,
+            )
+            return []
+        return [
+            r
+            for r in _normalize_rows(
+                res.content, keys=("earnings", "results", "items", "data")
+            )
+            if isinstance(r, dict)
+        ]
+
+    async def indexes(self) -> list[dict[str, Any]]:
+        """Market indexes via ``get_indexes`` (no args). Returns a list of
+        index rows (id + symbol/name) used to resolve ``instrument_ids`` for
+        :meth:`index_quotes`; ``[]`` on any failure."""
+        try:
+            client = await self._client()
+            res = await client.call_tool("get_indexes", self._acct_args())
+        except (BrokerError, McpError) as exc:
+            logger.warning(
+                "robinhood indexes failed: %s", exc.__class__.__name__
+            )
+            return []
+        return [
+            r
+            for r in _normalize_rows(
+                res.content, keys=("indexes", "results", "items", "data")
+            )
+            if isinstance(r, dict)
+        ]
+
+    async def index_quotes(
+        self, instrument_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Live index levels via ``get_index_quotes`` for the given
+        ``instrument_ids`` (resolve via :meth:`indexes`). Returns a list of
+        quote rows; ``[]`` on any failure."""
+        ids = [str(i).strip() for i in (instrument_ids or []) if str(i).strip()]
+        if not ids:
+            return []
+        try:
+            client = await self._client()
+            res = await client.call_tool(
+                "get_index_quotes", self._acct_args({"instrument_ids": ids})
+            )
+        except (BrokerError, McpError) as exc:
+            logger.warning(
+                "robinhood index quotes failed: %s", exc.__class__.__name__
+            )
+            return []
+        return [
+            r
+            for r in _normalize_rows(
+                res.content, keys=("quotes", "results", "items", "data")
+            )
+            if isinstance(r, dict)
+        ]
+
+    async def scans(self) -> list[dict[str, Any]]:
+        """Saved screeners via ``get_scans`` (no args). Returns a list of
+        scan rows (id + name); ``[]`` on any failure or when the user has no
+        saved scans (the caller degrades cleanly to the existing universe)."""
+        try:
+            client = await self._client()
+            res = await client.call_tool("get_scans", self._acct_args())
+        except (BrokerError, McpError) as exc:
+            logger.warning(
+                "robinhood scans failed: %s", exc.__class__.__name__
+            )
+            return []
+        return [
+            r
+            for r in _normalize_rows(
+                res.content, keys=("scans", "results", "items", "data")
+            )
+            if isinstance(r, dict)
+        ]
+
+    async def run_scan(self, scan_id: str) -> list[dict[str, Any]]:
+        """Run a saved screener via ``run_scan``. Returns a list of result
+        rows (each carrying a ``symbol``); ``[]`` on any failure. READ-ONLY:
+        running a screener never trades."""
+        sid = str(scan_id or "").strip()
+        if not sid:
+            return []
+        try:
+            client = await self._client()
+            res = await client.call_tool(
+                "run_scan", self._acct_args({"scan_id": sid})
+            )
+        except (BrokerError, McpError) as exc:
+            logger.warning(
+                "robinhood run_scan failed for %s: %s",
+                sid,
+                exc.__class__.__name__,
+            )
+            return []
+        return [
+            r
+            for r in _normalize_rows(
+                res.content,
+                keys=("results", "matches", "symbols", "items", "data"),
+            )
+            if isinstance(r, (dict, str))
+        ]
+
+    async def realized_pnl(
+        self, account_number: str | None = None
+    ) -> dict[str, Any] | None:
+        """Realized P&L via ``get_realized_pnl`` (requires an account number;
+        falls back to this broker's resolved agentic account). Returns the
+        P&L dict or ``None`` on any failure. Read-only."""
+        acct = str(account_number or self._account_number or "").strip()
+        if not acct:
+            return None
+        try:
+            client = await self._client()
+            res = await client.call_tool(
+                "get_realized_pnl", {"account_number": acct}
+            )
+        except (BrokerError, McpError) as exc:
+            logger.warning(
+                "robinhood realized pnl failed: %s", exc.__class__.__name__
+            )
+            return None
+        obj = _normalize_obj(res.content)
+        return obj or None
+
     async def aclose(self) -> None:
         """Close the cached MCP client if we own one. Safe to call
         multiple times and when no client was ever built. The injected
