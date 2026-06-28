@@ -346,6 +346,32 @@ async def test_indexes_empty_records_failure():
     assert snap["consecutive_failures"] >= 1
 
 
+async def test_indexes_closed_market_vix_empty_value_is_success():
+    # Live closed-market (Sunday) shape: get_indexes lists VIX but its quote
+    # carries an empty current_value (no numeric level). This is NOT a failure:
+    # rh_indexes must report OK and rh_vix_level returns None so regime falls
+    # back to yfinance ^VIX.
+    broker = FakeBroker(
+        indexes=[
+            {
+                "id": "3b912aa2-88f9-4682-8ae3-e39520bdf4db",
+                "symbol": "VIX",
+                "name": "",
+                "current_value": "",
+                "trade_halted": False,
+            },
+            {"id": "cc1fd266", "symbol": "I00001US"},
+        ],
+        index_quotes=[{"current_value": ""}],  # closed market -> no numeric level
+    )
+    rh_live.set_broker_for_test(broker)
+    assert await rh_live.rh_vix_level() is None
+    snap = rh_live.get_registry().snapshot(rh_live.SRC_INDEXES)
+    assert snap["status"] == "ok"
+    assert snap["consecutive_failures"] == 0
+    assert "index_quotes" in broker.calls  # VIX id resolved -> quote attempted
+
+
 # ---------------------------------------------------------------------------
 # Sync->async bridge: callable repeatedly without "Event loop is closed"
 # ---------------------------------------------------------------------------

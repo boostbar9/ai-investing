@@ -158,6 +158,50 @@ async def test_index_quotes_empty_ids_skips_call():
     assert fake.calls == []  # never hit the server
 
 
+async def test_indexes_calls_get_indexes_without_account_arg():
+    # The live server returns an EMPTY catalog when account_number is injected;
+    # get_indexes must be called bare. Reproduce the real nested
+    # ``{"data": {"indexes": [...]}}`` payload (VIX current_value="" on a closed
+    # Sunday market) and assert the rows survive AND no account arg leaks.
+    fake = FakeMcp(
+        {
+            "get_indexes": _envelope(
+                {
+                    "indexes": [
+                        {
+                            "id": "3b912aa2-88f9-4682-8ae3-e39520bdf4db",
+                            "symbol": "VIX",
+                            "name": "",
+                            "current_value": "",
+                            "trade_halted": False,
+                            "updated_at": "",
+                        },
+                        {"id": "cc1fd266", "symbol": "I00001US"},
+                    ]
+                }
+            )
+        }
+    )
+    rows = await _broker(fake).indexes()
+    assert [r["symbol"] for r in rows] == ["VIX", "I00001US"]
+    assert rows[0]["id"] == "3b912aa2-88f9-4682-8ae3-e39520bdf4db"
+    name, args = fake.calls[0]
+    assert name == "get_indexes"
+    assert "account_number" not in args  # bare call -> populated catalog
+    assert args == {}
+
+
+async def test_index_quotes_calls_without_account_arg():
+    fake = FakeMcp(
+        {"get_index_quotes": _envelope({"quotes": [{"last_price": 18.0}]})}
+    )
+    rows = await _broker(fake).index_quotes(["v1"])
+    assert rows[0]["last_price"] == 18.0
+    _, args = fake.calls[0]
+    assert "account_number" not in args
+    assert args == {"instrument_ids": ["v1"]}
+
+
 # ---------------------------------------------------------------------------
 # scans
 # ---------------------------------------------------------------------------

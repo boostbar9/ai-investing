@@ -1080,7 +1080,9 @@ class RobinhoodAgenticBroker(Broker):
         :meth:`index_quotes`; ``[]`` on any failure."""
         try:
             client = await self._client()
-            res = await client.call_tool("get_indexes", self._acct_args())
+            # get_indexes takes NO account arg; injecting account_number makes
+            # the live server return an empty catalog. Call it bare.
+            res = await client.call_tool("get_indexes", {})
         except (BrokerError, McpError) as exc:
             logger.warning(
                 "robinhood indexes failed: %s", exc.__class__.__name__
@@ -1105,8 +1107,10 @@ class RobinhoodAgenticBroker(Broker):
             return []
         try:
             client = await self._client()
+            # get_index_quotes is keyed solely by instrument_ids; an account
+            # arg is unnecessary and risks the same empty-catalog response.
             res = await client.call_tool(
-                "get_index_quotes", self._acct_args({"instrument_ids": ids})
+                "get_index_quotes", {"instrument_ids": ids}
             )
         except (BrokerError, McpError) as exc:
             logger.warning(
