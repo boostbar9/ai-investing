@@ -262,6 +262,15 @@ if (Test-CockpitReachable -Url $CockpitUrl) {
     Write-Host "Cockpit is up at $CockpitUrl." -ForegroundColor Green
 }
 
+# Pop the dashboard open in the default browser right away so the user
+# sees the interface the moment it launches (no hunting for a URL).
+try {
+    Start-Process $CockpitUrl | Out-Null
+    Write-Host "Opened the dashboard in your browser." -ForegroundColor Green
+} catch {
+    Write-Host "Could not auto-open the browser; visit $CockpitUrl manually." -ForegroundColor Yellow
+}
+
 # --------------------------------------------------------------------
 # 3. cloudflared
 # --------------------------------------------------------------------
@@ -370,12 +379,61 @@ if (-not $NoPublish) {
 }
 
 # --------------------------------------------------------------------
-# 7. Status block + block on tunnel
+# 7a. Phone access: write a QR-code page and open it
+# --------------------------------------------------------------------
+# The tunnel URL IS the phone-accessible dashboard (same FastAPI app),
+# so all the phone needs is that URL. We render a scannable QR locally
+# in a tiny self-contained HTML page (QR drawn client-side -- no extra
+# Python packages, no third-party image API, works offline once open).
+Write-Section "Step 7: Phone access"
+$qrPage = Join-Path $env:TEMP "cockpit_phone.html"
+$qrHtml = @"
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>View AI Trading Bot on your phone</title>
+<style>
+  body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#0b0f14;color:#e6edf3;
+       margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:24px}
+  h1{font-size:20px;margin:0}
+  p{color:#9fb0c0;margin:4px 0;text-align:center;max-width:420px}
+  #qr{background:#fff;padding:16px;border-radius:12px}
+  code{background:#161b22;padding:6px 10px;border-radius:8px;font-size:13px;word-break:break-all;color:#7ee787}
+  a.btn{background:#00e5c4;color:#06231f;text-decoration:none;font-weight:700;padding:10px 18px;border-radius:10px}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+</head><body>
+  <h1>📱 Open the bot on your phone</h1>
+  <p>Scan this with your phone camera. It opens the live dashboard from anywhere.</p>
+  <div id="qr"></div>
+  <p>or type this address into your phone browser:</p>
+  <code>$publicUrl</code>
+  <a class="btn" href="$publicUrl" target="_blank">Open here instead</a>
+  <p style="font-size:12px;color:#5b6b7b">This page is safe to leave open. The link works only while the launcher window stays running.</p>
+<script>
+  QRCode.toCanvas(document.createElement('canvas'), '$publicUrl', {width:240, margin:1},
+    function(err, canvas){ if(!err){ document.getElementById('qr').appendChild(canvas); }
+      else { document.getElementById('qr').textContent='(QR failed to render \u2014 use the address below)'; } });
+</script>
+</body></html>
+"@
+Set-Content -Path $qrPage -Value $qrHtml -Encoding UTF8
+try {
+    Start-Process $qrPage | Out-Null
+    Write-Host "Opened a QR-code page -- scan it with your phone to view the bot." -ForegroundColor Green
+} catch {
+    Write-Host "QR page saved to $qrPage (open it to scan)." -ForegroundColor Yellow
+}
+
+# --------------------------------------------------------------------
+# 7b. Status block + block on tunnel
 # --------------------------------------------------------------------
 Write-Section "Cockpit + tunnel are LIVE"
 Write-Host ""
-Write-Host "Public URL : $publicUrl" -ForegroundColor Green
-Write-Host "Token      : $token" -ForegroundColor Green
+Write-Host "On THIS computer : $CockpitUrl" -ForegroundColor Green
+Write-Host "On your PHONE    : $publicUrl" -ForegroundColor Green
+Write-Host "  (scan the QR page that just opened, or type that address)" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "Token      : $token" -ForegroundColor DarkGray
 Write-Host "Handle     : $HandlePath" -ForegroundColor DarkGray
 if (-not $NoPublish) {
     Write-Host "Published  : origin/cockpit-handle" -ForegroundColor DarkGray

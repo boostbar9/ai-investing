@@ -2464,16 +2464,43 @@ def _compute_robinhood_readiness() -> dict[str, Any]:
     # Next action = first unmet step in order (including the rh_mode flip
     # once everything else is green).
     next_step = "You're ready - flip the switch to LIVE when you want real trading."
+    next_id: str | None = None
     for c in checks:
         if c.get("informational"):
             continue
         if not c["ok"]:
             next_step = c["todo"]
+            next_id = c["id"]
             break
+
+    # Map the first unmet check to a single concrete UI action so the
+    # dashboard can offer ONE button that always does the right next
+    # thing. ``kind`` tells the frontend which handler to fire; ``label``
+    # is the plain-language button text. Steps the user must do in the
+    # Robinhood app (funding) or that require the §16 practice window
+    # (promotion_gate) are marked ``manual`` -- the button explains and
+    # links rather than pretending to one-click them.
+    actions: dict[str, dict[str, str]] = {
+        "connected": {"kind": "connect", "label": "Connect Robinhood"},
+        "account": {"kind": "find_account", "label": "Find my AI account"},
+        "funded": {"kind": "manual", "label": "Add money in the Robinhood app"},
+        "backend": {"kind": "select_robinhood", "label": "Make Robinhood the active broker"},
+        "cap": {"kind": "scroll_cap", "label": "Set a spending cap"},
+        "enable_live": {"kind": "goto_promote", "label": "Arm live trading"},
+        "promotion_gate": {"kind": "manual", "label": "Keep practicing to pass the gate"},
+    }
+    if next_id is None:
+        # Everything is green except (optionally) the final LIVE flip.
+        next_action = {"kind": "go_live", "label": "Go LIVE (real money)"}
+    else:
+        next_action = actions.get(
+            next_id, {"kind": "manual", "label": "See the checklist"}
+        )
 
     return {
         "ready": ready,
         "next_step": next_step,
+        "next_action": next_action,
         "rh_mode": rh_mode,
         "broker_backend": backend,
         "cap_usd": cap,

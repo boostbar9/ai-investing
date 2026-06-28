@@ -349,11 +349,17 @@
       <!-- Go-live checklist card -->
       <div class="card p-4">
         <h2 class="section-h mb-2">What's needed to go live</h2>
-        <div id="rh-next-step" class="text-sm mb-3 p-2 rounded"
+        <div id="rh-next-step" class="text-sm mb-3 p-3 rounded"
              style="background:rgba(0,229,196,.08);border:1px solid rgba(0,229,196,.25);color:var(--text-primary)">
           <span class="eyebrow" style="color:var(--accent)">Next step</span>
-          <div id="rh-next-step-text" class="mt-1">Loading…</div>
+          <div id="rh-next-step-text" class="mt-1 mb-3">Loading…</div>
+          <!-- ONE smart button that always does the right next thing -->
+          <button id="rh-do-next-btn" class="btn btn-primary btn-sm w-full" style="justify-content:center;">
+            <span id="rh-do-next-label">Checking…</span>
+          </button>
+          <div id="rh-do-next-hint" class="text-xs mt-2" style="color:var(--text-muted)"></div>
         </div>
+        <div class="eyebrow mb-2" style="color:var(--text-muted)">Full checklist</div>
         <ul id="rh-checklist" class="space-y-1.5 text-sm"></ul>
       </div>
     </section>
@@ -1597,6 +1603,7 @@
     (function () {
       const $ = (id) => document.getElementById(id);
       let lastReady = false;
+      let lastNextAction = null;
 
       function setPill(el, cls, text) {
         if (!el) return;
@@ -1695,6 +1702,25 @@
             : readiness.next_step;
         }
 
+        // --- the one smart 'Do this next' button ---
+        lastNextAction = (readiness && readiness.next_action) || null;
+        const doBtn = $('rh-do-next-btn');
+        const doLbl = $('rh-do-next-label');
+        const doHint = $('rh-do-next-hint');
+        if (doBtn && lastNextAction) {
+          doLbl.textContent = lastNextAction.label || 'Do next step';
+          const manual = lastNextAction.kind === 'manual';
+          const live = lastNextAction.kind === 'go_live';
+          // Green for normal next steps, red+armed look for the final LIVE flip,
+          // muted for steps the user must do in the Robinhood app.
+          doBtn.className = 'btn btn-sm w-full ' +
+            (live ? 'btn-danger' : (manual ? 'btn-ghost' : 'btn-primary'));
+          doBtn.style.justifyContent = 'center';
+          doHint.textContent = manual
+            ? 'Do this in the Robinhood app, then come back — this updates automatically.'
+            : (live ? 'You’ll be asked to type GO LIVE to confirm.' : '');
+        }
+
         // --- broker selector + dual pipeline badges ---
         const alpacaActive = backend === 'alpaca_paper';
         setPill($('pipe-alpaca-badge'), alpacaActive ? 'pill-success' : 'pill-muted',
@@ -1738,8 +1764,8 @@
         }
       }
 
-      // --- actions ---
-      $('rh-connect-btn').addEventListener('click', async () => {
+      // --- actions (named so the smart 'Do next' button can reuse them) ---
+      async function doConnect() {
         try {
           const r = await Cockpit.api.post('/api/onboarding/robinhood/connect', {});
           if (!r || !r.ok) { Cockpit.toastError((r && r.error) || 'Could not start Robinhood sign-in'); return; }
@@ -1747,7 +1773,50 @@
           $('rh-paste-box').classList.remove('hidden');
           Cockpit.toastSuccess('Robinhood sign-in opened in a new tab');
         } catch (e) { Cockpit.toastError('Could not start Robinhood sign-in'); }
-      });
+      }
+      async function doFindAccount() {
+        try {
+          const r = await Cockpit.api.post('/api/onboarding/robinhood/select-account', {});
+          if (r && r.ok) { Cockpit.toastSuccess('Found your AI account ' + r.account_masked); }
+          else { Cockpit.toastWarn('No AI account found yet — open your Agentic account in the Robinhood app first'); }
+          refreshControlCenter();
+        } catch (e) { Cockpit.toastError('Could not look up your account'); }
+      }
+      async function doGoLive() {
+        if (!lastReady) { Cockpit.toastWarn('Not ready for live yet — finish the checklist first'); return; }
+        const typed = prompt(
+          'This turns ON real-money trading in your Robinhood account.\n\n' +
+          'Type GO LIVE to confirm:');
+        if (typed !== 'GO LIVE') { Cockpit.toastWarn('Cancelled — still in practice mode'); return; }
+        try {
+          await Cockpit.api.post('/api/onboarding/robinhood/mode', { mode: 'live', confirm: true });
+          Cockpit.toastSuccess('LIVE trading armed'); refreshControlCenter();
+        } catch (e) {
+          Cockpit.toastError('Server refused — not ready for live. See the checklist.');
+          refreshControlCenter();
+        }
+      }
+      // The one smart button. ``lastNextAction`` is set on every refresh.
+      async function doNextAction() {
+        const a = lastNextAction || {};
+        switch (a.kind) {
+          case 'connect':           return doConnect();
+          case 'find_account':      return doFindAccount();
+          case 'select_robinhood':  return pickBackend('robinhood');
+          case 'go_live':           return doGoLive();
+          case 'scroll_cap':
+            location.href = '/onboarding'; return;
+          case 'goto_promote':
+            location.href = '/promote'; return;
+          case 'manual':
+          default:
+            Cockpit.toastWarn('This step is done in the Robinhood app — see the hint below the button.');
+            $('rh-control-center').scrollIntoView({ behavior: 'smooth' });
+            return;
+        }
+      }
+      $('rh-do-next-btn').addEventListener('click', doNextAction);
+      $('rh-connect-btn').addEventListener('click', doConnect);
       $('rh-finish-btn').addEventListener('click', async () => {
         const url = $('rh-paste-input').value.trim();
         if (!url) { Cockpit.toastWarn('Paste the address Robinhood sent you to'); return; }
@@ -1763,33 +1832,13 @@
           Cockpit.toastSuccess('Robinhood disconnected'); refreshControlCenter();
         } catch (e) { Cockpit.toastError('Disconnect failed'); }
       });
-      $('rh-findacct-btn').addEventListener('click', async () => {
-        try {
-          const r = await Cockpit.api.post('/api/onboarding/robinhood/select-account', {});
-          if (r && r.ok) { Cockpit.toastSuccess('Found your AI account ' + r.account_masked); }
-          else { Cockpit.toastWarn('No AI account found yet — open your Agentic account in the Robinhood app first'); }
-          refreshControlCenter();
-        } catch (e) { Cockpit.toastError('Could not look up your account'); }
-      });
+      $('rh-findacct-btn').addEventListener('click', doFindAccount);
       $('rh-shadow-btn').addEventListener('click', async () => {
         try { await Cockpit.api.post('/api/onboarding/robinhood/mode', { mode: 'shadow' });
           Cockpit.toastSuccess('Back to practice mode (no real money)'); refreshControlCenter();
         } catch (e) { Cockpit.toastError('Could not switch to practice mode'); }
       });
-      $('rh-live-btn').addEventListener('click', async () => {
-        if (!lastReady) { Cockpit.toastWarn('Not ready for live yet — finish the checklist first'); return; }
-        const typed = prompt(
-          'This turns ON real-money trading in your Robinhood account.\n\n' +
-          'Type GO LIVE to confirm:');
-        if (typed !== 'GO LIVE') { Cockpit.toastWarn('Cancelled — still in practice mode'); return; }
-        try {
-          await Cockpit.api.post('/api/onboarding/robinhood/mode', { mode: 'live', confirm: true });
-          Cockpit.toastSuccess('LIVE trading armed'); refreshControlCenter();
-        } catch (e) {
-          Cockpit.toastError('Server refused — not ready for live. See the checklist.');
-          refreshControlCenter();
-        }
-      });
+      $('rh-live-btn').addEventListener('click', doGoLive);
       async function pickBackend(backend) {
         try { await Cockpit.api.post('/api/onboarding/broker-backend', { backend });
           Cockpit.toastSuccess(backend === 'robinhood' ? 'Robinhood is now the active broker (still practice)' : 'Back to Alpaca paper');
