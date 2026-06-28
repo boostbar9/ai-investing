@@ -81,6 +81,50 @@ log = logging.getLogger("cockpit")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
+def _install_web_file_logging() -> None:
+    """Mirror the web-server's log output to a rotating file. Idempotent.
+
+    The Robinhood/OAuth onboarding routes log to *this* uvicorn process.
+    Without a file handler that output only reaches the console window, so
+    the remote bridge (``/api/remote/weblog``) can't surface connect errors
+    to a remote operator. We ADD a RotatingFileHandler to the root logger
+    (alongside the existing console handler from basicConfig) so every
+    logger that propagates to root — including the robinhood/onboarding
+    loggers and uvicorn — is captured. Console logging is unchanged.
+
+    Failures here are swallowed: file logging is observability, never a
+    reason to take the server down.
+    """
+    from logging.handlers import RotatingFileHandler
+
+    from packages.cockpit.web.remote import WEB_LOG_PATH
+
+    root = logging.getLogger()
+    for existing in root.handlers:
+        if getattr(existing, "_cockpit_web_file", False):
+            return
+    try:
+        WEB_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            WEB_LOG_PATH,
+            maxBytes=2 * 1024 * 1024,
+            backupCount=2,
+            encoding="utf-8",
+        )
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        handler._cockpit_web_file = True  # type: ignore[attr-defined]
+        root.addHandler(handler)
+    except OSError:
+        # Read-only FS, permissions, etc. — keep console logging only.
+        pass
+
+
+_install_web_file_logging()
+
+
 # --------------------------------------------------------------------------
 # Quiet the uvicorn access log
 # --------------------------------------------------------------------------

@@ -51,6 +51,7 @@ import contextlib
 import hmac
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -62,6 +63,42 @@ from packages.cockpit import updater as cockpit_updater
 from packages.cockpit.state import load_state, record_action, save_state
 
 log = logging.getLogger(__name__)
+
+
+# Path to the web-server's own log file. The Robinhood/OAuth onboarding
+# routes log to the uvicorn process (this app), whose output otherwise only
+# reaches the console window. server.py attaches a RotatingFileHandler that
+# mirrors that output here so the remote bridge can surface connect errors.
+# Defined in this module (rather than imported from server.py) to avoid a
+# circular import — server.py imports this module at startup.
+# packages/cockpit/web/remote.py -> parents[3] == repo root.
+WEB_LOG_PATH = Path(__file__).resolve().parents[3] / "data" / "cockpit" / "logs" / "cockpit_web.log"
+
+# Default and cap for the /weblog tail size, in bytes. The default mirrors
+# proc.tail_log (64KB); the cap bounds a hostile/buggy caller.
+_WEBLOG_DEFAULT_BYTES = 64 * 1024
+_WEBLOG_MAX_BYTES = 1024 * 1024
+
+
+def _tail_web_log(max_bytes: int) -> str:
+    """Return up to ``max_bytes`` of the tail of the web-server log file.
+
+    Empty string if the file doesn't exist yet (the server may not have
+    written anything, or file logging may be disabled). Mirrors the
+    byte-tail approach of :func:`packages.cockpit.proc.tail_log`.
+    """
+    path = WEB_LOG_PATH
+    if not path.exists():
+        return ""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read()
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 # Env var that gates the entire surface. When unset/empty, every route
@@ -261,6 +298,36 @@ def build_router() -> APIRouter:
                 body = "(no log on disk yet)"
             return PlainTextResponse(body)
         return {"kind": "paper_loop", "tail": cockpit_proc.tail_log("paper_loop")}
+
+    @router.get("/weblog")
+    def remote_weblog(
+        lines: int = 0,
+        bytes: int = 0,
+        authorization: str | None = Header(default=None),
+        x_cockpit_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Tail the web-server's own log (where Robinhood/OAuth errors land).
+
+        The paper-loop log (/log) only carries the child trading process's
+        output. Robinhood onboarding logs to *this* uvicorn process, so we
+        expose its log file separately for remote debugging.
+
+        Tail size is controlled by an optional ``?bytes=`` (preferred) or
+        ``?lines=`` query param, both clamped to a sane cap. Returns an
+        empty tail (still 200) if the log file doesn't exist yet, rather
+        than erroring.
+        """
+        require_remote_auth(authorization, x_cockpit_token)
+        # Resolve the requested tail size to a byte budget. ``bytes`` wins
+        # if given; otherwise approximate ``lines`` at ~256 bytes/line.
+        if bytes > 0:
+            max_bytes = bytes
+        elif lines > 0:
+            max_bytes = lines * 256
+        else:
+            max_bytes = _WEBLOG_DEFAULT_BYTES
+        max_bytes = max(1, min(max_bytes, _WEBLOG_MAX_BYTES))
+        return {"ok": True, "kind": "cockpit_web", "tail": _tail_web_log(max_bytes)}
 
     @router.post("/pause")
     def remote_pause(
