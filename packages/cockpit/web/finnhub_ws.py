@@ -61,6 +61,11 @@ DEFAULT_MAX_SYMBOLS = int(os.getenv("FINNHUB_WS_MAX_SYMBOLS", "50"))
 BACKOFF_START_S = 1.0
 BACKOFF_MAX_S = 60.0
 
+# Cap the opening handshake. The live logs showed "timed out during opening
+# handshake" hangs; bounding the connect attempt lets the backoff/reconnect
+# loop (and the REST polling fallback) take over quickly instead of stalling.
+CONNECT_TIMEOUT_S = float(os.getenv("FINNHUB_WS_CONNECT_TIMEOUT_S", "10.0"))
+
 
 @dataclass
 class WSStats:
@@ -127,6 +132,9 @@ class FinnhubWebSocketClient:
         self._lock = asyncio.Lock()
         self._stats = WSStats()
         self._connected = False
+        # Last connection error we logged at WARNING, so a flapping/blocked
+        # socket doesn't spam an identical warning on every retry.
+        self._last_logged_error: str | None = None
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -239,6 +247,7 @@ class FinnhubWebSocketClient:
                     self._connected = True
                     self._stats.connected_at = datetime.now(UTC)
                     backoff = BACKOFF_START_S
+                    self._last_logged_error = None
                     log.info("finnhub_ws: connected to %s", self._url)
                     await self._resubscribe_all()
                     await self._read_loop(ws)
@@ -246,8 +255,18 @@ class FinnhubWebSocketClient:
                 raise
             except Exception as exc:
                 self._stats.reconnect_count += 1
-                self._stats.last_error = f"{type(exc).__name__}: {exc}"[:240]
-                log.warning("finnhub_ws: connection failed: %s", exc)
+                sig = f"{type(exc).__name__}: {exc}"
+                self._stats.last_error = sig[:240]
+                # Only warn when the failure signature changes; repeats of the
+                # same handshake timeout drop to debug so we don't flood logs.
+                if sig != self._last_logged_error:
+                    log.warning(
+                        "finnhub_ws: connection failed (%s); retrying with "
+                        "backoff, REST polling covers the gap", exc,
+                    )
+                    self._last_logged_error = sig
+                else:
+                    log.debug("finnhub_ws: still failing to connect: %s", exc)
             finally:
                 self._connected = False
                 self._ws = None
@@ -267,7 +286,10 @@ class FinnhubWebSocketClient:
     @contextlib.asynccontextmanager
     async def _open(self):
         url = f"{self._url}?token={self._api_key}"
-        ws = await self._connect_factory(url)
+        # Bound the handshake so a wedged connect can't stall the loop.
+        ws = await asyncio.wait_for(
+            self._connect_factory(url), timeout=CONNECT_TIMEOUT_S
+        )
         try:
             yield ws
         finally:

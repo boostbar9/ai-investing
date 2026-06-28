@@ -87,6 +87,8 @@ def _tail_web_log(max_bytes: int) -> str:
     written anything, or file logging may be disabled). Mirrors the
     byte-tail approach of :func:`packages.cockpit.proc.tail_log`.
     """
+    from packages.data.redact import redact
+
     path = WEB_LOG_PATH
     if not path.exists():
         return ""
@@ -96,7 +98,10 @@ def _tail_web_log(max_bytes: int) -> str:
             if size > max_bytes:
                 f.seek(size - max_bytes)
             data = f.read()
-        return data.decode("utf-8", errors="replace")
+        # Defense in depth: redact on read too. The logging filter masks new
+        # lines, but historical lines (or lines written before the filter was
+        # installed) could still carry a token in a URL.
+        return redact(data.decode("utf-8", errors="replace"))
     except OSError:
         return ""
 

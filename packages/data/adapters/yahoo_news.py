@@ -30,8 +30,8 @@ from typing import Any
 import httpx
 
 from packages.data.adapters.base import DataAdapter, NewsItem
+from packages.data.adapters.http import ResilientHTTPClient
 from packages.shared.otel import span
-from packages.shared.rate_limit import BUCKETS
 
 logger = logging.getLogger(__name__)
 
@@ -74,26 +74,21 @@ class YahooNewsAdapter(DataAdapter):
     name = "yahoo_news"
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
-        self._own_client = client is None
-        self._client = client or httpx.AsyncClient(
-            timeout=DEFAULT_TIMEOUT_S,
-            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+        self._http = ResilientHTTPClient(
+            "yahoo_news",
+            bucket="yfinance",
+            client=client,
+            user_agent=USER_AGENT,
+            timeout_s=DEFAULT_TIMEOUT_S,
         )
 
     async def health(self) -> dict[str, Any]:
-        import time
-
-        t0 = time.monotonic()
-        try:
-            r = await self._client.get(
-                YAHOO_SEARCH_URL,
-                params={"q": "AAPL", "newsCount": 1, "quotesCount": 0},
-                timeout=DEFAULT_TIMEOUT_S,
-            )
-            ok = r.status_code == 200
-        except Exception:
-            ok = False
-        return {"ok": ok, "latency_ms": (time.monotonic() - t0) * 1000.0}
+        res = await self._http.get(
+            YAHOO_SEARCH_URL,
+            params={"q": "AAPL", "newsCount": 1, "quotesCount": 0},
+            record_health=False,
+        )
+        return {"ok": res.ok, "latency_ms": 0.0}
 
     async def fetch_ticker_news(
         self, symbol: str, *, limit: int = 10
@@ -104,33 +99,22 @@ class YahooNewsAdapter(DataAdapter):
         ``source="yahoo/<publisher>"`` so downstream filters can weight
         Reuters/Bloomberg/WSJ differently from blog aggregators.
         """
-        await BUCKETS["yfinance"].acquire()
         with span("data.yahoo_news.ticker", {"symbol": symbol}):
-            try:
-                r = await self._client.get(
-                    YAHOO_SEARCH_URL,
-                    params={
-                        "q": symbol,
-                        "newsCount": limit,
-                        "quotesCount": 0,
-                        "enableFuzzyQuery": "false",
-                    },
-                )
-            except Exception as exc:
-                logger.warning(
-                    "yahoo news fetch failed for %s: %s",
-                    symbol,
-                    exc.__class__.__name__,
-                )
+            res = await self._http.get(
+                YAHOO_SEARCH_URL,
+                params={
+                    "q": symbol,
+                    "newsCount": limit,
+                    "quotesCount": 0,
+                    "enableFuzzyQuery": "false",
+                },
+            )
+            if not res.ok:
+                if res.unavailable and res.error != "disabled":
+                    logger.warning("yahoo news %s: %s", symbol, res.error)
                 return []
-            if r.status_code != 200:
-                logger.warning(
-                    "yahoo news %s: HTTP %s", symbol, r.status_code
-                )
-                return []
-            try:
-                payload = r.json()
-            except ValueError:
+            payload = res.json()
+            if not isinstance(payload, dict):
                 return []
             items = payload.get("news") or []
             out: list[NewsItem] = []
@@ -166,31 +150,22 @@ class YahooNewsAdapter(DataAdapter):
         (bool), ``recent_action`` (str — "upgrade"/"downgrade"/"") and
         ``recent_firm`` (str). Empty dict on failure.
         """
-        await BUCKETS["yfinance"].acquire()
         with span("data.yahoo_news.analyst", {"symbol": symbol}):
             url = YAHOO_QUOTE_SUMMARY_URL.format(symbol=symbol)
-            try:
-                r = await self._client.get(
-                    url,
-                    params={
-                        "modules": (
-                            "upgradeDowngradeHistory,recommendationTrend,"
-                            "financialData"
-                        ),
-                    },
-                )
-            except Exception as exc:
-                logger.warning(
-                    "yahoo analyst fetch failed for %s: %s",
-                    symbol,
-                    exc.__class__.__name__,
-                )
+            res = await self._http.get(
+                url,
+                params={
+                    "modules": (
+                        "upgradeDowngradeHistory,recommendationTrend,"
+                        "financialData"
+                    ),
+                },
+                health_key="yahoo_quote_summary",
+            )
+            if not res.ok:
                 return {}
-            if r.status_code != 200:
-                return {}
-            try:
-                payload = r.json()
-            except ValueError:
+            payload = res.json()
+            if not isinstance(payload, dict):
                 return {}
             result = (
                 (payload.get("quoteSummary") or {}).get("result") or []
@@ -247,28 +222,17 @@ class YahooNewsAdapter(DataAdapter):
         insider holdings), ``buy_count``, ``sell_count``. Empty dict on
         failure.
         """
-        await BUCKETS["yfinance"].acquire()
         with span("data.yahoo_news.insider", {"symbol": symbol}):
             url = YAHOO_QUOTE_SUMMARY_URL.format(symbol=symbol)
-            try:
-                r = await self._client.get(
-                    url,
-                    params={
-                        "modules": "netSharePurchaseActivity",
-                    },
-                )
-            except Exception as exc:
-                logger.warning(
-                    "yahoo insider fetch failed for %s: %s",
-                    symbol,
-                    exc.__class__.__name__,
-                )
+            res = await self._http.get(
+                url,
+                params={"modules": "netSharePurchaseActivity"},
+                health_key="yahoo_quote_summary",
+            )
+            if not res.ok:
                 return {}
-            if r.status_code != 200:
-                return {}
-            try:
-                payload = r.json()
-            except ValueError:
+            payload = res.json()
+            if not isinstance(payload, dict):
                 return {}
             result = (
                 (payload.get("quoteSummary") or {}).get("result") or []
@@ -292,6 +256,5 @@ class YahooNewsAdapter(DataAdapter):
             }
 
     async def aclose(self) -> None:
-        if self._own_client:
-            with contextlib.suppress(Exception):
-                await self._client.aclose()
+        with contextlib.suppress(Exception):
+            await self._http.aclose()

@@ -22,9 +22,9 @@ from typing import Any
 import httpx
 
 from packages.shared.otel import span
-from packages.shared.rate_limit import BUCKETS
 
 from .base import DataAdapter, DataAdapterError, NewsItem
+from .http import ResilientHTTPClient
 
 # ---------------------------------------------------------------------------
 # Lexicon-based sentiment scoring
@@ -224,40 +224,50 @@ class SentimentAdapter(DataAdapter):
     ) -> None:
         self.subreddits = subreddits
         self.rss_feeds = rss_feeds
-        self._client = client or httpx.AsyncClient(
-            timeout=20,
-            follow_redirects=True,
-            headers={
-                "User-Agent": os.getenv(
-                    "SENTIMENT_USER_AGENT",
-                    # Reddit aggressively blocks generic clients. A browser-like
-                    # UA + accepting JSON improves the success rate from cloud IPs.
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                ),
-                "Accept": "application/json, text/xml, text/html, */*",
-            },
+        # Reddit aggressively blocks generic clients; a browser-like UA + a
+        # shared rate limiter + backoff (all in ResilientHTTPClient) is the
+        # best we can do as a polite, unauthenticated client.
+        self._http = ResilientHTTPClient(
+            "sentiment",
+            bucket="reddit",
+            client=client,
+            user_agent=os.getenv(
+                "SENTIMENT_USER_AGENT",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            ),
+            timeout_s=20,
         )
 
     async def health(self) -> dict[str, Any]:
         with span("data.sentiment.health"):
-            try:
-                r = await self._client.get("https://www.reddit.com/r/stocks/hot.json?limit=1")
-                return {"ok": r.status_code == 200, "latency_ms": r.elapsed.total_seconds() * 1000}
-            except Exception as e:
-                return {"ok": False, "error": str(e)}
+            res = await self._http.get(
+                "https://www.reddit.com/r/stocks/hot.json?limit=1",
+                bucket="reddit",
+                health_key="reddit",
+                record_health=False,
+            )
+            return {"ok": res.ok, "latency_ms": 0.0}
 
     async def fetch_reddit(self, subreddit: str, limit: int = 25) -> list[NewsItem]:
-        """Pull the top ``limit`` hot posts from ``r/<subreddit>``."""
-        await BUCKETS["reddit"].acquire()
+        """Pull the top ``limit`` hot posts from ``r/<subreddit>``.
+
+        Raises :class:`DataAdapterError` when Reddit blocks us (403/429) or
+        the source is disabled, so :meth:`fetch_all` can skip it. The error
+        path is graceful — callers never see a non-typed exception and a
+        blocked feed is never a negative signal.
+        """
         with span("data.sentiment.reddit", {"subreddit": subreddit}):
-            r = await self._client.get(
+            res = await self._http.get(
                 f"https://www.reddit.com/r/{subreddit}/hot.json",
                 params={"limit": limit},
+                bucket="reddit",
+                health_key="reddit",
             )
-            if r.status_code != 200:
-                raise DataAdapterError(f"reddit {subreddit}: {r.status_code}")
-            children = (r.json().get("data") or {}).get("children") or []
+            if not res.ok:
+                raise DataAdapterError(f"reddit {subreddit}: {res.error}")
+            body = res.json()
+            children = ((body or {}).get("data") or {}).get("children") or []
             out: list[NewsItem] = []
             for ch in children:
                 d = ch.get("data") or {}
@@ -299,12 +309,13 @@ class SentimentAdapter(DataAdapter):
 
     async def fetch_rss(self, feed_url: str) -> list[NewsItem]:
         """Pull headlines from an RSS feed (uses tiny inline parser, no feedparser dep)."""
-        await BUCKETS["rss"].acquire()
         with span("data.sentiment.rss", {"feed": feed_url}):
-            r = await self._client.get(feed_url)
-            if r.status_code != 200:
-                raise DataAdapterError(f"rss {feed_url}: {r.status_code}")
-            return _parse_rss(r.text, feed_url)
+            res = await self._http.get(
+                feed_url, bucket="rss", health_key="rss_news"
+            )
+            if not res.ok:
+                raise DataAdapterError(f"rss {feed_url}: {res.error}")
+            return _parse_rss(res.text, feed_url)
 
     async def fetch_all(self, max_per_source: int = 25) -> list[NewsItem]:
         """Pull from every configured subreddit + RSS feed. Best-effort: a
@@ -323,7 +334,7 @@ class SentimentAdapter(DataAdapter):
         return out
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        await self._http.aclose()
 
 
 # ---------------------------------------------------------------------------

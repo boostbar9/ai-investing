@@ -30,6 +30,32 @@
     .stat { display: flex; flex-direction: column; gap: 4px; }
     .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #94a3b8; }
     .stat-value { font-size: 22px; font-weight: 600; color: #f1f5f9; font-variant-numeric: tabular-nums; }
+
+    /* Live health panels (mission-control style) */
+    .health-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
+    .source-card { background: #0f172a; border: 1px solid #1f2937; border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+    .source-card.is-off { opacity: .55; }
+    .source-card .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+    .source-card .title { font-weight: 600; color: #f1f5f9; font-size: 14px; line-height: 1.25; }
+    .source-card .key { color: #64748b; font-size: 11px; font-family: ui-monospace, monospace; }
+    .source-card .help { color: #94a3b8; font-size: 12px; line-height: 1.4; }
+    .source-card .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; font-size: 12px; }
+    .source-card .metrics .m-label { color: #64748b; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+    .source-card .metrics .m-value { color: #e2e8f0; font-variant-numeric: tabular-nums; }
+    .source-card .err { color: #fca5a5; font-size: 11px; font-family: ui-monospace, monospace; word-break: break-all; }
+    .pill-degraded { background: #422006; color: #fcd34d; border: 1px solid #d97706; }
+    .pill-down { background: #450a0a; color: #fca5a5; border: 1px solid #b91c1c; }
+    .pill-off { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
+    /* On/off switch */
+    .switch { position: relative; display: inline-block; width: 42px; height: 22px; flex: none; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; cursor: pointer; inset: 0; background: #334155; transition: .2s; border-radius: 999px; }
+    .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 3px; bottom: 3px; background: #e2e8f0; transition: .2s; border-radius: 50%; }
+    .switch input:checked + .slider { background: #10b981; }
+    .switch input:checked + .slider:before { transform: translateX(20px); }
+    .ws-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #94a3b8; }
+    .ws-dot { width: 9px; height: 9px; border-radius: 50%; background: #475569; }
+    .ws-dot.live { background: #10b981; box-shadow: 0 0 6px #10b981; }
   </style>
 </head>
 <body class="min-h-screen">
@@ -58,6 +84,23 @@
           <span class="stat-label">Candidates</span>
           <span class="stat-value" id="candidate-count">--</span>
         </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="flex items-center justify-between mb-1">
+        <h2 class="text-lg font-semibold">Live source health</h2>
+        <span class="ws-badge" id="ws-badge">
+          <span class="ws-dot" id="ws-dot"></span><span id="ws-text">websocket --</span>
+        </span>
+      </div>
+      <p class="text-gray-400 text-xs mb-4">
+        Real-time status of each feed as the bot fetches it. Flip a source off to
+        stop using it — the rest keep working and a disabled or failing source is
+        never treated as a sell signal. Switches persist across restarts.
+      </p>
+      <div class="health-grid" id="health-grid">
+        <div class="empty">Loading…</div>
       </div>
     </div>
 
@@ -163,8 +206,107 @@
       } catch (e) { /* offline, keep last state */ }
     }
 
+    // ---- Live source health (resilient-fetch registry) ----
+    const statusPills = {
+      ok: 'pill pill-ok',
+      degraded: 'pill pill-degraded',
+      down: 'pill pill-down',
+      disabled: 'pill pill-off',
+    };
+
+    function fmtAge(sec) {
+      if (sec === null || sec === undefined) return 'never';
+      sec = Math.max(0, Math.round(sec));
+      if (sec < 60) return sec + 's ago';
+      if (sec < 3600) return Math.round(sec / 60) + 'm ago';
+      if (sec < 86400) return Math.round(sec / 3600) + 'h ago';
+      return Math.round(sec / 86400) + 'd ago';
+    }
+
+    async function toggleSource(name, enabled) {
+      try {
+        await fetch(`/api/data-sources/${encodeURIComponent(name)}/toggle`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled }),
+        });
+      } catch (e) { /* will reconcile on next poll */ }
+      refreshHealth();
+    }
+
+    function renderHealth(data) {
+      const ws = data.websocket || {};
+      const dot = document.getElementById('ws-dot');
+      const txt = document.getElementById('ws-text');
+      if (ws && ws.enabled) {
+        const live = !!ws.connected;
+        dot.className = 'ws-dot' + (live ? ' live' : '');
+        txt.textContent = live
+          ? `websocket live · ${ws.ticks_ingested || 0} ticks`
+          : 'websocket reconnecting';
+      } else {
+        dot.className = 'ws-dot';
+        txt.textContent = 'websocket off (REST polling)';
+      }
+
+      const grid = document.getElementById('health-grid');
+      const sources = data.sources || [];
+      if (sources.length === 0) {
+        grid.innerHTML = '<div class="empty">No sources tracked yet.</div>';
+        return;
+      }
+      grid.innerHTML = '';
+      for (const s of sources) {
+        const card = document.createElement('div');
+        card.className = 'source-card' + (s.enabled ? '' : ' is-off');
+        const pillCls = statusPills[s.status] || 'pill pill-idle';
+        const rate = (s.success_rate * 100).toFixed(0) + '%';
+        const lat = (s.last_latency_ms === null || s.last_latency_ms === undefined)
+          ? '--' : Math.round(s.last_latency_ms) + ' ms';
+        const freshness = s.served_from_cache
+          ? 'cached' : (s.stale ? 'stale' : 'live');
+        const errRow = s.last_error
+          ? `<div class="err" title="last error">${s.last_error}</div>` : '';
+        card.innerHTML = `
+          <div class="head">
+            <div>
+              <div class="title">${s.label}</div>
+              <div class="key">${s.name}</div>
+            </div>
+            <label class="switch" title="${s.enabled ? 'Disable' : 'Enable'} this source">
+              <input type="checkbox" ${s.enabled ? 'checked' : ''} data-name="${s.name}">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div><span class="${pillCls}">${s.status}</span></div>
+          ${s.help ? `<div class="help">${s.help}</div>` : ''}
+          <div class="metrics">
+            <div><div class="m-label">Last ok</div><div class="m-value">${fmtAge(s.last_success_age_s)}</div></div>
+            <div><div class="m-label">Success rate</div><div class="m-value">${rate}</div></div>
+            <div><div class="m-label">Latency</div><div class="m-value">${lat}</div></div>
+            <div><div class="m-label">Freshness</div><div class="m-value">${freshness}</div></div>
+          </div>
+          ${errRow}
+        `;
+        const input = card.querySelector('input[type=checkbox]');
+        input.addEventListener('change', (e) => toggleSource(s.name, e.target.checked));
+        grid.appendChild(card);
+      }
+    }
+
+    async function refreshHealth() {
+      try {
+        const r = await fetch('/api/data-sources/health', { cache: 'no-store' });
+        if (r.ok) {
+          renderHealth(await r.json());
+        }
+      } catch (e) { /* offline, keep last state */ }
+    }
+
     refresh();
+    refreshHealth();
     setInterval(refresh, 30000);
+    setInterval(refreshHealth, 10000);
   </script>
 </body>
 </html>

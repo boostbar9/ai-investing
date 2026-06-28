@@ -66,6 +66,7 @@ from packages.cockpit.web import knowledge_base as autonomy_knowledge
 from packages.cockpit.web import live_quotes as live_quotes_mod
 from packages.cockpit.web import reflection as autonomy_reflection
 from packages.cockpit.web import regime as autonomy_regime
+from packages.data import health as health_mod
 from packages.execution.broker import AlpacaPaperBroker, BrokerError, OrderRequest
 from packages.paper.streak import compute_paper_streak
 from packages.shared import conn_checks, secrets
@@ -123,6 +124,22 @@ def _install_web_file_logging() -> None:
 
 
 _install_web_file_logging()
+
+
+def _install_log_redaction() -> None:
+    """Mask secrets (Finnhub ``?token=``, auth headers) in every log handler.
+
+    Runs after the console + rotating-file handlers are attached so both the
+    terminal and ``/api/remote/weblog`` (which tails the file) are covered.
+    Idempotent and best-effort — observability must never crash the server.
+    """
+    from packages.data.redact import install_redaction
+
+    with contextlib.suppress(Exception):
+        install_redaction()
+
+
+_install_log_redaction()
 
 
 # --------------------------------------------------------------------------
@@ -2913,6 +2930,133 @@ def api_data_sources_snapshot() -> dict[str, Any]:
         "candidate_count": len(sweep.get("candidates") or []),
         "subreddit_roster": roster,
     }
+
+
+# Sources tracked by the live resilient-fetch health registry. These are the
+# ``health_key`` values the data adapters record against (see packages/data/
+# adapters/*). Plain-language helper text + display label for each so the
+# dashboard never shows a bare internal key.
+_HEALTH_SOURCE_DISPLAY: dict[str, dict[str, str]] = {
+    "reddit": {
+        "label": "Reddit (finance subreddits)",
+        "tier": "social",
+        "help": "Retail chatter from r/wallstreetbets, r/stocks and friends. "
+        "Used as a contrarian/sentiment signal. Reddit blocks bots, so this "
+        "one flaps the most — when it's off the rest of the feed still works.",
+    },
+    "rss_news": {
+        "label": "RSS news (Yahoo / MarketWatch / Seeking Alpha)",
+        "tier": "news",
+        "help": "Top market headlines via public RSS feeds. No key needed.",
+    },
+    "yahoo_news": {
+        "label": "Yahoo Finance per-ticker news",
+        "tier": "news",
+        "help": "Per-ticker headlines with publisher attribution "
+        "(Reuters, Bloomberg, WSJ). High-signal news source.",
+    },
+    "yahoo_quote_summary": {
+        "label": "Yahoo analyst + insider summary",
+        "tier": "fundamentals",
+        "help": "Analyst rating changes and insider buy/sell rollups. Yahoo "
+        "occasionally returns 401 here; when it does we simply skip it.",
+    },
+    "stocktwits": {
+        "label": "StockTwits trending",
+        "tier": "social",
+        "help": "Early-momentum trending tickers by message volume. Catches "
+        "moves before they hit Reddit's hot list.",
+    },
+    "finnhub": {
+        "label": "Finnhub news + quotes",
+        "tier": "market",
+        "help": "Real-time quotes and company news. Needs an API key; the "
+        "REST path keeps working even when the live websocket is down.",
+    },
+}
+
+
+def _data_source_help(name: str) -> str:
+    meta = _HEALTH_SOURCE_DISPLAY.get(name)
+    return meta["help"] if meta else ""
+
+
+def _data_source_label(name: str) -> str:
+    meta = _HEALTH_SOURCE_DISPLAY.get(name)
+    if meta:
+        return meta["label"]
+    return name.replace("_", " ").title()
+
+
+def _data_source_tier(name: str) -> str:
+    meta = _HEALTH_SOURCE_DISPLAY.get(name)
+    return meta["tier"] if meta else "other"
+
+
+@app.get("/api/data-sources/health")
+def api_data_sources_health() -> dict[str, Any]:
+    """Live per-source health from the resilient-fetch registry.
+
+    Surfaces, for each known source: status pill (ok/degraded/down/disabled),
+    last-success age, rolling success rate, freshness/cached flags, and a
+    *sanitized* last error (secrets already stripped by the registry). Also
+    includes the websocket tick-stream status so the page can show a live
+    badge.
+
+    A disabled or never-tried source is reported plainly — it is NEVER an
+    error and must never be read as a bearish signal.
+    """
+    reg = health_mod.get_registry()
+
+    # Union of: known display sources, anything the registry has actually seen,
+    # and anything an operator has explicitly toggled.
+    names: set[str] = set(_HEALTH_SOURCE_DISPLAY)
+    names.update(reg._states.keys())  # noqa: SLF001 — read-only union for listing
+    names.update(health_mod.all_toggles().keys())
+
+    sources: list[dict[str, Any]] = []
+    for name in sorted(names):
+        snap = reg.snapshot(name)
+        snap["label"] = _data_source_label(name)
+        snap["tier"] = _data_source_tier(name)
+        snap["help"] = _data_source_help(name)
+        sources.append(snap)
+
+    ws_status: dict[str, Any] = {}
+    client = finnhub_ws_mod.get_default_client()
+    if client is not None:
+        with contextlib.suppress(Exception):
+            ws_status = client.status()
+
+    return {
+        "sources": sources,
+        "websocket": ws_status,
+        "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+    }
+
+
+class _ToggleRequest(BaseModel):
+    """Optional explicit enable/disable; omitted -> flip current state."""
+
+    enabled: bool | None = None
+
+
+@app.post("/api/data-sources/{name}/toggle")
+def api_data_sources_toggle(name: str, body: _ToggleRequest | None = None) -> dict[str, Any]:
+    """Enable/disable a data source. Persisted across restarts; fail-safe
+    default is enabled so a source is only ever off by explicit choice.
+
+    Body ``{"enabled": true|false}`` sets an explicit state; an empty body
+    flips the current value. The fetch path honors this immediately — a
+    disabled source short-circuits to a typed 'unavailable' result and is
+    dropped from the inputs (never treated as bearish).
+    """
+    if body is not None and body.enabled is not None:
+        new_state = health_mod.set_enabled(name, body.enabled)
+    else:
+        new_state = health_mod.toggle(name)
+    log.info("data-sources: %s -> %s", name, "enabled" if new_state else "disabled")
+    return {"name": name, "enabled": new_state}
 
 
 @app.get("/api/ollama/status")

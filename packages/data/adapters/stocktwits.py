@@ -15,14 +15,13 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import time
 from typing import Any
 
 import httpx
 
 from packages.data.adapters.base import DataAdapter
+from packages.data.adapters.http import ResilientHTTPClient
 from packages.shared.otel import span
-from packages.shared.rate_limit import BUCKETS
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +30,11 @@ STOCKTWITS_TRENDING_URL = os.getenv(
     "https://api.stocktwits.com/api/2/trending/symbols.json",
 )
 
+# StockTwits returns 403 to obvious bot UAs — present as a real browser.
 USER_AGENT = os.getenv(
     "STOCKTWITS_UA",
-    "ai-investing/0.4 (+https://github.com/boostbar9/ai-investing)",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 )
 
 DEFAULT_TIMEOUT_S = 8.0
@@ -42,27 +43,26 @@ DEFAULT_TIMEOUT_S = 8.0
 class StockTwitsAdapter(DataAdapter):
     """Lightweight trending-ticker feed from StockTwits.
 
-    Shares the ``rss`` rate-limit bucket (1 req/s) since we hit it at
-    most once per sweep.
+    Fetches through the shared :class:`ResilientHTTPClient` (browser UA,
+    backoff on 429/5xx, the ``rss`` rate-limit bucket, health recording)
+    and degrades to ``[]`` on any failure — it never raises and a blocked
+    feed is never a negative signal.
     """
 
     name = "stocktwits"
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
-        self._own_client = client is None
-        self._client = client or httpx.AsyncClient(
-            timeout=DEFAULT_TIMEOUT_S,
-            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+        self._http = ResilientHTTPClient(
+            "stocktwits",
+            bucket="rss",
+            client=client,
+            user_agent=USER_AGENT,
+            timeout_s=DEFAULT_TIMEOUT_S,
         )
 
     async def health(self) -> dict[str, Any]:
-        t0 = time.monotonic()
-        try:
-            r = await self._client.get(STOCKTWITS_TRENDING_URL)
-            ok = r.status_code == 200
-        except Exception:
-            ok = False
-        return {"ok": ok, "latency_ms": (time.monotonic() - t0) * 1000.0}
+        res = await self._http.get(STOCKTWITS_TRENDING_URL, record_health=False)
+        return {"ok": res.ok, "latency_ms": 0.0}
 
     async def fetch_trending(
         self, *, limit: int = 30
@@ -71,24 +71,16 @@ class StockTwitsAdapter(DataAdapter):
         ``symbol``, ``title`` (company name), and ``watchlist_count``.
         Returns ``[]`` on any failure — never raises.
         """
-        await BUCKETS["rss"].acquire()
         with span("data.stocktwits.trending"):
-            try:
-                r = await self._client.get(STOCKTWITS_TRENDING_URL)
-            except Exception as exc:
-                logger.warning(
-                    "stocktwits trending failed: %s",
-                    exc.__class__.__name__,
-                )
+            res = await self._http.get(STOCKTWITS_TRENDING_URL)
+            if not res.ok:
+                if res.unavailable and res.error != "disabled":
+                    logger.warning(
+                        "stocktwits trending unavailable: %s", res.error
+                    )
                 return []
-            if r.status_code != 200:
-                logger.warning(
-                    "stocktwits trending: HTTP %s", r.status_code
-                )
-                return []
-            try:
-                payload = r.json()
-            except ValueError:
+            payload = res.json()
+            if not isinstance(payload, dict):
                 return []
             symbols = payload.get("symbols") or []
             out: list[dict[str, Any]] = []
@@ -106,6 +98,5 @@ class StockTwitsAdapter(DataAdapter):
             return out
 
     async def aclose(self) -> None:
-        if self._own_client:
-            with contextlib.suppress(Exception):
-                await self._client.aclose()
+        with contextlib.suppress(Exception):
+            await self._http.aclose()

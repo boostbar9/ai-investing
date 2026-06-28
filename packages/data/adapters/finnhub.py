@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from packages.data import health as health_mod
 from packages.shared.otel import span
 from packages.shared.rate_limit import BUCKETS
 
@@ -97,13 +98,17 @@ class FinnhubAdapter(DataAdapter):
 
     async def get_company_news(self, symbol: str, frm: str, to: str) -> list[NewsItem]:
         await BUCKETS["finnhub"].acquire()
+        reg = health_mod.get_registry()
+        reg.record_attempt("finnhub")
         with span("data.finnhub.company_news", {"symbol": symbol}):
             r = await self._client.get(
                 f"{self.BASE}/company-news",
                 params={"symbol": symbol, "from": frm, "to": to, "token": self.api_key},
             )
             if r.status_code != 200:
+                reg.record_failure("finnhub", f"HTTP {r.status_code}")
                 raise DataAdapterError(f"finnhub {symbol}: {r.status_code}")
+            reg.record_success("finnhub")
             return [
                 NewsItem(
                     symbol=symbol,
