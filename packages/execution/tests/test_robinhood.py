@@ -877,6 +877,85 @@ async def test_account_snapshot_parses_mcp_content_blocks(
 
 
 @pytest.mark.asyncio
+async def test_account_snapshot_unwraps_data_envelope_and_autoselects(
+    monkeypatch, isolated_onboarding
+):
+    """The REAL live shape: each tool result is an MCP text-content block
+    whose decoded JSON nests the domain payload under ``data`` alongside a
+    ``guide`` string. The snapshot must drill through both layers, read
+    ``data.accounts``, auto-select the single ``agentic_allowed`` account,
+    thread its ``account_number`` into ``get_portfolio``, and populate the
+    top-line numbers + masked account."""
+    monkeypatch.setattr(rh_mod, "is_connected", lambda: True)
+    accounts_envelope = {
+        "data": {
+            "accounts": [
+                {
+                    "account_number": "5SA87845",
+                    "type": "margin",
+                    "is_default": True,
+                    "agentic_allowed": False,
+                },
+                {
+                    "account_number": "181701389106",
+                    "type": "margin",
+                    "management_type": "managed",
+                    "agentic_allowed": False,
+                },
+                {
+                    "account_number": "668863863",
+                    "rhs_account_number": "668863863",
+                    "type": "cash",
+                    "nickname": "Agentic",
+                    "agentic_allowed": True,
+                    "state": "active",
+                },
+            ]
+        },
+        "guide": "long presentation guide ...",
+    }
+    portfolio_envelope = {
+        "data": {"equity": "1234.56", "buying_power": "100.00", "cash": "42.00"},
+        "guide": "portfolio guide ...",
+    }
+    fake = _MultiToolMcpClient(
+        responses={
+            "get_accounts": [
+                {"type": "text", "text": json.dumps(accounts_envelope)}
+            ],
+            "get_portfolio": [
+                {"type": "text", "text": json.dumps(portfolio_envelope)}
+            ],
+            "get_equity_positions": [
+                {"type": "text", "text": json.dumps({"data": {"positions": []}})}
+            ],
+        }
+    )
+    broker = RobinhoodAgenticBroker(
+        mode=ExecutionMode.SHADOW,
+        mcp_client=fake,
+        token_loader=_good_tokens,
+    )
+    snap = await broker.account_snapshot()
+
+    # accounts parsed out of data.accounts (not top level, not data wrapper)
+    assert len(snap["accounts"]) == 3
+    # single agentic_allowed account auto-selected for downstream calls
+    assert broker._account_number == "668863863"
+    assert snap["account_masked"] == "••••3863"
+    # top-line numbers come from the unwrapped get_portfolio payload
+    assert snap["total_equity"] == 1234.56
+    assert snap["buying_power"] == 100.0
+    assert snap["cash"] == 42.0
+    # get_portfolio + get_equity_positions carried the resolved account_number
+    by_name = {name: args for name, args in fake.calls}
+    assert by_name["get_portfolio"].get("account_number") == "668863863"
+    assert by_name["get_equity_positions"].get("account_number") == "668863863"
+    # no error recorded -- accounts were found
+    assert not any("get_accounts" in e for e in snap["errors"])
+
+
+@pytest.mark.asyncio
 async def test_account_snapshot_degrades_on_partial_failure(
     monkeypatch, isolated_onboarding
 ):

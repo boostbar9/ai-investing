@@ -265,14 +265,39 @@ def _unwrap_content(content: Any) -> Any:
     return content
 
 
+def _unwrap_mcp_payload(content: Any) -> Any:
+    """Unwrap a Robinhood MCP ``tools/call`` result to its domain payload.
+
+    Single reusable entry point used by every read tool (``get_accounts``,
+    ``get_portfolio``, ``get_equity_positions``, order polling). It peels
+    TWO layers the agentic-trading server wraps around the real data:
+
+      1. **MCP content blocks** -- ``result.content`` is a list like
+         ``[{"type": "text", "text": "<json string>"}]``; the JSON string
+         is decoded (handled by :func:`_unwrap_content`).
+      2. **Presentation envelope** -- the decoded object nests the domain
+         payload under ``"data"`` alongside a human-readable ``"guide"``
+         string, e.g. ``{"data": {"accounts": [...]}, "guide": "..."}``.
+         We descend into ``"data"`` so callers read ``accounts`` /
+         portfolio fields directly instead of finding them missing at the
+         top level (the bug that left the account unresolved).
+
+    Returns a dict or list (or the raw unwrapped value when neither layer
+    applies, e.g. legacy/test payloads that are already flat)."""
+    obj = _unwrap_content(content)
+    if isinstance(obj, dict) and isinstance(obj.get("data"), (dict, list)):
+        return obj["data"]
+    return obj
+
+
 def _normalize_rows(content: Any, *, keys: tuple[str, ...]) -> list[Any]:
     """Normalize an MCP payload to a list of rows.
 
-    Unwraps content blocks, then if the result is a dict, pulls the
-    first matching ``keys`` entry that holds a list. Returns ``[]`` when
-    no list can be found.
+    Unwraps the full MCP envelope (content blocks + ``data`` presentation
+    wrapper), then if the result is a dict, pulls the first matching
+    ``keys`` entry that holds a list. Returns ``[]`` when no list is found.
     """
-    obj = _unwrap_content(content)
+    obj = _unwrap_mcp_payload(content)
     if isinstance(obj, list):
         return obj
     if isinstance(obj, dict):
@@ -285,7 +310,7 @@ def _normalize_rows(content: Any, *, keys: tuple[str, ...]) -> list[Any]:
 
 def _normalize_obj(content: Any) -> dict[str, Any]:
     """Normalize an MCP payload to a single dict (``{}`` when not a dict)."""
-    obj = _unwrap_content(content)
+    obj = _unwrap_mcp_payload(content)
     if isinstance(obj, dict):
         return obj
     # Some tools return a single-element list wrapping the object.
@@ -311,8 +336,10 @@ def _shape_hint(content: Any) -> str:
     Returns something like ``dict(keys=[accounts,results])`` or
     ``list[dict(keys=[account_number,type])]`` so an unexpected empty
     response is debuggable from the cockpit's ``errors`` array without ever
-    exposing account numbers, balances, or other PII."""
-    obj = _unwrap_content(content)
+    exposing account numbers, balances, or other PII. Reports the shape
+    AFTER envelope-unwrapping so the hint reflects the descended ``data``
+    payload, not the presentation wrapper."""
+    obj = _unwrap_mcp_payload(content)
     if isinstance(obj, dict):
         return f"dict(keys=[{','.join(sorted(map(str, obj.keys())))}])"
     if isinstance(obj, list):
@@ -326,12 +353,12 @@ def _shape_hint(content: Any) -> str:
 
 
 def _mask_account(number: str) -> str:
-    """Mask an account number to its last 4 chars for display (``...1234``).
+    """Mask an account number to its last 4 chars for display (``••••3863``).
     Short/empty numbers degrade safely."""
     s = str(number or "").strip()
     if len(s) <= 4:
         return s
-    return f"...{s[-4:]}"
+    return f"••••{s[-4:]}"
 
 
 # ---------------------------------------------------------------------------
@@ -676,10 +703,16 @@ class RobinhoodAgenticBroker(Broker):
                 )
                 if snap["buying_power"] is None:
                     snap["buying_power"] = _first_float(
-                        portfolio, ("buying_power", "buyingPower")
+                        portfolio,
+                        ("buying_power", "buyingPower", "buying_power_usd"),
+                    )
+                if snap["cash"] is None:
+                    snap["cash"] = _first_float(
+                        portfolio,
+                        ("cash", "cash_balance", "cashBalance", "cash_available"),
                     )
         except McpError as exc:
-            snap["errors"].append(f"portfolio: {exc}")
+            snap["errors"].append(f"get_portfolio: {exc}")
 
         # ---- positions (reuse the parsed BrokerPosition path) -----------
         try:

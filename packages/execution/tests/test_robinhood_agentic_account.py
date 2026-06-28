@@ -111,6 +111,23 @@ def test_select_accepts_camelcase_alias():
     assert select_agentic_account(accounts) == AGENTIC_ACCT
 
 
+def test_select_autoselects_single_active_account_without_agentic_flag():
+    """Requirement C: no account carries the agentic flag but exactly one
+    active account exists -> auto-select it (user is remote, can't click)."""
+    accounts = [{"account_number": AGENTIC_ACCT, "type": "cash"}]
+    assert select_agentic_account(accounts) == AGENTIC_ACCT
+
+
+def test_select_refuses_multiple_active_accounts_without_agentic_flag():
+    """Ambiguous: several active accounts, none flagged agentic -> None,
+    so the user must make an explicit choice (fail safe)."""
+    accounts = [
+        {"account_number": MARGIN_ACCT, "type": "margin"},
+        {"account_number": MANAGED_ACCT, "type": "managed"},
+    ]
+    assert select_agentic_account(accounts) is None
+
+
 @pytest.mark.asyncio
 async def test_discover_returns_agentic_account_no_network():
     fake = _FakeMcpClient(
