@@ -117,6 +117,13 @@ class AutonomyConfig:
     exit_rules_tick: Callable[[], Any] | None = None
     dip_watch_tick: Callable[[], Any] | None = None
     eod_flatten_tick: Callable[[], Any] | None = None
+    # Trading-controls guardrail. After each sweep the chosen candidates are
+    # passed through the user's budget + confidence gate: qualifying trades
+    # go down the (shadow) execution path, the rest are queued as pending.
+    # Injected by the cockpit (default None = no-op) so the autonomy module
+    # stays broker-agnostic and existing tests see zero new side effects.
+    trading_controls_enabled: bool = True
+    trading_controls_tick: Callable[[list[dict[str, Any]]], Any] | None = None
     # ---- Phase 25.3: live-quote cache warmer ---------------------
     # Called at the head of every fast tick (and exposed via run_tick)
     # to refresh the LiveQuoteCache for the active symbol set before
@@ -876,6 +883,21 @@ async def run_one_tick(
     # finishes in max(exit, dip) instead of exit+dip. The fast loop
     # uses the same helper.
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Trading-controls guardrail. Push the freshly-chosen candidates
+    # through the user's budget + confidence limits: qualifying ones
+    # proceed down the existing SHADOW execution path, the rest are
+    # recorded as pending with plain-language reasons. The hook also
+    # re-evaluates previously-held trades so they auto-proceed once they
+    # qualify. Fully defensive — a failure here never breaks the tick.
+    # ------------------------------------------------------------------
+    trading_controls_result: dict[str, Any] | None = None
+    if cfg.trading_controls_enabled and cfg.trading_controls_tick is not None:
+        try:
+            trading_controls_result = await cfg.trading_controls_tick(focus_details)
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("trading-controls tick failed: %s", exc)
+
     exit_tick_result: dict[str, Any] | None = None
     dip_tick_result: dict[str, Any] | None = None
     eod_flatten_tick_result: dict[str, Any] | None = None
@@ -896,6 +918,7 @@ async def run_one_tick(
         "exit_rules": exit_tick_result,
         "dip_watch": dip_tick_result,
         "eod_flatten": eod_flatten_tick_result,
+        "trading_controls": trading_controls_result,
     }
 
 

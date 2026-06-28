@@ -209,6 +209,54 @@
       </div>
     </header>
 
+    <!-- ==== Trading Controls summary (budget / pickiness / waiting) ==== -->
+    <a id="tc-summary" href="/trading-controls"
+       class="card p-4 mb-4 block"
+       style="text-decoration:none;border:1px solid var(--border);">
+      <div class="flex items-center justify-between mb-2" style="flex-wrap:wrap;gap:8px;">
+        <h2 class="section-h mb-0">Trading limits</h2>
+        <span class="text-xs" style="color:var(--text-muted);">Tap to adjust →</span>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
+        <div class="md:col-span-1">
+          <div class="flex items-center justify-between text-xs mb-1" style="color:var(--text-secondary);">
+            <span>Budget used</span>
+            <span class="mono"><span id="tc-sum-used">$0</span> / <span id="tc-sum-total">$300</span></span>
+          </div>
+          <div style="height:10px;border-radius:999px;background:rgba(255,255,255,.07);overflow:hidden;">
+            <div id="tc-sum-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#10b981,#059669);transition:width .3s;"></div>
+          </div>
+        </div>
+        <div>
+          <div class="text-xs" style="color:var(--text-secondary);">Pickiness</div>
+          <div class="font-semibold" style="text-transform:capitalize;"><span id="tc-sum-preset">—</span>
+            <span class="text-xs mono" style="color:var(--text-muted);">(≥ <span id="tc-sum-conf">—</span>)</span></div>
+        </div>
+        <div>
+          <div class="text-xs" style="color:var(--text-secondary);">Waiting on your settings</div>
+          <div class="font-semibold"><span id="tc-sum-waiting">0</span> trade(s)</div>
+        </div>
+      </div>
+    </a>
+    <script>
+      (async () => {
+        try {
+          const fmt = (v) => { const n = Number(v)||0; return Number.isInteger(n) ? `$${n.toLocaleString()}` : `$${n.toFixed(2)}`; };
+          const d = await fetch('/api/trading-controls').then(r => r.ok ? r.json() : null);
+          if (d) {
+            const total = Number(d.total_budget_usd)||0, used = Number(d.used_budget_usd)||0;
+            document.getElementById('tc-sum-used').textContent = fmt(used);
+            document.getElementById('tc-sum-total').textContent = fmt(total);
+            document.getElementById('tc-sum-bar').style.width = (total>0 ? Math.min(100, used/total*100) : 0) + '%';
+            document.getElementById('tc-sum-preset').textContent = d.risk_preset || '—';
+            document.getElementById('tc-sum-conf').textContent = Math.round((Number(d.min_confidence)||0)*100) + '%';
+          }
+          const p = await fetch('/api/trading-controls/pending').then(r => r.ok ? r.json() : null);
+          if (p) document.getElementById('tc-sum-waiting').textContent = p.count || 0;
+        } catch (_) { /* swallow — panel just shows defaults */ }
+      })();
+    </script>
+
     <!-- ==== Connection status banner (always visible, top of page) ==== -->
     <!-- One glance answers: which broker is active, am I on real money
          or practice, and is the agent connected? This is the core thing

@@ -622,6 +622,13 @@ def trading_page() -> HTMLResponse:
     return _render("trading.html")
 
 
+@app.get("/trading-controls", response_class=HTMLResponse)
+def trading_controls_page() -> HTMLResponse:
+    """Plain-language guardrails: budget limits, the confidence gate, and
+    the pending-trades queue. Client-side polls /api/trading-controls."""
+    return _render("trading_controls.html")
+
+
 @app.get("/errors", response_class=HTMLResponse)
 def errors_page() -> HTMLResponse:
     return _render("errors.html")
@@ -2048,6 +2055,111 @@ def api_robinhood_cap_set(body: _FloatCapBody) -> dict[str, Any]:
         "clamped": clamped != requested,
         "absolute_max_usd": ABSOLUTE_MAX_FLOAT_USD,
     }
+
+
+# ---------------------------------------------------------------------------
+# Trading Controls -- the user-facing guardrail panel (budget, confidence
+# gate, pending queue). Budget reads/writes through the onboarding cap above
+# so the two can never diverge.
+# ---------------------------------------------------------------------------
+def _trading_controls_live_state() -> dict[str, Any]:
+    """Derive used-budget / open-positions / trades-today from today's
+    shadow-trade audit log. Best-effort: any failure yields zeros so the
+    gate fails safe (treats the account as empty rather than blocking)."""
+    from datetime import date
+
+    used = 0.0
+    trades_today = 0
+    open_syms: set[str] = set()
+    try:
+        from packages.execution.robinhood import load_shadow_trades
+
+        today = date.today().isoformat()
+        for t in load_shadow_trades():
+            if not str(t.get("ts", "")).startswith(today):
+                continue
+            side = str(t.get("side", "")).lower()
+            sym = str(t.get("symbol", "")).upper()
+            if side == "buy":
+                trades_today += 1
+                try:
+                    used += float(t.get("notional_estimate") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+                if sym:
+                    open_syms.add(sym)
+            elif side == "sell":
+                open_syms.discard(sym)
+    except Exception:  # pragma: no cover — defensive
+        return {"used_budget_usd": 0.0, "open_positions": 0, "trades_today": 0}
+    return {
+        "used_budget_usd": round(used, 2),
+        "open_positions": len(open_syms),
+        "trades_today": trades_today,
+    }
+
+
+def _trading_controls_payload() -> dict[str, Any]:
+    """Resolved controls + derived budget/position info for the GET route."""
+    from packages.cockpit import trading_controls as tc
+
+    controls = tc.load_controls()
+    live = _trading_controls_live_state()
+    remaining = max(0.0, controls.total_budget_usd - live["used_budget_usd"])
+    return {
+        **controls.to_dict(),
+        "absolute_max_usd": tc._budget_ceiling(),
+        "preset_thresholds": dict(tc.PRESET_CONFIDENCE),
+        "used_budget_usd": live["used_budget_usd"],
+        "remaining_budget_usd": round(remaining, 2),
+        "open_positions": live["open_positions"],
+        "trades_today": live["trades_today"],
+    }
+
+
+@app.get("/api/trading-controls")
+def api_trading_controls_get() -> dict[str, Any]:
+    """Current guardrail settings + derived budget/position state."""
+    return _trading_controls_payload()
+
+
+class _TradingControlsBody(BaseModel):
+    """Any subset of the controls may be updated. Server clamps everything."""
+
+    total_budget_usd: float | None = None
+    max_per_trade_usd: float | None = None
+    max_trades_per_day: int | None = None
+    max_open_positions: int | None = None
+    min_confidence: float | None = None
+    risk_preset: str | None = None
+    pending_mode: str | None = None
+
+
+@app.post("/api/trading-controls")
+def api_trading_controls_set(body: _TradingControlsBody) -> dict[str, Any]:
+    """Validate + clamp + persist any subset of controls; return resolved.
+
+    Setting ``risk_preset`` to a known preset updates ``min_confidence``;
+    setting ``min_confidence`` directly switches the preset to ``custom``.
+    Budget is persisted through the onboarding cap (clamped to its absolute
+    max) so it stays consistent with ``resolve_float_cap``.
+    """
+    from packages.cockpit import trading_controls as tc
+
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    tc.update_controls(updates)
+    return _trading_controls_payload()
+
+
+@app.get("/api/trading-controls/pending")
+def api_trading_controls_pending() -> dict[str, Any]:
+    """Trades the bot is holding because they don't meet the user's
+    settings yet, plus the plain reasons they're waiting on."""
+    from packages.cockpit import pending_trades as pq
+
+    waiting = pq.load_waiting()
+    waiting.sort(key=lambda e: str(e.get("ts", "")), reverse=True)
+    return {"pending": waiting, "count": len(waiting)}
 
 
 # ---------------------------------------------------------------------------
@@ -4359,6 +4471,120 @@ async def _autonomy_startup() -> None:  # pragma: no cover
 
     _eod_flatten_hook = make_flatten_tick_hook(_eod_broker_factory)
 
+    async def _trading_controls_tick(
+        focus_details: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Pass freshly-chosen candidates (plus any previously-held ones)
+        through the user's trading controls.
+
+        Qualifying trades are recorded via an EXPLICITLY-SHADOW Robinhood
+        broker -- they land in shadow_trades.jsonl and never touch the
+        network, regardless of the global mode. This new feature never
+        sends real orders. Non-qualifying trades are queued as pending with
+        their reasons; held trades are re-evaluated every pass so they
+        auto-proceed once they qualify.
+        """
+        from packages.cockpit import pending_trades as pq
+        from packages.cockpit import trading_controls as tc
+
+        controls = tc.load_controls()
+        live = _trading_controls_live_state()
+        state = tc.PortfolioState(
+            used_budget_usd=live["used_budget_usd"],
+            open_positions=live["open_positions"],
+            trades_today=live["trades_today"],
+        )
+
+        # Build candidates from this cycle's focus picks + still-pending
+        # trades (deduped by symbol so a held pick isn't double-counted).
+        candidates: list[tc.TradeCandidate] = []
+        seen: set[str] = set()
+
+        def _price_for(sym: str) -> float | None:
+            try:
+                return _last_price(sym)
+            except Exception:
+                return None
+
+        for fd in focus_details or []:
+            sym = str(fd.get("symbol", "")).upper()
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            cand = fd.get("candidate") or {}
+            conf = fd.get("score")
+            if conf is None:
+                conf = cand.get("confidence")
+            price = _price_for(sym)
+            notional = min(controls.max_per_trade_usd, controls.total_budget_usd)
+            candidates.append(
+                tc.TradeCandidate(
+                    symbol=sym,
+                    side="buy",
+                    confidence=float(conf or 0.0),
+                    notional=float(notional),
+                )
+            )
+        for e in pq.load_waiting():
+            sym = str(e.get("symbol", "")).upper()
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            candidates.append(
+                tc.TradeCandidate(
+                    symbol=sym,
+                    side=str(e.get("side", "buy")).lower(),
+                    confidence=float(e.get("confidence") or 0.0),
+                    notional=float(e.get("notional") or controls.max_per_trade_usd),
+                )
+            )
+
+        async def _shadow_execute(
+            cand: tc.TradeCandidate, clamped_notional: float
+        ) -> Any:
+            # Force SHADOW: this broker can only log to shadow_trades.jsonl,
+            # never submit to Robinhood, no matter the global mode.
+            from packages.execution.broker import OrderRequest
+            from packages.execution.modes import ExecutionMode
+            from packages.execution.robinhood import RobinhoodAgenticBroker
+
+            price = _price_for(cand.symbol)
+            if not price or price <= 0:
+                raise RuntimeError("no price for shadow sizing")
+            qty = max(0.0, clamped_notional / price)
+            if qty <= 0:
+                raise RuntimeError("zero qty")
+            broker = RobinhoodAgenticBroker(
+                mode=ExecutionMode.SHADOW, account_number="shadow-local"
+            )
+            try:
+                return await broker.submit(
+                    OrderRequest(
+                        symbol=cand.symbol,
+                        side="buy",
+                        qty=qty,
+                        type="limit",
+                        limit_price=float(price),
+                        decision_id=f"controls-{cand.symbol}",
+                    )
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    await broker.aclose()
+
+        try:
+            return await tc.process_candidates(
+                candidates,
+                controls,
+                state,
+                executor=_shadow_execute,
+                record_pending=pq.upsert_pending,
+                mark_executed=pq.mark_executed,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("trading-controls processing failed: %s", exc)
+            return {"error": str(exc)[:200]}
+
     autonomy_brain.configure(
         on_curiosity_focus=_agent_sched_set_symbols,
         portfolio_symbols_getter=_portfolio_symbols_snapshot,
@@ -4369,6 +4595,7 @@ async def _autonomy_startup() -> None:  # pragma: no cover
         dip_watch_tick=_phase25_dip_watch_tick,
         quote_warmup_tick=_phase25_quote_warmup_tick,
         eod_flatten_tick=_eod_flatten_hook,
+        trading_controls_tick=_trading_controls_tick,
     )
     started = autonomy_brain.start()
     log.info("autonomy brain startup: started=%s", started)

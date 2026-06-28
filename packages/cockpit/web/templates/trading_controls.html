@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0B0F14" />
+  <title>Controls · The Seer</title>
+  {% include "_head_icons.html" %}
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/cockpit.css" />
+  <script src="/static/cockpit.js"></script>
+  <style>
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .tc-help { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+    .tc-field { margin-bottom: 16px; }
+    .tc-input {
+      width: 100%; background: rgba(255,255,255,.04); color: var(--text-primary);
+      border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+      font-size: 15px;
+    }
+    .tc-input:focus { outline: none; border-color: var(--accent-violet, #8b5cf6); }
+    .tc-bar-track { height: 12px; border-radius: 999px; background: rgba(255,255,255,.07); overflow: hidden; }
+    .tc-bar-fill { height: 100%; background: linear-gradient(90deg,#10b981,#059669); transition: width .3s; }
+    .tc-preset {
+      flex: 1; min-width: 0; text-align: left; cursor: pointer;
+      background: rgba(255,255,255,.03); border: 1px solid var(--border);
+      border-radius: 10px; padding: 14px; transition: all .15s;
+    }
+    .tc-preset:hover { border-color: var(--border-strong, #475569); }
+    .tc-preset.is-active {
+      border-color: #10b981; background: rgba(16,185,129,.10);
+      box-shadow: 0 0 0 1px #10b981 inset;
+    }
+    .tc-preset-name { font-weight: 600; font-size: 15px; }
+    .tc-preset-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+    .tc-preset-pct { font-size: 12px; color: #6ee7b7; margin-top: 6px; }
+    .tc-pending-row {
+      display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center;
+      padding: 12px 0; border-bottom: 1px solid var(--border-faint);
+    }
+    .tc-pending-row:last-child { border-bottom: none; }
+    .tc-reason { font-size: 12px; color: #fcd34d; margin-top: 2px; }
+  </style>
+</head>
+<body class="min-h-screen">
+  {% include "_nav.html" %}
+
+  <div class="max-w-3xl mx-auto p-4 md:p-6">
+    <header class="mb-5">
+      <h1 class="text-2xl font-semibold">Controls</h1>
+      <p class="text-sm mt-1" style="color:var(--text-secondary);">
+        Set the limits the AI trades within. These apply at all times — and while
+        you're in practice (shadow) mode, every trade is simulated, never real.
+      </p>
+      <span id="tc-save-pill" class="pill pill-green mt-2" style="display:none;">Saved</span>
+    </header>
+
+    <!-- ============ BUDGET ============ -->
+    <section class="card p-5 mb-4">
+      <h2 class="section-h mb-1">Budget</h2>
+      <p class="text-sm mb-4" style="color:var(--text-secondary);">
+        How much money the AI is allowed to use, and how it's spread out.
+      </p>
+
+      <div class="mb-4">
+        <div class="flex items-center justify-between text-sm mb-1">
+          <span style="color:var(--text-secondary);">Used so far today</span>
+          <span class="mono"><span id="tc-used">$0</span> of <span id="tc-budget-total">$300</span></span>
+        </div>
+        <div class="tc-bar-track"><div id="tc-budget-bar" class="tc-bar-fill" style="width:0%"></div></div>
+        <div class="tc-help"><span id="tc-remaining">$300</span> remaining today</div>
+      </div>
+
+      <div class="tc-field">
+        <label class="text-sm font-medium" for="tc-total-budget">Total budget</label>
+        <input id="tc-total-budget" class="tc-input mono" type="number" min="0" step="10" />
+        <div class="tc-help">The most real money the AI can use in total (max $10,000).</div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div class="tc-field">
+          <label class="text-sm font-medium" for="tc-per-trade">Max per trade</label>
+          <input id="tc-per-trade" class="tc-input mono" type="number" min="0" step="5" />
+          <div class="tc-help">The most it can spend on any single buy.</div>
+        </div>
+        <div class="tc-field">
+          <label class="text-sm font-medium" for="tc-max-trades">Max trades / day</label>
+          <input id="tc-max-trades" class="tc-input mono" type="number" min="0" step="1" />
+          <div class="tc-help">How many buys it can make in a day.</div>
+        </div>
+        <div class="tc-field">
+          <label class="text-sm font-medium" for="tc-max-open">Max open positions</label>
+          <input id="tc-max-open" class="tc-input mono" type="number" min="0" step="1" />
+          <div class="tc-help">How many stocks it can hold at once.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ CONFIDENCE GATE ============ -->
+    <section class="card p-5 mb-4">
+      <h2 class="section-h mb-1">How picky should the AI be?</h2>
+      <p class="text-sm mb-4" style="color:var(--text-secondary);">
+        The AI only acts on trades it's confident about. Pickier means fewer,
+        higher-conviction trades.
+      </p>
+
+      <div class="flex flex-col md:flex-row gap-3 mb-4">
+        <button type="button" class="tc-preset" data-preset="conservative">
+          <div class="tc-preset-name">Conservative</div>
+          <div class="tc-preset-sub">Only the strongest ideas. Fewest trades.</div>
+          <div class="tc-preset-pct">Needs ≥ <span data-preset-pct="conservative">70%</span> confidence</div>
+        </button>
+        <button type="button" class="tc-preset" data-preset="balanced">
+          <div class="tc-preset-name">Balanced</div>
+          <div class="tc-preset-sub">A sensible middle ground.</div>
+          <div class="tc-preset-pct">Needs ≥ <span data-preset-pct="balanced">55%</span> confidence</div>
+        </button>
+        <button type="button" class="tc-preset" data-preset="aggressive">
+          <div class="tc-preset-name">Aggressive</div>
+          <div class="tc-preset-sub">Acts on more ideas. More trades.</div>
+          <div class="tc-preset-pct">Needs ≥ <span data-preset-pct="aggressive">40%</span> confidence</div>
+        </button>
+      </div>
+
+      <details id="tc-advanced">
+        <summary class="text-sm cursor-pointer" style="color:var(--text-secondary);">Advanced: set the exact minimum</summary>
+        <div class="mt-3">
+          <div class="flex items-center justify-between text-sm mb-1">
+            <span style="color:var(--text-secondary);">Minimum confidence</span>
+            <span class="mono" id="tc-conf-label">60%</span>
+          </div>
+          <input id="tc-conf-slider" type="range" min="0" max="100" step="1" value="60" class="w-full" />
+          <div class="tc-help">Moving this switches you to a <strong>Custom</strong> setting.</div>
+        </div>
+      </details>
+    </section>
+
+    <div class="flex items-center gap-3 mb-6">
+      <button id="tc-save" class="btn btn-primary">Save controls</button>
+      <span id="tc-save-status" class="text-sm" style="color:var(--text-muted);"></span>
+    </div>
+
+    <!-- ============ PENDING ============ -->
+    <section class="card p-5 mb-8">
+      <div class="flex items-center justify-between mb-1">
+        <h2 class="section-h mb-0">Waiting on your settings</h2>
+        <span id="tc-pending-count" class="pill pill-muted">0</span>
+      </div>
+      <p class="text-sm mb-3" style="color:var(--text-secondary);">
+        Trades the AI wants to make but is holding because they don't meet your
+        limits yet. When one qualifies, it proceeds automatically (in practice mode).
+      </p>
+      <div id="tc-pending-list"></div>
+      <div id="tc-pending-empty" class="text-sm" style="color:var(--text-muted);">
+        Nothing waiting right now.
+      </div>
+    </section>
+  </div>
+
+  <script>
+    // ---------------------------------------------------------------------
+    // Trading Controls page
+    // ---------------------------------------------------------------------
+    let TC = {};            // last-loaded controls payload
+    const $ = (id) => document.getElementById(id);
+
+    function fmtUsd(v) {
+      const n = Number(v) || 0;
+      return Number.isInteger(n) ? `$${n.toLocaleString()}` : `$${n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+    }
+    function pct(frac) { return `${Math.round((Number(frac)||0) * 100)}%`; }
+
+    function paintPresets(preset) {
+      document.querySelectorAll('.tc-preset').forEach((b) => {
+        b.classList.toggle('is-active', b.dataset.preset === preset);
+      });
+    }
+
+    function paintBudgetBar() {
+      const total = Number(TC.total_budget_usd) || 0;
+      const used = Number(TC.used_budget_usd) || 0;
+      const remaining = Number(TC.remaining_budget_usd ?? Math.max(0, total - used));
+      const w = total > 0 ? Math.min(100, (used / total) * 100) : 0;
+      $('tc-budget-bar').style.width = `${w}%`;
+      $('tc-used').textContent = fmtUsd(used);
+      $('tc-budget-total').textContent = fmtUsd(total);
+      $('tc-remaining').textContent = fmtUsd(remaining);
+    }
+
+    function applyToForm(d) {
+      TC = d || {};
+      $('tc-total-budget').value = Math.round(Number(d.total_budget_usd) || 0);
+      $('tc-per-trade').value = Math.round(Number(d.max_per_trade_usd) || 0);
+      $('tc-max-trades').value = Number(d.max_trades_per_day) || 0;
+      $('tc-max-open').value = Number(d.max_open_positions) || 0;
+      const confPct = Math.round((Number(d.min_confidence) || 0) * 100);
+      $('tc-conf-slider').value = confPct;
+      $('tc-conf-label').textContent = `${confPct}%`;
+      // preset threshold labels
+      const thr = d.preset_thresholds || {};
+      ['conservative','balanced','aggressive'].forEach((p) => {
+        const el = document.querySelector(`[data-preset-pct="${p}"]`);
+        if (el && thr[p] != null) el.textContent = pct(thr[p]);
+      });
+      paintPresets(d.risk_preset);
+      paintBudgetBar();
+    }
+
+    async function loadControls() {
+      try {
+        const d = await Cockpit.api.get('/api/trading-controls');
+        applyToForm(d);
+      } catch (e) {
+        if (Cockpit.toastError) Cockpit.toastError('Could not load controls: ' + e.message);
+      }
+    }
+
+    function renderPending(items) {
+      const list = $('tc-pending-list');
+      const empty = $('tc-pending-empty');
+      $('tc-pending-count').textContent = items.length;
+      if (!items.length) {
+        list.innerHTML = '';
+        empty.style.display = '';
+        return;
+      }
+      empty.style.display = 'none';
+      list.innerHTML = items.map((e) => {
+        const conf = pct(e.confidence);
+        const reasons = (e.reasons || []).map((r) => `<div class="tc-reason">• ${r}</div>`).join('');
+        return `
+          <div class="tc-pending-row">
+            <div>
+              <div><span class="font-semibold mono">${e.symbol}</span>
+                <span class="text-xs" style="color:var(--text-muted)">wants to ${e.side || 'buy'} ${fmtUsd(e.notional)}</span></div>
+              ${reasons}
+            </div>
+            <div class="mono text-sm" style="color:var(--text-secondary)">${conf}</div>
+          </div>`;
+      }).join('');
+    }
+
+    async function loadPending() {
+      try {
+        const d = await Cockpit.api.get('/api/trading-controls/pending');
+        renderPending(d.pending || []);
+      } catch (e) { /* leave last render */ }
+    }
+
+    async function save(extra) {
+      const body = Object.assign({
+        total_budget_usd: Number($('tc-total-budget').value),
+        max_per_trade_usd: Number($('tc-per-trade').value),
+        max_trades_per_day: Number($('tc-max-trades').value),
+        max_open_positions: Number($('tc-max-open').value),
+      }, extra || {});
+      try {
+        const d = await Cockpit.api.post('/api/trading-controls', body);
+        applyToForm(d);
+        const pill = $('tc-save-pill');
+        pill.style.display = '';
+        setTimeout(() => { pill.style.display = 'none'; }, 2500);
+        if (Cockpit.toastSuccess) Cockpit.toastSuccess('Controls saved');
+      } catch (e) {
+        if (Cockpit.toastError) Cockpit.toastError('Save failed: ' + e.message);
+      }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      // Preset buttons -> save with that preset (server maps to min_confidence).
+      document.querySelectorAll('.tc-preset').forEach((b) => {
+        b.addEventListener('click', () => save({ risk_preset: b.dataset.preset }));
+      });
+      // Slider: live label; on release, save as explicit min_confidence (=> custom).
+      const slider = $('tc-conf-slider');
+      slider.addEventListener('input', () => {
+        $('tc-conf-label').textContent = `${slider.value}%`;
+        paintPresets('custom');
+      });
+      slider.addEventListener('change', () => {
+        save({ min_confidence: Number(slider.value) / 100 });
+      });
+      $('tc-save').addEventListener('click', () => save());
+
+      loadControls();
+      loadPending();
+      Cockpit.poll(loadPending, 15000, { name: 'tc-pending' });
+      Cockpit.poll(() => { paintBudgetBar(); loadControls(); }, 30000, { name: 'tc-controls' });
+    });
+  </script>
+</body>
+</html>
