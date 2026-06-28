@@ -15,7 +15,9 @@
       6. Writes URL + token to data/cockpit/remote_handle.json.
       7. Publishes the handle to a private GitHub branch
          (refs/heads/cockpit-handle) so the agent can always find it.
-      8. Tails the tunnel; Ctrl+C stops everything.
+      8. Supervises cloudflared 24/7: auto-restarts it on crash/disconnect,
+         re-detects the new URL, and re-publishes the handle on every URL
+         change so the agent always follows the live tunnel. Ctrl+C stops all.
 
     Run this ONCE and the agent can reach your bot for as long as the
     window stays open. Re-run anytime; URL refreshes automatically.
@@ -133,6 +135,164 @@ function Install-Cloudflared {
     Invoke-WebRequest -Uri $url -OutFile $CloudflaredExe -UseBasicParsing
     Write-Host "Installed: $CloudflaredExe" -ForegroundColor Green
     return $CloudflaredExe
+}
+
+function Publish-Handle {
+    # Write the remote handle JSON locally, then (unless -NoPublish) publish
+    # it to origin/cockpit-handle. Called on the FIRST tunnel detection AND
+    # on every URL change after a watchdog restart, so the agent's published
+    # handle ALWAYS points at the current live trycloudflare URL.
+    #
+    # The LOCAL file is refreshed FIRST (even if the GitHub push later fails)
+    # so a local-file discovery fallback still works. Every publish failure is
+    # non-fatal: it logs a warning and leaves the tunnel up.
+    param(
+        [string]$PublicUrl,
+        [string]$Token
+    )
+    New-Item -ItemType Directory -Force -Path $HandleDir | Out-Null
+    $handle = [ordered]@{
+        url        = $PublicUrl
+        token      = $Token
+        started_at = (Get-Date).ToUniversalTime().ToString("o")
+        host_name  = $env:COMPUTERNAME
+        repo_root  = $RepoRoot
+    }
+    ($handle | ConvertTo-Json) | Set-Content -Path $HandlePath -Encoding UTF8
+    Write-Host "Wrote handle -> $HandlePath ($PublicUrl)" -ForegroundColor Green
+
+    if ($NoPublish) {
+        Write-Host "Skipping GitHub publish (-NoPublish set); handle is local only." -ForegroundColor DarkGray
+        return
+    }
+
+    # Git writes progress to stderr; relax the Stop policy for this block and
+    # rely on $LASTEXITCODE for real failure detection.
+    $prevErrPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    Push-Location $RepoRoot
+    try {
+        $tmpWorktree = Join-Path $env:TEMP ("cockpit-handle-" + [Guid]::NewGuid().ToString("N"))
+        $branchName = "cockpit-handle"
+
+        & git worktree add --detach $tmpWorktree *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "git worktree add failed; trying GitHub CLI fallback..." -ForegroundColor Yellow
+            if (-not (Publish-HandleViaGh -HandlePath $HandlePath -Branch $branchName)) {
+                Write-Host "Publish failed (git + gh both unavailable); handle is local only at $HandlePath (non-fatal)." -ForegroundColor Yellow
+            }
+        } else {
+            Push-Location $tmpWorktree
+            try {
+                & git checkout --orphan $branchName *> $null
+                & git rm -rf . *> $null
+                $remoteHandleDir = Join-Path $tmpWorktree "data\cockpit"
+                New-Item -ItemType Directory -Force -Path $remoteHandleDir | Out-Null
+                Copy-Item $HandlePath (Join-Path $remoteHandleDir "remote_handle.json") -Force
+
+                & git add data/cockpit/remote_handle.json *> $null
+                $commitMsg = "cockpit: publish handle " + (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+                & git -c user.email=devfarinsky@gmail.com -c user.name="Devin Farinsky" commit -m $commitMsg *> $null
+                # Orphan single-file state ref, rewritten every (re)publish on purpose.
+                & git push --force origin ("HEAD:refs/heads/" + $branchName) *> $null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "Published handle to origin/$branchName" -ForegroundColor Green
+                } else {
+                    Write-Host "git push failed (exit=$LASTEXITCODE); trying GitHub CLI fallback..." -ForegroundColor Yellow
+                    if (-not (Publish-HandleViaGh -HandlePath $HandlePath -Branch $branchName)) {
+                        Write-Host "Publish to origin failed (git push + gh both unavailable); handle local only (non-fatal)." -ForegroundColor Yellow
+                    }
+                }
+            } finally {
+                Pop-Location
+            }
+            & git worktree remove --force $tmpWorktree *> $null
+        }
+    } catch {
+        Write-Host "Handle publish hit an error (non-fatal, tunnel stays up): $($_.Exception.Message)" -ForegroundColor Yellow
+    } finally {
+        Pop-Location
+        $ErrorActionPreference = $prevErrPref
+    }
+}
+
+function Write-QrPage {
+    # Render the scannable phone QR page (QR drawn client-side -- no extra
+    # Python packages, no third-party image API). Regenerated whenever the
+    # tunnel URL changes so the QR always points at the live address.
+    param([string]$PublicUrl)
+    $qrPage = Join-Path $env:TEMP "cockpit_phone.html"
+    $qrHtml = @"
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>View AI Trading Bot on your phone</title>
+<style>
+  body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#0b0f14;color:#e6edf3;
+       margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:24px}
+  h1{font-size:20px;margin:0}
+  p{color:#9fb0c0;margin:4px 0;text-align:center;max-width:420px}
+  #qr{background:#fff;padding:16px;border-radius:12px}
+  code{background:#161b22;padding:6px 10px;border-radius:8px;font-size:13px;word-break:break-all;color:#7ee787}
+  a.btn{background:#00e5c4;color:#06231f;text-decoration:none;font-weight:700;padding:10px 18px;border-radius:10px}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+</head><body>
+  <h1>📱 Open the bot on your phone</h1>
+  <p>Scan this with your phone camera. It opens the live dashboard from anywhere.</p>
+  <div id="qr"></div>
+  <p>or type this address into your phone browser:</p>
+  <code>$PublicUrl</code>
+  <a class="btn" href="$PublicUrl" target="_blank">Open here instead</a>
+  <p style="font-size:12px;color:#5b6b7b">This page is safe to leave open. The link works only while the launcher window stays running.</p>
+<script>
+  QRCode.toCanvas(document.createElement('canvas'), '$PublicUrl', {width:240, margin:1},
+    function(err, canvas){ if(!err){ document.getElementById('qr').appendChild(canvas); }
+      else { document.getElementById('qr').textContent='(QR failed to render — use the address below)'; } });
+</script>
+</body></html>
+"@
+    Set-Content -Path $qrPage -Value $qrHtml -Encoding UTF8
+    return $qrPage
+}
+
+function Start-TunnelProcess {
+    # Start a fresh cloudflared quick tunnel. The log is ROTATED first so URL
+    # detection reads THIS process's banner -- a fresh cloudflared always gets
+    # a brand-new trycloudflare hostname, so a stale log line would otherwise
+    # make us publish a dead URL.
+    param([string]$Exe, [string]$LogPath, [string]$Url)
+    if (Test-Path $LogPath) { Remove-Item $LogPath -Force -ErrorAction SilentlyContinue }
+    $tunnelArgs = @("tunnel", "--url", $Url, "--no-autoupdate", "--logfile", $LogPath)
+    return Start-Process -FilePath $Exe -ArgumentList $tunnelArgs -PassThru -NoNewWindow
+}
+
+function Wait-TunnelUrl {
+    # Poll the cloudflared log for the trycloudflare URL of the current run.
+    param([string]$LogPath, [int]$TimeoutSec = 60)
+    for ($i = 0; $i -lt $TimeoutSec; $i++) {
+        Start-Sleep -Seconds 1
+        if (-not (Test-Path $LogPath)) { continue }
+        $logContent = Get-Content $LogPath -Raw -ErrorAction SilentlyContinue
+        if ($logContent -match "https://[a-z0-9-]+\.trycloudflare\.com") {
+            return $matches[0]
+        }
+    }
+    return $null
+}
+
+function Test-PublicTunnel {
+    # Confirm the tunnel is actually serving by hitting the PUBLIC health
+    # route through cloudflared (not just checking the local process). Any
+    # failure (DNS, QUIC drop, 5xx, timeout) returns $false.
+    param([string]$PublicUrl, [string]$Token)
+    try {
+        $headers = @{}
+        if ($Token) { $headers["Authorization"] = "Bearer $Token" }
+        $r = Invoke-WebRequest -Uri "$PublicUrl/api/remote/health" -Headers $headers -UseBasicParsing -TimeoutSec 8
+        return ($r.StatusCode -eq 200)
+    } catch {
+        return $false
+    }
 }
 
 function Repair-MiseProfile {
@@ -429,191 +589,162 @@ Write-Section "Step 3: cloudflared"
 $cf = Install-Cloudflared
 
 # --------------------------------------------------------------------
-# 4. Tunnel
+# 4. Supervised tunnel (self-healing watchdog) + auto-republish
 # --------------------------------------------------------------------
-Write-Section "Step 4: Starting tunnel"
+# Free, account-less quick tunnels get a NEW trycloudflare hostname on every
+# fresh cloudflared process, and the QUIC link can silently drop. So rather
+# than starting cloudflared once and passively tailing it, we SUPERVISE it for
+# the life of this window so remote access is truly 24/7:
+#   - (re)start cloudflared, rotate the log, re-detect the NEW public URL;
+#   - whenever the URL changes (first boot or after a restart) re-publish the
+#     handle so the agent always auto-discovers the LIVE url -- no pasting;
+#   - poll the process AND the public health route through cloudflared; if it
+#     exits or goes unreachable 3x, recycle it with light backoff (3s -> 15s);
+#   - once the tunnel has EVER come up we never exit -- we just keep healing.
+# Ctrl+C in this window still stops everything.
+Write-Section "Step 4: Starting self-healing tunnel"
 $logPath = Join-Path $env:TEMP "cockpit_tunnel.log"
-if (Test-Path $logPath) { Remove-Item $logPath -Force }
 
-$tunnelArgs = @("tunnel", "--url", $CockpitUrl, "--no-autoupdate", "--logfile", $logPath)
-$proc = Start-Process -FilePath $cf -ArgumentList $tunnelArgs -PassThru -NoNewWindow
+$currentUrl     = $null
+$everUp         = $false
+$proc           = $null
+$backoff        = 3
+$maxBackoff     = 15
+$coldStartTries = 0
+$healthFails    = 0
+$upSince        = $null
+$lastBeat       = Get-Date
+$checkEvery     = 15   # seconds between supervisor checks
+$beatEvery      = 60   # seconds between heartbeat lines
 
-$publicUrl = $null
-for ($i = 0; $i -lt 60; $i++) {
-    Start-Sleep -Seconds 1
-    if (-not (Test-Path $logPath)) { continue }
-    $logContent = Get-Content $logPath -Raw -ErrorAction SilentlyContinue
-    if ($logContent -match "https://[a-z0-9-]+\.trycloudflare\.com") {
-        $publicUrl = $matches[0]
-        break
-    }
-}
-
-if (-not $publicUrl) {
-    Write-Host "Could not detect tunnel URL within 60s. Check $logPath." -ForegroundColor Red
-    try { Stop-Process -Id $proc.Id -Force } catch {}
-    exit 1
-}
-
-Write-Host "Tunnel URL: $publicUrl" -ForegroundColor Green
-
-# Open the LOCAL dashboard as the primary browser tab -- NOT the tunnel URL.
-# The Robinhood OAuth callback redirects to http://127.0.0.1:8000/callback,
-# which only resolves on THIS machine; completing Connect from the tunnel
-# tab lands the loopback callback in the wrong context. So the tab the user
-# should actually use is the local one. The tunnel URL stays first-class for
-# phone/remote: printed prominently here, written to the handle JSON, and
-# rendered as a QR page below -- it just isn't the auto-opened primary tab.
-$localUrl = "$CockpitUrl/"
-Write-Host ""
-Write-Host "Open this on THIS computer to use the dashboard & connect Robinhood:  $localUrl" -ForegroundColor Cyan
-Write-Host "Open this on your PHONE / share with the agent (remote):  $publicUrl" -ForegroundColor Cyan
-Write-Host ""
-try {
-    Start-Process $localUrl | Out-Null
-    Write-Host "Opened the LOCAL dashboard ($localUrl) in your browser -- use this tab to Connect Robinhood." -ForegroundColor Green
-} catch {
-    Write-Host "Could not auto-open the browser; visit $localUrl on this computer." -ForegroundColor Yellow
-}
-
-# --------------------------------------------------------------------
-# 5. Write handle JSON
-# --------------------------------------------------------------------
-Write-Section "Step 5: Write handle"
-New-Item -ItemType Directory -Force -Path $HandleDir | Out-Null
-$handle = [ordered]@{
-    url        = $publicUrl
-    token      = $token
-    started_at = (Get-Date).ToUniversalTime().ToString("o")
-    host_name  = $env:COMPUTERNAME
-    repo_root  = $RepoRoot
-}
-$handleJson = $handle | ConvertTo-Json
-Set-Content -Path $HandlePath -Value $handleJson -Encoding UTF8
-Write-Host "Wrote $HandlePath" -ForegroundColor Green
-
-# --------------------------------------------------------------------
-# 6. Publish handle to GitHub branch (optional)
-# --------------------------------------------------------------------
-if (-not $NoPublish) {
-    Write-Section "Step 6: Publish handle to GitHub"
-    # Git writes progress lines to stderr; PowerShell's `Stop` policy treats
-    # those as terminating errors. Temporarily relax it for this block and
-    # rely on $LASTEXITCODE for real failure detection.
-    $prevErrPref = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    Push-Location $RepoRoot
-    $publishOk = $false
-    try {
-        $tmpWorktree = Join-Path $env:TEMP ("cockpit-handle-" + [Guid]::NewGuid().ToString("N"))
-        $branchName = "cockpit-handle"
-
-        & git worktree add --detach $tmpWorktree *> $null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "git worktree add failed; skipping publish. Handle is local only." -ForegroundColor Yellow
-        } else {
-            Push-Location $tmpWorktree
-            try {
-                & git checkout --orphan $branchName *> $null
-                & git rm -rf . *> $null
-                $remoteHandleDir = Join-Path $tmpWorktree "data\cockpit"
-                New-Item -ItemType Directory -Force -Path $remoteHandleDir | Out-Null
-                Copy-Item $HandlePath (Join-Path $remoteHandleDir "remote_handle.json") -Force
-
-                & git add data/cockpit/remote_handle.json *> $null
-                $commitMsg = "cockpit: publish handle " + (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
-                & git -c user.email=devfarinsky@gmail.com -c user.name="Devin Farinsky" commit -m $commitMsg *> $null
-                # Orphan single-file state ref, rewritten every launch on purpose.
-                & git push --force origin ("HEAD:refs/heads/" + $branchName) *> $null
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Host "Published handle to origin/$branchName" -ForegroundColor Green
-                    $publishOk = $true
-                } else {
-                    Write-Host "git push failed (exit=$LASTEXITCODE); trying GitHub CLI fallback..." -ForegroundColor Yellow
-                    $publishOk = Publish-HandleViaGh -HandlePath $HandlePath -Branch $branchName
-                    if (-not $publishOk) {
-                        Write-Host "Publish to origin failed (git push + gh both unavailable)." -ForegroundColor Yellow
-                        Write-Host "Handle is still available locally at $HandlePath" -ForegroundColor Yellow
-                        Write-Host "  Agent fallback: paste the Public URL + Token shown below." -ForegroundColor DarkGray
-                    }
-                }
-            } finally {
-                Pop-Location
-            }
-            & git worktree remove --force $tmpWorktree *> $null
+while ($true) {
+    # ---- (Re)start cloudflared whenever we have no live process ----
+    if (-not $proc -or $proc.HasExited) {
+        if ($proc -and $proc.HasExited) {
+            Write-Host "[tunnel] cloudflared exited (code $($proc.ExitCode)) -- restarting in ${backoff}s..." -ForegroundColor Yellow
+            Start-Sleep -Seconds $backoff
+            $backoff = [Math]::Min($backoff * 2, $maxBackoff)
         }
-    } finally {
-        Pop-Location
-        $ErrorActionPreference = $prevErrPref
+
+        $proc = Start-TunnelProcess -Exe $cf -LogPath $logPath -Url $CockpitUrl
+        $detected = Wait-TunnelUrl -LogPath $logPath -TimeoutSec 60
+
+        if (-not $detected) {
+            try { if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force } } catch {}
+            $proc = $null
+            if (-not $everUp) {
+                # Tolerant cold start: retry a couple times before giving a
+                # clear error. We ONLY hard-exit before the tunnel has ever
+                # come up; after that we never exit.
+                $coldStartTries++
+                if ($coldStartTries -ge 3) {
+                    Write-Host "Could not detect a tunnel URL after $coldStartTries attempts. Check $logPath." -ForegroundColor Red
+                    exit 1
+                }
+                Write-Host "[tunnel] no URL yet (cold-start attempt $coldStartTries/3) -- retrying..." -ForegroundColor Yellow
+            } else {
+                Write-Host "[tunnel] restart produced no URL within 60s -- retrying in ${backoff}s..." -ForegroundColor Yellow
+                Start-Sleep -Seconds $backoff
+                $backoff = [Math]::Min($backoff * 2, $maxBackoff)
+            }
+            continue
+        }
+
+        # Live URL in hand -- reset failure state.
+        $backoff     = 3
+        $healthFails = 0
+        $upSince     = Get-Date
+        $lastBeat    = Get-Date
+        $firstUp     = -not $everUp
+        $everUp      = $true
+
+        if ($detected -ne $currentUrl) {
+            $changed = ($null -ne $currentUrl)
+            $currentUrl = $detected
+            Write-Host "Tunnel URL: $currentUrl" -ForegroundColor Green
+            if ($changed) {
+                Write-Host "[tunnel] URL changed after restart -- re-publishing handle so the agent follows it." -ForegroundColor Yellow
+            }
+            # Re-publish on first detection AND on every change so the agent
+            # always reads the live URL. Both are non-fatal.
+            Publish-Handle -PublicUrl $currentUrl -Token $token
+            $qrPage = Write-QrPage -PublicUrl $currentUrl
+
+            if ($firstUp) {
+                # One-time UX: open the LOCAL dashboard as the primary tab --
+                # the Robinhood OAuth callback redirects to
+                # http://127.0.0.1:8000/callback, which only resolves on THIS
+                # machine, so Connect must be done from the local tab. The
+                # tunnel URL stays first-class for phone/remote (handle + QR).
+                $localUrl = "$CockpitUrl/"
+                Write-Host ""
+                Write-Host "Open this on THIS computer to use the dashboard & connect Robinhood:  $localUrl" -ForegroundColor Cyan
+                Write-Host "Open this on your PHONE / share with the agent (remote):  $currentUrl" -ForegroundColor Cyan
+                Write-Host ""
+                try {
+                    Start-Process $localUrl | Out-Null
+                    Write-Host "Opened the LOCAL dashboard ($localUrl) in your browser -- use this tab to Connect Robinhood." -ForegroundColor Green
+                } catch {
+                    Write-Host "Could not auto-open the browser; visit $localUrl on this computer." -ForegroundColor Yellow
+                }
+                try {
+                    Start-Process $qrPage | Out-Null
+                    Write-Host "Opened a QR-code page -- scan it with your phone to view the bot." -ForegroundColor Green
+                } catch {
+                    Write-Host "QR page saved to $qrPage (open it to scan)." -ForegroundColor Yellow
+                }
+
+                Write-Section "Cockpit + tunnel are LIVE"
+                Write-Host ""
+                Write-Host "On THIS computer : $CockpitUrl" -ForegroundColor Green
+                Write-Host "On your PHONE    : $currentUrl" -ForegroundColor Green
+                Write-Host "  (scan the QR page that just opened, or type that address)" -ForegroundColor DarkGray
+                Write-Host ""
+                Write-Host "Token      : $token" -ForegroundColor DarkGray
+                Write-Host "Handle     : $HandlePath" -ForegroundColor DarkGray
+                if (-not $NoPublish) {
+                    Write-Host "Published  : origin/cockpit-handle" -ForegroundColor DarkGray
+                }
+                Write-Host ""
+                Write-Host "The agent can now reach your cockpit." -ForegroundColor Yellow
+                Write-Host "You don't need to tell it the URL -- it will read the published handle." -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "This window self-heals the tunnel 24/7 (auto-restart + auto-republish)." -ForegroundColor DarkGray
+                Write-Host "Leave it open while you want remote access. Press Ctrl+C to stop." -ForegroundColor DarkGray
+                Write-Host ""
+            } else {
+                Write-Host "On your PHONE    : $currentUrl  (new address -- QR page refreshed)" -ForegroundColor Green
+            }
+        }
+    }
+
+    # ---- Supervise the live process ----
+    Start-Sleep -Seconds $checkEvery
+
+    if ($proc.HasExited) {
+        # Loop top logs + restarts with backoff.
+        continue
+    }
+
+    if (Test-PublicTunnel -PublicUrl $currentUrl -Token $token) {
+        $healthFails = 0
+    } else {
+        $healthFails++
+        Write-Host "[tunnel] public health check failed ($healthFails/3) for $currentUrl" -ForegroundColor DarkYellow
+        if ($healthFails -ge 3) {
+            Write-Host "[tunnel] unreachable 3x -- recycling cloudflared (backoff ${backoff}s)..." -ForegroundColor Yellow
+            try { if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force } } catch {}
+            $proc = $null
+            $healthFails = 0
+            Start-Sleep -Seconds $backoff
+            $backoff = [Math]::Min($backoff * 2, $maxBackoff)
+            continue
+        }
+    }
+
+    # ---- Low-noise heartbeat so a glance at the window confirms it's alive ----
+    if (((Get-Date) - $lastBeat).TotalSeconds -ge $beatEvery) {
+        Write-Host "[tunnel] healthy -- $currentUrl (up since $($upSince.ToString('HH:mm:ss')))" -ForegroundColor DarkGray
+        $lastBeat = Get-Date
     }
 }
-
-# --------------------------------------------------------------------
-# 7a. Phone access: write a QR-code page and open it
-# --------------------------------------------------------------------
-# The tunnel URL IS the phone-accessible dashboard (same FastAPI app),
-# so all the phone needs is that URL. We render a scannable QR locally
-# in a tiny self-contained HTML page (QR drawn client-side -- no extra
-# Python packages, no third-party image API, works offline once open).
-Write-Section "Step 7: Phone access"
-$qrPage = Join-Path $env:TEMP "cockpit_phone.html"
-$qrHtml = @"
-<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>View AI Trading Bot on your phone</title>
-<style>
-  body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#0b0f14;color:#e6edf3;
-       margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:24px}
-  h1{font-size:20px;margin:0}
-  p{color:#9fb0c0;margin:4px 0;text-align:center;max-width:420px}
-  #qr{background:#fff;padding:16px;border-radius:12px}
-  code{background:#161b22;padding:6px 10px;border-radius:8px;font-size:13px;word-break:break-all;color:#7ee787}
-  a.btn{background:#00e5c4;color:#06231f;text-decoration:none;font-weight:700;padding:10px 18px;border-radius:10px}
-</style>
-<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
-</head><body>
-  <h1>📱 Open the bot on your phone</h1>
-  <p>Scan this with your phone camera. It opens the live dashboard from anywhere.</p>
-  <div id="qr"></div>
-  <p>or type this address into your phone browser:</p>
-  <code>$publicUrl</code>
-  <a class="btn" href="$publicUrl" target="_blank">Open here instead</a>
-  <p style="font-size:12px;color:#5b6b7b">This page is safe to leave open. The link works only while the launcher window stays running.</p>
-<script>
-  QRCode.toCanvas(document.createElement('canvas'), '$publicUrl', {width:240, margin:1},
-    function(err, canvas){ if(!err){ document.getElementById('qr').appendChild(canvas); }
-      else { document.getElementById('qr').textContent='(QR failed to render \u2014 use the address below)'; } });
-</script>
-</body></html>
-"@
-Set-Content -Path $qrPage -Value $qrHtml -Encoding UTF8
-try {
-    Start-Process $qrPage | Out-Null
-    Write-Host "Opened a QR-code page -- scan it with your phone to view the bot." -ForegroundColor Green
-} catch {
-    Write-Host "QR page saved to $qrPage (open it to scan)." -ForegroundColor Yellow
-}
-
-# --------------------------------------------------------------------
-# 7b. Status block + block on tunnel
-# --------------------------------------------------------------------
-Write-Section "Cockpit + tunnel are LIVE"
-Write-Host ""
-Write-Host "On THIS computer : $CockpitUrl" -ForegroundColor Green
-Write-Host "On your PHONE    : $publicUrl" -ForegroundColor Green
-Write-Host "  (scan the QR page that just opened, or type that address)" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "Token      : $token" -ForegroundColor DarkGray
-Write-Host "Handle     : $HandlePath" -ForegroundColor DarkGray
-if (-not $NoPublish) {
-    Write-Host "Published  : origin/cockpit-handle" -ForegroundColor DarkGray
-}
-Write-Host ""
-Write-Host "The agent can now reach your cockpit." -ForegroundColor Yellow
-Write-Host "You don't need to tell it the URL -- it will read the published handle." -ForegroundColor Yellow
-Write-Host ""
-Write-Host "Leave this window open while you want remote access." -ForegroundColor DarkGray
-Write-Host "Press Ctrl+C to stop the tunnel." -ForegroundColor DarkGray
-Write-Host ""
-
-Wait-Process -Id $proc.Id
