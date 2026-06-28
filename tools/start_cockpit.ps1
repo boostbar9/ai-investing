@@ -135,6 +135,71 @@ function Install-Cloudflared {
     return $CloudflaredExe
 }
 
+function Repair-MiseProfile {
+    # Some users' PowerShell profiles run `mise activate pwsh | Out-String |
+    # Invoke-Expression` unconditionally. When mise isn't installed, every
+    # new session -- including each cockpit/uvicorn window this launcher
+    # spawns -- prints a noisy "The term 'mise' is not recognized" error.
+    #
+    # Guard any `mise activate` line behind a Get-Command check so it cleanly
+    # no-ops when mise is absent. SAFE + idempotent:
+    #   - only rewrites lines matching `mise activate` that aren't already
+    #     guarded (line already contains `Get-Command mise`);
+    #   - backs the profile up once to <profile>.bak before the first edit;
+    #   - never throws (each profile is handled in its own try/catch) so a
+    #     missing/read-only profile can't crash the launcher.
+    $targets = @($PROFILE.CurrentUserAllHosts, $PROFILE.CurrentUserCurrentHost) |
+        Where-Object { $_ } | Select-Object -Unique
+    $patchedAny = $false
+    $cleanAny = $false
+    foreach ($profilePath in $targets) {
+        try {
+            if (-not (Test-Path $profilePath)) { continue }
+            $lines = @(Get-Content -LiteralPath $profilePath)
+            $changed = $false
+            $out = foreach ($line in $lines) {
+                if ($line -match '^\s*mise\s+activate' -and $line -notmatch 'Get-Command\s+mise') {
+                    $changed = $true
+                    $indent = if ($line -match '^(\s*)') { $matches[1] } else { '' }
+                    $indent + 'if (Get-Command mise -ErrorAction SilentlyContinue) { ' + $line.TrimStart() + ' }'
+                } else {
+                    $line
+                }
+            }
+            if ($changed) {
+                $bak = "$profilePath.bak"
+                if (-not (Test-Path $bak)) {
+                    Copy-Item -LiteralPath $profilePath -Destination $bak -Force -ErrorAction SilentlyContinue
+                }
+                Set-Content -LiteralPath $profilePath -Value $out -Encoding UTF8
+                Write-Host "Patched PowerShell profile to silence mise error: $profilePath" -ForegroundColor Green
+                $patchedAny = $true
+            } else {
+                $cleanAny = $true
+            }
+        } catch {
+            Write-Host "  Could not patch profile $profilePath (skipped, non-fatal): $($_.Exception.Message)" -ForegroundColor DarkGray
+        }
+    }
+    if (-not $patchedAny -and $cleanAny) {
+        Write-Host "PowerShell profile already clean (no mise guard needed)." -ForegroundColor Green
+    } elseif (-not $patchedAny -and -not $cleanAny) {
+        Write-Host "No user PowerShell profile found to check (nothing to do)." -ForegroundColor DarkGray
+    }
+}
+
+# --------------------------------------------------------------------
+# Pre-flight: silence the `mise` PowerShell-profile error (if present)
+# --------------------------------------------------------------------
+# Done before anything spawns a child PowerShell window so those windows
+# inherit the cleaned profile. Fully non-fatal.
+Write-Section "Pre-flight: PowerShell profile hygiene"
+try {
+    Repair-MiseProfile
+} catch {
+    Write-Host "Profile hygiene step skipped (non-fatal): $($_.Exception.Message)" -ForegroundColor DarkGray
+}
+
 # --------------------------------------------------------------------
 # 0. Auto-pull latest code from origin (Phase 36e+)
 # --------------------------------------------------------------------
@@ -144,13 +209,18 @@ function Install-Cloudflared {
 # of the desktop shortcut starts a clean, current cockpit.
 #
 # Safety properties:
-#   - Fast-forward only: a divergent local branch is left untouched.
-#   - Uncommitted changes block the pull (git refuses); we detect and
-#     warn but continue booting on the existing code instead of
-#     halting -- the bot's job is to be running, not to be pristine.
+#   - Uncommitted changes block the update (we never discard user work):
+#     we detect a dirty tree, warn, and boot on the existing code.
+#   - On a CLEAN tree we land exactly on origin/main: fast-forward when
+#     possible, else hard-reset (safe -- no local work to lose). This is
+#     what makes the update RELIABLE instead of silently skipping.
+#   - Credential-less PCs: a plain `git fetch` (exit=128) is retried once
+#     with the GitHub CLI's token, scoped to that single fetch.
+#   - If GitHub is unreachable we print a LOUD warning and keep booting --
+#     the update never hard-fails the launcher (try/catch around it all).
 #   - --NoPull skips the whole block for the rare case you want to
 #     boot exactly what is on disk.
-#   - All git output is captured and shown; no silent failures.
+#   - All update output is visible; no silent failures.
 Write-Section "Step 0: Sync code from origin"
 if ($NoPull) {
     Write-Host "Skipped (-NoPull flag set)." -ForegroundColor Yellow
@@ -175,25 +245,58 @@ if ($NoPull) {
             $dirty -split "`n" | Select-Object -First 5 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
         } else {
             $beforeSha = (& git rev-parse --short HEAD 2>$null)
-            & git fetch --quiet origin 2>$null
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "git fetch failed (offline? auth?); booting on current code." -ForegroundColor Yellow
+
+            # 0b. Fetch origin/main. The user's PC frequently has NO git
+            #     credentials configured, so a plain fetch returns exit=128.
+            #     We retry once using the GitHub CLI's own auth token, scoped
+            #     to THIS single fetch via -c http.extraheader (no global
+            #     config change, token never persisted).
+            & git fetch --quiet origin main 2>$null
+            $fetchOk = ($LASTEXITCODE -eq 0)
+            if (-not $fetchOk) {
+                $gh = Get-Command gh -ErrorAction SilentlyContinue
+                if ($gh) {
+                    & gh auth status *> $null
+                    if ($LASTEXITCODE -eq 0) {
+                        $ghToken = (& gh auth token 2>$null)
+                        if (-not [string]::IsNullOrWhiteSpace($ghToken)) {
+                            Write-Host "Plain git fetch failed; retrying with GitHub CLI token..." -ForegroundColor Yellow
+                            & git -c http.extraheader="AUTHORIZATION: bearer $ghToken" fetch --quiet origin main 2>$null
+                            $fetchOk = ($LASTEXITCODE -eq 0)
+                        }
+                    }
+                }
+            }
+
+            if (-not $fetchOk) {
+                # LOUD, unmissable message -- this is the failure mode that
+                # kept the user on stale code. Never hard-fail the launcher.
+                Write-Host "============================================================" -ForegroundColor Red
+                Write-Host " Could not reach GitHub to update -- booting on current code $beforeSha." -ForegroundColor Red
+                Write-Host " Your PC may be missing the latest fixes." -ForegroundColor Red
+                Write-Host " (Fix: run ``gh auth login`` once, or configure git credentials.)" -ForegroundColor DarkGray
+                Write-Host "============================================================" -ForegroundColor Red
             } else {
-                # Count commits we're behind so we only pip-install if we actually moved.
-                $behindStr = (& git rev-list --count "HEAD..@{u}" 2>$null)
-                if ($LASTEXITCODE -ne 0) { $behindStr = "0" }
-                try { $behind = [int]$behindStr } catch { $behind = 0 }
-                if ($behind -le 0) {
+                $targetSha = (& git rev-parse --short origin/main 2>$null)
+                if ($beforeSha -eq $targetSha) {
                     Write-Host "Already up to date at $beforeSha." -ForegroundColor Green
                 } else {
-                    Write-Host "Pulling $behind commit(s) from origin..." -ForegroundColor Yellow
-                    & git pull --ff-only --quiet 2>$null
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Host "git pull --ff-only failed; booting on current code at $beforeSha." -ForegroundColor Yellow
-                        Write-Host "  Resolve manually: git status / git pull / git merge" -ForegroundColor DarkGray
-                    } else {
+                    # Prefer a fast-forward. If the local branch has diverged
+                    # (e.g. stale orphan/handle commits) we are SAFE to hard-
+                    # reset because we already verified the tree is clean
+                    # above -- no user work can be lost.
+                    & git merge --ff-only --quiet origin/main 2>$null
+                    $moved = ($LASTEXITCODE -eq 0)
+                    if (-not $moved) {
+                        Write-Host "Fast-forward not possible (local branch diverged); hard-resetting CLEAN tree to origin/main..." -ForegroundColor Yellow
+                        & git reset --hard origin/main 2>$null
+                        $moved = ($LASTEXITCODE -eq 0)
+                    }
+                    if ($moved) {
                         $afterSha = (& git rev-parse --short HEAD 2>$null)
-                        Write-Host "Updated: $beforeSha -> $afterSha" -ForegroundColor Green
+                        Write-Host "============================================================" -ForegroundColor Green
+                        Write-Host " Updated: $beforeSha -> $afterSha  (now on origin/main)" -ForegroundColor Green
+                        Write-Host "============================================================" -ForegroundColor Green
                         # Pip-install in editable mode so package metadata + entry
                         # points pick up. --quiet keeps the console readable; the
                         # full log goes to a temp file for post-mortem if needed.
@@ -206,10 +309,15 @@ if ($NoPull) {
                             Write-Host "Pip install returned exit=$LASTEXITCODE; booting anyway." -ForegroundColor Yellow
                             Write-Host "  Full log: $pipLog" -ForegroundColor DarkGray
                         }
+                    } else {
+                        Write-Host "Update could not be applied; booting on current code at $beforeSha." -ForegroundColor Yellow
+                        Write-Host "  Resolve manually: git status / git fetch / git reset --hard origin/main" -ForegroundColor DarkGray
                     }
                 }
             }
         }
+    } catch {
+        Write-Host "Auto-update step hit an unexpected error; booting on current code (non-fatal): $($_.Exception.Message)" -ForegroundColor Yellow
     } finally {
         Pop-Location
         $ErrorActionPreference = $prevErrPref
@@ -349,16 +457,23 @@ if (-not $publicUrl) {
 
 Write-Host "Tunnel URL: $publicUrl" -ForegroundColor Green
 
-# Now that the real, phone-reachable public URL is known, pop it open in
-# the default browser. We intentionally open $publicUrl (not the local
-# 127.0.0.1 address) so the link works from any device, and only after a
-# successful detection -- if detection failed above we already exited, so
-# there is never a dead/local URL auto-opened.
+# Open the LOCAL dashboard as the primary browser tab -- NOT the tunnel URL.
+# The Robinhood OAuth callback redirects to http://127.0.0.1:8000/callback,
+# which only resolves on THIS machine; completing Connect from the tunnel
+# tab lands the loopback callback in the wrong context. So the tab the user
+# should actually use is the local one. The tunnel URL stays first-class for
+# phone/remote: printed prominently here, written to the handle JSON, and
+# rendered as a QR page below -- it just isn't the auto-opened primary tab.
+$localUrl = "$CockpitUrl/"
+Write-Host ""
+Write-Host "Open this on THIS computer to use the dashboard & connect Robinhood:  $localUrl" -ForegroundColor Cyan
+Write-Host "Open this on your PHONE / share with the agent (remote):  $publicUrl" -ForegroundColor Cyan
+Write-Host ""
 try {
-    Start-Process $publicUrl | Out-Null
-    Write-Host "Opened the live dashboard in your browser." -ForegroundColor Green
+    Start-Process $localUrl | Out-Null
+    Write-Host "Opened the LOCAL dashboard ($localUrl) in your browser -- use this tab to Connect Robinhood." -ForegroundColor Green
 } catch {
-    Write-Host "Could not auto-open the browser; visit $publicUrl manually." -ForegroundColor Yellow
+    Write-Host "Could not auto-open the browser; visit $localUrl on this computer." -ForegroundColor Yellow
 }
 
 # --------------------------------------------------------------------
