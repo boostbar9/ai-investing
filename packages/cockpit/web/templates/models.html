@@ -52,42 +52,9 @@
   </style>
 </head>
 <body class="min-h-screen">
-  <div class="topbar"><div class="topbar-inner">
-    <a href="/" class="topbar-brand" aria-label="The Seer — home">
-      <span class="topbar-brand-sigil" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M2 12 C5 5, 19 5, 22 12 C19 19, 5 19, 2 12 Z"/>
-          <circle cx="12" cy="12" r="3.2" fill="currentColor" opacity="0.9"/>
-        </svg>
-      </span>
-      <span class="topbar-brand-text">
-        <span class="topbar-brand-name">The Seer</span>
-        <span class="topbar-brand-tag">Agent-driven investing</span>
-      </span>
-      <span id="cockpit-conn-dot" class="topbar-brand-dot idle" title="Connection status"></span>
-    </a>
-    <div id="cockpit-topbar"></div>
-  </div></div>
+  {% include "_nav.html" %}
 
   <div class="max-w-5xl mx-auto p-6">
-    <nav class="nav flex items-center gap-1 mb-4 text-sm">
-      <a href="/" class="nav-link">Dashboard</a>
-      <a href="/trading" class="nav-link">Trading</a>
-
-      <a href="/autopilot" class="nav-link">Autopilot</a>
-
-      <a href="/preflight" class="nav-link">Pre-flight</a>
-      <a href="/promote" class="nav-link">Promote</a>
-      <a href="/shadow" class="nav-link" title="Research deep-dive (formerly Shadow). Reasoning/funnel/calibration for each cycle.">Research</a>
-      <a href="/agents" class="nav-link">Agents</a>
-      <a href="/models" class="nav-link nav-active">Models</a>
-      <a href="/data-sources" class="nav-link">Data Sources</a>
-      <a href="/settings" class="nav-link">Settings</a>
-      <a href="/updates" class="nav-link">Updates</a>
-      <a href="/health" class="nav-link">Health</a>
-      <a href="/errors" class="nav-link">Errors<span id="nav-err-badge" class="nav-badge" data-err-badge style="display:none">0</span></a>
-      <button id="shortcuts-btn" class="btn btn-ghost btn-sm ml-auto" data-tt="Keyboard shortcuts (press ?)">?</button>
-    </nav>
 
     <header class="mb-6">
       <h1 class="text-2xl font-semibold">Models</h1>

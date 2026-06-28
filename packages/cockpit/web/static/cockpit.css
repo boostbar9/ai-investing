@@ -1119,6 +1119,257 @@ kbd {
   margin-bottom: var(--sp-5);
 }
 
+/* ============================================================================
+   Mission-control shell — shared responsive nav (_nav.html)
+   Desktop (>=960px): fixed left sidebar rail with collapsible groups.
+   Mobile  (<960px):  sticky top bar + hamburger reveals an accordion menu.
+   Behaviour lives in Cockpit.initNav(); this owns all the styling.
+   ============================================================================ */
+
+:root {
+  --seer-rail-w: 248px;
+  --seer-topbar-h: 60px;
+}
+
+/* Skip link — visually hidden until focused (keyboard accessibility). */
+.seer-skip {
+  position: fixed;
+  top: 8px;
+  left: 8px;
+  z-index: 120;
+  padding: 8px 14px;
+  border-radius: var(--r-md);
+  background: var(--accent);
+  color: #04201B;
+  font-weight: 700;
+  font-size: 0.8rem;
+  transform: translateY(-160%);
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.seer-skip:focus { transform: translateY(0); text-shadow: none; }
+
+/* ---- The shell container ---- */
+.seer-shell {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: var(--seer-rail-w);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-3);
+  overflow-y: auto;
+  overflow-x: hidden;
+  background:
+    linear-gradient(180deg, rgba(19,26,36,0.92) 0%, rgba(11,15,20,0.96) 100%);
+  border-right: 1px solid var(--border);
+  box-shadow: var(--shadow-lg), inset -1px 0 0 rgba(255,255,255,0.03);
+  backdrop-filter: blur(24px) saturate(150%);
+  -webkit-backdrop-filter: blur(24px) saturate(150%);
+}
+.seer-shell::-webkit-scrollbar { width: 6px; }
+
+.seer-shell-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+
+/* Live status chips painted by Cockpit.renderTopbar(). */
+.seer-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.seer-chips:empty { display: none; }
+.seer-chips .topbar-stats { margin-left: 0; gap: 6px; }
+
+/* ---- Hamburger (mobile only) ---- */
+.seer-burger {
+  display: none;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  width: 42px;
+  height: 42px;
+  padding: 0;
+  border-radius: var(--r-md);
+  background: var(--bg-glass);
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+.seer-burger span {
+  display: block;
+  width: 20px;
+  height: 2px;
+  margin: 0 auto;
+  border-radius: 2px;
+  background: var(--text-secondary);
+  transition: transform var(--dur-fast) var(--ease-out),
+              opacity var(--dur-fast) var(--ease-out);
+}
+.seer-shell.is-open .seer-burger span:nth-child(1) { transform: translateY(6px) rotate(45deg); }
+.seer-shell.is-open .seer-burger span:nth-child(2) { opacity: 0; }
+.seer-shell.is-open .seer-burger span:nth-child(3) { transform: translateY(-6px) rotate(-45deg); }
+
+/* ---- Menu + groups ---- */
+.seer-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.seer-group { display: flex; flex-direction: column; }
+
+.seer-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  margin-top: 6px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: var(--r-sm);
+}
+.seer-group-head:hover { background: var(--bg-glass); }
+.seer-group-name {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.seer-caret {
+  width: 8px; height: 8px;
+  border-right: 1.5px solid var(--text-dim);
+  border-bottom: 1.5px solid var(--text-dim);
+  transform: rotate(45deg);
+  transition: transform var(--dur-fast) var(--ease-out);
+  flex: none;
+}
+.seer-group[data-open="false"] .seer-caret { transform: rotate(-45deg); }
+
+.seer-group-items {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 6px;
+}
+.seer-group[data-open="false"] .seer-group-items { display: none; }
+
+/* ---- Links ---- */
+.seer-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: var(--r-md);
+  font-size: 0.86rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  text-align: left;
+  cursor: pointer;
+  position: relative;
+  transition: color var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
+}
+.seer-link:hover { color: var(--text-primary); background: var(--bg-glass); text-shadow: none; }
+.seer-link .seer-link-label { flex: 1 1 auto; }
+
+.seer-link.is-active {
+  color: var(--text-primary);
+  background: var(--accent-soft);
+  border-color: var(--border-glow);
+  font-weight: 600;
+}
+.seer-link.is-active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 18%;
+  bottom: 18%;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+
+.seer-help { margin-top: 10px; color: var(--text-dim); justify-content: space-between; }
+.seer-help .kbd { flex: none; }
+
+/* Error count badge on the Errors link. */
+.nav-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: var(--r-pill);
+  background: var(--danger);
+  color: #1A0509;
+  font-size: 0.66rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.seer-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+  background: rgba(3, 4, 13, 0.55);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+
+/* ---- Desktop: push page content right of the fixed rail ---- */
+@media (min-width: 960px) {
+  body { padding-left: var(--seer-rail-w); }
+  .seer-scrim { display: none !important; }
+}
+
+/* ---- Mobile / tablet: top bar + hamburger accordion ---- */
+@media (max-width: 959.98px) {
+  body { padding-left: 0; }
+  .seer-shell {
+    position: sticky;
+    top: 0;
+    left: auto;
+    bottom: auto;
+    width: auto;
+    max-height: 100vh;
+    flex-direction: column;
+    gap: var(--sp-3);
+    padding: 10px 14px;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    border-radius: 0 0 var(--r-lg) var(--r-lg);
+  }
+  .seer-burger { display: flex; }
+  /* Collapsed by default on mobile — hamburger reveals chips + menu. */
+  .seer-shell .seer-chips,
+  .seer-shell .seer-menu { display: none; }
+  .seer-shell.is-open .seer-chips { display: flex; }
+  .seer-shell.is-open .seer-menu { display: flex; }
+  /* Bigger, touch-friendly tap targets. */
+  .seer-link { padding: 12px 14px; font-size: 0.95rem; min-height: 46px; }
+  .seer-group-head { padding: 12px 12px; min-height: 44px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .seer-skip, .seer-burger span, .seer-caret, .seer-link { transition: none; }
+}
+
 /* ----------------- Mobile-first responsive (tablet ≤768px) ----------------- */
 
 @media (max-width: 768px) {

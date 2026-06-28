@@ -22,7 +22,10 @@ TEMPLATES = Path(__file__).resolve().parents[1] / "web" / "templates"
 
 
 def _templates():
-    return sorted(TEMPLATES.glob("*.html"))
+    # Skip ``_``-prefixed partials (e.g. _nav.html): they are never served
+    # standalone, only included into full pages that load the bundle, so a
+    # ``Cockpit.*`` reference in an onclick handler there is always safe.
+    return sorted(p for p in TEMPLATES.glob("*.html") if not p.name.startswith("_"))
 
 
 def test_no_template_loads_cockpit_js_with_defer():

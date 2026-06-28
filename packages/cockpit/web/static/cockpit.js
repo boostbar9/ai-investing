@@ -416,9 +416,93 @@
   };
 
   // ----------------------------------------------------------------------
+  // Mission-control shell nav (_nav.html)
+  // ----------------------------------------------------------------------
+  // The templating layer has no variables, so the shared nav partial is
+  // byte-identical on every page. We derive the active link from
+  // location.pathname here, drive the collapsible groups, and run the
+  // mobile hamburger + click-outside/Esc behaviour. Idempotent.
+  Cockpit.initNav = function () {
+    const shell = document.getElementById("seer-shell");
+    if (!shell || shell.dataset.navReady) return;
+    shell.dataset.navReady = "1";
+
+    const desktop = window.matchMedia("(min-width: 960px)");
+    const burger = document.getElementById("seer-burger");
+    const scrim = document.getElementById("seer-scrim");
+    const groups = Array.from(shell.querySelectorAll(".seer-group"));
+
+    // --- active-link highlight + expand the group that contains it ---
+    const here = (location.pathname.replace(/\/+$/, "") || "/");
+    let activeGroup = null;
+    shell.querySelectorAll(".seer-link[data-path]").forEach((a) => {
+      const raw = a.getAttribute("data-path") || "/";
+      const norm = raw.replace(/\/+$/, "") || "/";
+      const active = norm === "/"
+        ? here === "/"
+        : (here === norm || here.startsWith(norm + "/"));
+      a.classList.toggle("is-active", active);
+      if (active) {
+        a.setAttribute("aria-current", "page");
+        activeGroup = a.closest(".seer-group");
+      } else {
+        a.removeAttribute("aria-current");
+      }
+    });
+
+    function setGroup(group, open) {
+      group.setAttribute("data-open", open ? "true" : "false");
+      const head = group.querySelector(".seer-group-head");
+      if (head) head.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+    // Default expansion: open everything on desktop; on mobile keep groups
+    // collapsed except the one holding the current page (so when the menu
+    // opens the user sees where they are).
+    function applyDefaults() {
+      const wide = desktop.matches;
+      groups.forEach((g) => setGroup(g, wide || g === activeGroup));
+    }
+    applyDefaults();
+
+    // Group headers toggle their own section.
+    groups.forEach((g) => {
+      const head = g.querySelector(".seer-group-head");
+      if (!head) return;
+      head.addEventListener("click", () => {
+        setGroup(g, g.getAttribute("data-open") !== "true");
+      });
+    });
+
+    // --- mobile hamburger ---
+    function setMenu(open) {
+      shell.classList.toggle("is-open", open);
+      if (burger) burger.setAttribute("aria-expanded", open ? "true" : "false");
+      if (burger) burger.setAttribute("aria-label", open ? "Close menu" : "Open menu");
+      if (scrim) scrim.hidden = !open;
+    }
+    if (burger) {
+      burger.addEventListener("click", () => setMenu(!shell.classList.contains("is-open")));
+    }
+    if (scrim) scrim.addEventListener("click", () => setMenu(false));
+    // Close the menu after navigating on mobile.
+    shell.querySelectorAll(".seer-link[href]").forEach((a) => {
+      a.addEventListener("click", () => { if (!desktop.matches) setMenu(false); });
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && shell.classList.contains("is-open")) setMenu(false);
+    });
+
+    // Reset state when crossing the breakpoint.
+    const onChange = () => { setMenu(false); applyDefaults(); };
+    if (desktop.addEventListener) desktop.addEventListener("change", onChange);
+    else if (desktop.addListener) desktop.addListener(onChange);
+  };
+
+  // ----------------------------------------------------------------------
   // Boot
   // ----------------------------------------------------------------------
   document.addEventListener("DOMContentLoaded", () => {
+    Cockpit.initNav();
     Cockpit.initTooltips();
     Cockpit.syncErrorBadge();
     setInterval(Cockpit.syncErrorBadge, 15000);

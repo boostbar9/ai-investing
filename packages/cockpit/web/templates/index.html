@@ -13,25 +13,7 @@
 </head>
 <body class="min-h-screen">
 
-  <!-- Global topbar -->
-  <div class="topbar">
-    <div class="topbar-inner">
-      <a href="/" class="topbar-brand" aria-label="The Seer — home">
-        <span class="topbar-brand-sigil" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M2 12 C5 5, 19 5, 22 12 C19 19, 5 19, 2 12 Z"/>
-            <circle cx="12" cy="12" r="3.2" fill="currentColor" opacity="0.9"/>
-          </svg>
-        </span>
-        <span class="topbar-brand-text">
-          <span class="topbar-brand-name">The Seer</span>
-          <span class="topbar-brand-tag">Agent-driven investing</span>
-        </span>
-        <span id="cockpit-conn-dot" class="topbar-brand-dot idle" title="Connection status"></span>
-      </a>
-      <div id="cockpit-topbar"></div>
-    </div>
-  </div>
+  {% include "_nav.html" %}
 
   <div class="max-w-7xl mx-auto p-4 md:p-6">
 
@@ -208,27 +190,6 @@
       })();
     </script>
 
-    <!-- Nav -->
-    <nav class="nav">
-      <a href="/" class="nav-link nav-active">Dashboard</a>
-      <a href="/trading" class="nav-link">Trading</a>
-
-      <a href="/autopilot" class="nav-link">Autopilot</a>
-
-      <a href="/preflight" class="nav-link">Pre-flight</a>
-      <a href="/promote" class="nav-link">Promote</a>
-      <a href="/shadow" class="nav-link" title="Research deep-dive (formerly Shadow). Reasoning/funnel/calibration for each cycle.">Research</a>
-      <a href="/agents" class="nav-link">Agents</a>
-      <a href="/learning" class="nav-link">Learning</a>
-      <a href="/models" class="nav-link">Models</a>
-      <a href="/data-sources" class="nav-link">Data Sources</a>
-      <a href="/settings" class="nav-link">Settings</a>
-      <a href="/updates" class="nav-link">Updates</a>
-      <a href="/health" class="nav-link">Health</a>
-      <a href="/errors" class="nav-link">Errors<span id="nav-err-badge" class="nav-badge" style="display:none">0</span></a>
-      <button onclick="Cockpit.showShortcuts()" class="ml-auto btn btn-ghost btn-sm" aria-label="Keyboard shortcuts">?</button>
-    </nav>
-
     <!-- Hero header -->
     <header class="seer-hero mb-5">
       <div class="seer-hero-left">
@@ -363,6 +324,87 @@
         <ul id="rh-checklist" class="space-y-1.5 text-sm"></ul>
       </div>
     </section>
+
+    <!-- ==== Live Robinhood account snapshot (read-only) ==== -->
+    <!-- Plain-English view of the real account the AI can see. Read-only:
+         polls /api/onboarding/robinhood/snapshot. Shows "Not connected"
+         gracefully until Robinhood is linked. -->
+    <section id="acct-panel" class="card p-4 mb-5">
+      <div class="flex items-center justify-between mb-3" style="flex-wrap:wrap;gap:8px;">
+        <div>
+          <h2 class="section-h mb-0">Your Robinhood account</h2>
+          <div class="text-xs mt-1" style="color:var(--text-muted)">
+            A read-only peek at the real account — the AI never moves money here until you go LIVE.
+          </div>
+        </div>
+        <span id="acct-status" class="pill pill-muted">checking…</span>
+      </div>
+      <div id="acct-grid" class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
+        <div class="p-3 rounded" style="border:1px solid var(--border)">
+          <div class="stat-label" data-tt="The account number the AI is allowed to trade, masked for privacy.">Account</div>
+          <div id="acct-masked" class="stat-val mono small">—</div>
+        </div>
+        <div class="p-3 rounded" style="border:1px solid var(--border)">
+          <div class="stat-label" data-tt="Cash that isn't tied up in positions.">Cash</div>
+          <div id="acct-cash" class="stat-val mono">—</div>
+        </div>
+        <div class="p-3 rounded" style="border:1px solid var(--border)">
+          <div class="stat-label" data-tt="How much the account can put to work right now.">Buying power</div>
+          <div id="acct-buying-power" class="stat-val mono">—</div>
+        </div>
+        <div class="p-3 rounded" style="border:1px solid var(--border)">
+          <div class="stat-label" data-tt="Total value of the account: cash plus the market value of every position.">Total equity</div>
+          <div id="acct-equity" class="stat-val mono">—</div>
+        </div>
+      </div>
+      <div id="acct-empty" class="text-sm mt-3" style="display:none;color:var(--text-muted)">
+        Robinhood isn't connected yet, so there's nothing real to show. Link it above and these
+        numbers will appear automatically — still read-only and safe.
+      </div>
+    </section>
+    <script>
+      // {# Read-only account snapshot poller. Hidden gracefully when not
+      //    connected; never triggers an order. Uses Cockpit.poll so it
+      //    pauses while the tab is hidden, like every other tile. #}
+      (function () {
+        const $ = (id) => document.getElementById(id);
+        function fmtMoney(v) {
+          const n = Number(v);
+          if (v === null || v === undefined || Number.isNaN(n)) return '—';
+          return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+        function setPill(cls, text) {
+          const el = $('acct-status');
+          if (!el) return;
+          el.className = 'pill ' + cls;
+          el.textContent = text;
+        }
+        async function refreshSnapshot() {
+          let snap;
+          try {
+            snap = await Cockpit.api.get('/api/onboarding/robinhood/snapshot?refresh=false');
+          } catch (_) { return; }
+          if (!snap) return;
+          const connected = !!snap.connected;
+          const grid = $('acct-grid');
+          const empty = $('acct-empty');
+          if (!connected) {
+            setPill('pill-muted', 'Not connected');
+            if (grid) grid.style.display = 'none';
+            if (empty) empty.style.display = 'block';
+            return;
+          }
+          if (grid) grid.style.display = '';
+          if (empty) empty.style.display = 'none';
+          setPill('pill-success', (snap.mode === 'live') ? 'Connected · LIVE' : 'Connected · practice');
+          $('acct-masked').textContent = snap.account_masked || '—';
+          $('acct-cash').textContent = fmtMoney(snap.cash);
+          $('acct-buying-power').textContent = fmtMoney(snap.buying_power);
+          $('acct-equity').textContent = fmtMoney(snap.total_equity);
+        }
+        Cockpit.poll(refreshSnapshot, 15000, { name: 'index-rh-snapshot' });
+      })();
+    </script>
 
     <!-- Broker selector + dual pipeline -->
     <section class="card p-4 mb-5">
