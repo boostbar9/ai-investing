@@ -262,15 +262,6 @@ if (Test-CockpitReachable -Url $CockpitUrl) {
     Write-Host "Cockpit is up at $CockpitUrl." -ForegroundColor Green
 }
 
-# Pop the dashboard open in the default browser right away so the user
-# sees the interface the moment it launches (no hunting for a URL).
-try {
-    Start-Process $CockpitUrl | Out-Null
-    Write-Host "Opened the dashboard in your browser." -ForegroundColor Green
-} catch {
-    Write-Host "Could not auto-open the browser; visit $CockpitUrl manually." -ForegroundColor Yellow
-}
-
 # --------------------------------------------------------------------
 # 3. cloudflared
 # --------------------------------------------------------------------
@@ -305,6 +296,18 @@ if (-not $publicUrl) {
 }
 
 Write-Host "Tunnel URL: $publicUrl" -ForegroundColor Green
+
+# Now that the real, phone-reachable public URL is known, pop it open in
+# the default browser. We intentionally open $publicUrl (not the local
+# 127.0.0.1 address) so the link works from any device, and only after a
+# successful detection -- if detection failed above we already exited, so
+# there is never a dead/local URL auto-opened.
+try {
+    Start-Process $publicUrl | Out-Null
+    Write-Host "Opened the live dashboard in your browser." -ForegroundColor Green
+} catch {
+    Write-Host "Could not auto-open the browser; visit $publicUrl manually." -ForegroundColor Yellow
+}
 
 # --------------------------------------------------------------------
 # 5. Write handle JSON
