@@ -244,9 +244,61 @@ if (Test-CockpitReachable -Url $CockpitUrl) {
         Write-Host "Create one first: python -m venv .venv ; .\.venv\Scripts\python -m pip install -e ." -ForegroundColor Red
         exit 1
     }
-    Write-Host "Starting cockpit in a new window..." -ForegroundColor Yellow
-    # Pass token through environment to the child process.
-    $startCmd = "`$env:COCKPIT_REMOTE_TOKEN='$token'; & '$VenvPython' -m uvicorn packages.cockpit.web.server:app --host 127.0.0.1 --port 8000"
+    # --------------------------------------------------------------------
+    # 2a. Stale-port guard.
+    # --------------------------------------------------------------------
+    # We are here because Test-CockpitReachable returned $false. If port
+    # 8000 is nonetheless held by a LISTENING process, that process is a
+    # dead/stale cockpit (or an unrelated app) -- either way the new
+    # uvicorn will fail to bind and crash-loop. Conservatively free the
+    # port ONLY if the owner is a python/uvicorn process; otherwise leave
+    # it alone and tell the user, so we never kill unrelated software.
+    try {
+        $stale = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue
+    } catch {
+        $stale = $null
+    }
+    if ($stale) {
+        $freedAny = $false
+        foreach ($conn in @($stale)) {
+            $owningPid = $conn.OwningProcess
+            $owner = Get-Process -Id $owningPid -ErrorAction SilentlyContinue
+            if ($owner -and ($owner.ProcessName -match '(?i)python|uvicorn')) {
+                Write-Host "Port 8000 held by a stale cockpit ($($owner.ProcessName), PID $owningPid); freeing it..." -ForegroundColor Yellow
+                Stop-Process -Id $owningPid -Force -ErrorAction SilentlyContinue
+                $freedAny = $true
+            } else {
+                $ownerName = if ($owner) { $owner.ProcessName } else { "unknown" }
+                Write-Host "Port 8000 is in use by '$ownerName' (PID $owningPid), which is NOT python/uvicorn." -ForegroundColor Red
+                Write-Host "  Close that program (or the old cockpit window) and re-run this launcher." -ForegroundColor Yellow
+            }
+        }
+        if ($freedAny) { Start-Sleep -Seconds 1 }
+    }
+
+    Write-Host "Starting cockpit in a new window (auto-restart enabled)..." -ForegroundColor Yellow
+    # Pass token through environment to the child process and wrap uvicorn
+    # in a while-loop so a single bad request (e.g. an unhandled error in
+    # the OAuth flow) can't take the UI down: if uvicorn exits, we log it,
+    # wait 2s, and restart. -NoExit keeps the window open so repeated
+    # failures stay visible. Console output is tee'd to a temp log so a
+    # crash is captured even if the window is missed; the web server also
+    # writes its own data/cockpit/logs/cockpit_web.log (RotatingFileHandler)
+    # which /api/remote/weblog exposes.
+    #
+    # Quoting: $token (hex) and $VenvPython (Windows path) are expanded by
+    # THIS parent shell via single-quoted literals; backtick-$ tokens stay
+    # literal so they evaluate inside the child shell.
+    $startCmd = "`$env:COCKPIT_REMOTE_TOKEN='$token'; " +
+        "`$ErrorActionPreference='Continue'; " +
+        "`$cockpitLog = Join-Path `$env:TEMP 'cockpit_server.log'; " +
+        "Write-Host ('[cockpit] console log: ' + `$cockpitLog) -ForegroundColor DarkGray; " +
+        "while (`$true) { " +
+            "Write-Host '[cockpit] starting uvicorn on 127.0.0.1:8000 ...' -ForegroundColor Cyan; " +
+            "& '$VenvPython' -m uvicorn packages.cockpit.web.server:app --host 127.0.0.1 --port 8000 2>&1 | Tee-Object -FilePath `$cockpitLog -Append; " +
+            "Write-Host ('[cockpit] server exited (code ' + `$LASTEXITCODE + '). Restarting in 2s... close this window to stop.') -ForegroundColor Yellow; " +
+            "Start-Sleep -Seconds 2 " +
+        "}"
     Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit", "-Command", $startCmd) -WorkingDirectory $RepoRoot | Out-Null
 
     Write-Host "Waiting for cockpit to come up..." -ForegroundColor DarkGray
