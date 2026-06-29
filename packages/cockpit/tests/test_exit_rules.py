@@ -186,6 +186,36 @@ def test_thesis_invalidates_on_compliance_red_flag(
     assert "Noncompliant" in d.reason
 
 
+def test_thesis_invalidation_via_source_helper_bluechip_etf_vs_otlk(
+    th: exit_rules.ExitThresholds, fresh_peaks: exit_rules._PeakStore
+) -> None:
+    """End-to-end: build the thesis_signal exactly as the server does (from
+    the corrected ``_compliance_ok``) and confirm a blue-chip/ETF HOLDS while
+    a true OTLK-style non-compliant name INVALIDATES."""
+    from packages.agents.research_sweep import _compliance_ok
+
+    def _signal(row: dict[str, Any]) -> dict[str, Any]:
+        ok, status = _compliance_ok(row)
+        return {"compliance_ok": ok, "compliance_status": status}
+
+    bluechip = _signal({"market_cap": 4.5e11, "financial_status_indicator": ""})
+    etf = _signal({"name": "SPDR Dow Jones Industrial Average ETF Trust"})
+    otlk = _signal({"financial_status_indicator": "CC4",
+                    "financial_status_description": "Noncompliant"})
+
+    for sig in (bluechip, etf):
+        d = exit_rules.evaluate_position(
+            "AAA", 0.001, th, peaks=fresh_peaks, thesis_signal=sig
+        )
+        assert d.action == "hold"
+
+    d = exit_rules.evaluate_position(
+        "OTLK", 0.001, th, peaks=fresh_peaks, thesis_signal=otlk
+    )
+    assert d.action == "sell"
+    assert d.reason.startswith("thesis_invalidated:compliance")
+
+
 def test_thesis_invalidates_on_catalyst_decay(
     th: exit_rules.ExitThresholds, fresh_peaks: exit_rules._PeakStore
 ) -> None:

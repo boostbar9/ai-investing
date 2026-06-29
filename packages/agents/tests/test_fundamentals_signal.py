@@ -28,6 +28,7 @@ from packages.agents.research_sweep import (
     _apply_fundamentals_enrichment,
     _compliance_ok,
     _gather_rh_fundamentals,
+    _is_etf_like,
     _next_earnings,
     _parse_fundamentals_row,
 )
@@ -85,17 +86,70 @@ def test_parse_fundamentals_row_skips_missing_without_fabricating() -> None:
 
 
 def test_compliance_ok_detects_noncompliant() -> None:
+    # OTLK-style: explicit deny-code + Noncompliant description.
     bad, status = _compliance_ok(
         {"financial_status_indicator": "CC4",
          "financial_status_description": "Noncompliant"}
     )
     assert bad is False and status == "Noncompliant"
-    # Non-normal indicator with no description still trips.
+    # An explicit Nasdaq deficiency code with no description still trips.
     bad2, _ = _compliance_ok({"financial_status_indicator": "D"})
     assert bad2 is False
     # Normal / empty are fine.
     assert _compliance_ok({"financial_status_indicator": "N"})[0] is True
     assert _compliance_ok({})[0] is True
+
+
+def test_compliance_ok_keyword_description_flags() -> None:
+    # A bad keyword in the description trips even with no indicator code.
+    for kw in ("Noncompliant", "Deficiency notice", "Pending delisting"):
+        ok, status = _compliance_ok({"financial_status_description": kw})
+        assert ok is False
+        assert status == kw
+
+
+def test_compliance_ok_blank_and_null_are_neutral() -> None:
+    # Blank / null / empty financial-status (large-cap, Finnhub/RSS names) =>
+    # NEUTRAL. Unknown is never risk -- this is the blue-chip false-positive fix.
+    assert _compliance_ok({})[0] is True
+    assert _compliance_ok({"financial_status_indicator": ""})[0] is True
+    assert _compliance_ok({"financial_status_indicator": None})[0] is True
+    assert _compliance_ok(
+        {"financial_status_indicator": "", "financial_status_description": ""}
+    )[0] is True
+    # A name with only price/cap data (MA, LLY style) is never flagged.
+    assert _compliance_ok(
+        {"market_cap": 4.5e11, "pe_ratio": 35.0, "last_trade_price": 480.0}
+    )[0] is True
+
+
+def test_compliance_ok_unrecognised_code_is_neutral() -> None:
+    # An UNRECOGNISED indicator code is NOT in the explicit deny-list => neutral.
+    for code in ("X", "ZZ", "CC9", "ACTIVE", "1", "FOO"):
+        ok, _ = _compliance_ok({"financial_status_indicator": code})
+        assert ok is True, f"{code!r} should be neutral, not a false positive"
+
+
+def test_compliance_ok_etf_is_always_neutral() -> None:
+    # ETFs / funds have no compliance concept -> never flagged, even if a
+    # stray indicator code is present on the row.
+    assert _compliance_ok({"type": "etp"})[0] is True
+    assert _compliance_ok({"instrument_type": "ETF"})[0] is True
+    assert _compliance_ok(
+        {"name": "SPDR Dow Jones Industrial Average ETF Trust"}
+    )[0] is True
+    assert _compliance_ok(
+        {"name": "iShares Core S&P 500", "financial_status_indicator": "D"}
+    )[0] is True
+
+
+def test_is_etf_like_positive_and_uncertain() -> None:
+    assert _is_etf_like({"type": "etf"}) is True
+    assert _is_etf_like({"category": "Exchange Traded Fund"}) is True
+    assert _is_etf_like({"name": "Vanguard Total Stock Market"}) is True
+    # Uncertain / plain equity => False (caller still defaults to no badge).
+    assert _is_etf_like({"name": "Mastercard Incorporated"}) is False
+    assert _is_etf_like({}) is False
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +182,44 @@ def test_apply_fundamentals_noncompliant_sets_risk_flag() -> None:
     (out,) = _apply_fundamentals_enrichment([c], funds)
     assert out.compliance_ok is False
     assert out.risk_flag == "delisting/compliance risk"
+
+
+def test_apply_fundamentals_bluechip_blank_status_no_badge() -> None:
+    # MA / LLY style: real RH read, huge cap, blank financial-status field.
+    # Must NOT raise the delisting/compliance badge (the screenshot bug).
+    c = _cand("MA")
+    funds = {
+        "MA": {
+            "market_cap": 4.5e11,
+            "pe_ratio": 35.0,
+            "last_trade_price": 480.0,
+            "high_52_weeks": 500.0,
+            "low_52_weeks": 360.0,
+            "sector": "Financial Services",
+            "financial_status_indicator": "",
+        }
+    }
+    (out,) = _apply_fundamentals_enrichment([c], funds)
+    assert out.compliance_ok is True
+    assert out.risk_flag == ""
+
+
+def test_apply_fundamentals_etf_no_badge() -> None:
+    # DIA / SPY style ETF: no compliance concept -> never badged.
+    c = _cand("DIA")
+    funds = {"DIA": {"name": "SPDR Dow Jones Industrial Average ETF Trust",
+                     "market_cap": 4.5e10}}
+    (out,) = _apply_fundamentals_enrichment([c], funds)
+    assert out.compliance_ok is True
+    assert out.risk_flag == ""
+
+
+def test_apply_fundamentals_unrecognised_code_no_badge() -> None:
+    c = _cand("AAA")
+    funds = {"AAA": {"financial_status_indicator": "CC9"}}  # unknown code
+    (out,) = _apply_fundamentals_enrichment([c], funds)
+    assert out.compliance_ok is True
+    assert out.risk_flag == ""
 
 
 def test_apply_fundamentals_missing_symbol_untouched() -> None:
