@@ -8,6 +8,7 @@ get lighter coverage.
 """
 from __future__ import annotations
 
+import importlib
 import math
 
 import pytest
@@ -16,6 +17,7 @@ from packages.agents.policy import (
     CONFIDENCE_WEIGHTS,
     ConfidenceGatedPolicy,
     PolicyDecision,
+    catalyst_score,
     composite_confidence,
 )
 
@@ -35,6 +37,7 @@ def test_composite_zero_when_all_inputs_zero() -> None:
     assert score == 0.0
     assert parts == {
         "candidate": 0.0,
+        "catalyst": 0.0,
         "regime": 0.0,
         "trust": 0.0,
         "ensemble_alignment": 0.0,
@@ -42,12 +45,29 @@ def test_composite_zero_when_all_inputs_zero() -> None:
 
 
 def test_composite_perfect_bull_signal_maxes_out() -> None:
-    """All signals firing in bull regime -> ~1.0 (sum of weights)."""
+    """All signals firing in bull regime -> ~1.0 (sum of weights).
+
+    Phase 3: includes a full catalyst payload so the new catalyst component
+    also pegs at 1.0; otherwise the catalyst weight would hold the composite
+    below 1.0 on purpose.
+    """
     candidate = {
         "symbol": "NVDA",
         "confidence": 1.0,
         "reddit_trust": 1.0,
         "corroborated": True,
+        # Catalyst sub-signals all maxed.
+        "days_to_earnings": 0,
+        "corroboration_score": 1.0,
+        "news_headlines": 5,
+        "yahoo_news_count": 5,
+        "rel_volume": 3.0,
+        "analyst_mean_rating": 1.0,
+        "analyst_num": 12,
+        "analyst_recent_action": "upgrade",
+        "insider_buy_count": 5,
+        "insider_sell_count": 0,
+        "insider_form4_30d": 5,
     }
     score, parts = composite_confidence(
         candidate=candidate,
@@ -57,6 +77,7 @@ def test_composite_perfect_bull_signal_maxes_out() -> None:
     )
     assert score == pytest.approx(1.0)
     assert parts["candidate"] == 1.0
+    assert parts["catalyst"] == pytest.approx(1.0)
     assert parts["regime"] == 1.0
     assert parts["trust"] == 1.0  # 1.0 + 0.3 corroboration, clipped at 1.0
     assert parts["ensemble_alignment"] == 1.0
@@ -391,7 +412,22 @@ def test_decide_uses_calibrator_when_provided() -> None:
     p.calibrator = lambda x: x * 0.5  # type: ignore[method-assign]
     decisions = p.decide(
         sweep_candidates=[
-            {"symbol": "NVDA", "confidence": 1.0, "reddit_trust": 1.0, "corroborated": True}
+            {
+                "symbol": "NVDA",
+                "confidence": 1.0,
+                "reddit_trust": 1.0,
+                "corroborated": True,
+                # Full catalyst payload so the raw composite still pegs ~1.0
+                # under the Phase 3 blend (catalyst now carries real weight).
+                "days_to_earnings": 0,
+                "corroboration_score": 1.0,
+                "news_headlines": 5,
+                "rel_volume": 3.0,
+                "analyst_mean_rating": 1.0,
+                "analyst_num": 12,
+                "analyst_recent_action": "upgrade",
+                "insider_buy_count": 5,
+            }
         ],
         ensemble_weights={"NVDA": 0.10},
         current_holdings=set(),
@@ -578,3 +614,251 @@ def test_to_target_weights_sizer_with_drawdown_shrinks_gross() -> None:
     )
     # Total gross under drawdown should be strictly smaller.
     assert sum(w_dd.values()) < sum(w_flat.values())
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: catalyst component -- each sub-signal contributes when present and
+# degrades to 0 when its feed is missing (never bearish, never fabricated),
+# the fundamentals red flag caps it, and the reweighted composite stays in
+# [0, 1], is env-overridable, and ranks a strong-catalyst name above an
+# otherwise-identical no-catalyst name.
+# ---------------------------------------------------------------------------
+
+
+def test_catalyst_zero_when_no_signals_present() -> None:
+    """A bare candidate (no enrichment) scores exactly 0.0 -- NEUTRAL, the
+    fail-safe floor. Missing feeds never push catalyst negative."""
+    assert catalyst_score(None) == 0.0
+    assert catalyst_score({}) == 0.0
+    assert catalyst_score({"symbol": "AAA", "confidence": 0.9}) == 0.0
+
+
+def test_catalyst_earnings_proximity_contributes_and_degrades() -> None:
+    """Near-term earnings lift catalyst; None (unknown) and past/far dates
+    contribute 0 -- absence is never bearish."""
+    soon = catalyst_score({"days_to_earnings": 0})
+    later = catalyst_score({"days_to_earnings": 7})
+    assert soon > later > 0.0
+    # Unknown / past / beyond-window all degrade to 0.
+    assert catalyst_score({"days_to_earnings": None}) == 0.0
+    assert catalyst_score({"days_to_earnings": -3}) == 0.0
+    assert catalyst_score({"days_to_earnings": 999}) == 0.0
+
+
+def test_catalyst_news_recency_contributes_and_degrades() -> None:
+    """Fresh-news corroboration + headline volume lift catalyst; no news -> 0."""
+    corro = catalyst_score({"corroboration_score": 1.0, "corroborated": True})
+    headlines = catalyst_score({"news_headlines": 5, "yahoo_news_count": 5})
+    assert corro > 0.0
+    assert headlines > 0.0
+    # No news fields at all -> neutral.
+    assert catalyst_score({"reddit_trust": 0.9}) == 0.0
+
+
+def test_catalyst_volume_expansion_contributes_and_degrades() -> None:
+    """rel_volume > 1 lifts catalyst; unknown (0.0) or no-expansion (<=1)
+    contribute 0 -- a quiet/unknown tape is never bearish."""
+    expand = catalyst_score({"rel_volume": 3.0})
+    assert expand > 0.0
+    assert catalyst_score({"rel_volume": 0.0}) == 0.0  # unknown
+    assert catalyst_score({"rel_volume": 1.0}) == 0.0  # no expansion
+    assert catalyst_score({"rel_volume": 0.5}) == 0.0  # below average, not bearish
+
+
+def test_catalyst_analyst_insider_contributes_and_degrades() -> None:
+    """Strong analyst rating / upgrade / insider buying lift catalyst; absent
+    feeds contribute 0. A downgrade is NEUTRAL, never a negative score."""
+    strong_buy = catalyst_score({"analyst_mean_rating": 1.0, "analyst_num": 10})
+    upgrade = catalyst_score({"analyst_recent_action": "upgrade"})
+    insider = catalyst_score({"insider_buy_count": 8, "insider_sell_count": 0})
+    assert strong_buy > 0.0
+    assert upgrade > 0.0
+    assert insider > 0.0
+    # A hold-rating with no other signal -> 0; a downgrade -> 0 (never bearish).
+    assert catalyst_score({"analyst_mean_rating": 3.0, "analyst_num": 10}) == 0.0
+    assert catalyst_score({"analyst_recent_action": "downgrade"}) == 0.0
+    # Analyst rating with zero coverage is ignored (not fabricated).
+    assert catalyst_score({"analyst_mean_rating": 1.0, "analyst_num": 0}) == 0.0
+
+
+def test_catalyst_capped_by_fundamentals_red_flag() -> None:
+    """A Noncompliant / delisting-risk name has its catalyst CAPPED (default
+    0.0) no matter how strong the event signals are. The gate only reduces."""
+    strong = {
+        "days_to_earnings": 0,
+        "corroboration_score": 1.0,
+        "corroborated": True,
+        "rel_volume": 3.0,
+        "analyst_mean_rating": 1.0,
+        "analyst_num": 10,
+        "analyst_recent_action": "upgrade",
+        "insider_buy_count": 5,
+    }
+    healthy = catalyst_score(strong)
+    assert healthy > 0.5
+    flagged = dict(strong, compliance_ok=False)
+    assert catalyst_score(flagged) == 0.0
+    # A candidate whose fundamentals feed never ran keeps compliance_ok=True by
+    # default and is therefore NEVER capped -- absence is not a red flag.
+    assert catalyst_score(strong) == healthy
+
+
+def test_catalyst_handles_garbage_fields() -> None:
+    """Garbage / wrong-typed enrichment fields never crash and never escape
+    [0, 1]; they degrade to the neutral floor."""
+    score = catalyst_score(
+        {
+            "days_to_earnings": "soon",
+            "corroboration_score": None,
+            "rel_volume": "lots",
+            "analyst_mean_rating": float("nan"),
+            "analyst_num": "many",
+            "insider_buy_count": None,
+        }
+    )
+    assert score == 0.0
+
+
+def test_composite_catalyst_component_present_in_breakdown() -> None:
+    """The catalyst component is surfaced in the components breakdown so the
+    decision log can show what drove a BUY."""
+    _, parts = composite_confidence(
+        candidate={"confidence": 0.5, "days_to_earnings": 1, "rel_volume": 3.0},
+        regime="bull",
+        regime_confidence=0.5,
+        ensemble_weight=0.0,
+    )
+    assert "catalyst" in parts
+    assert parts["catalyst"] > 0.0
+
+
+def test_composite_strong_catalyst_outscores_identical_no_catalyst() -> None:
+    """The whole point: an identical candidate with a strong catalyst payload
+    must score strictly higher than one with no catalyst at all."""
+    base = {"symbol": "ABC", "confidence": 0.6}
+    strong = dict(
+        base,
+        days_to_earnings=0,
+        corroboration_score=1.0,
+        corroborated=True,
+        news_headlines=5,
+        rel_volume=3.0,
+        analyst_mean_rating=1.0,
+        analyst_num=10,
+        analyst_recent_action="upgrade",
+        insider_buy_count=5,
+    )
+    score_plain, _ = composite_confidence(
+        candidate=base, regime="bull", regime_confidence=0.5, ensemble_weight=0.0
+    )
+    score_strong, _ = composite_confidence(
+        candidate=strong, regime="bull", regime_confidence=0.5, ensemble_weight=0.0
+    )
+    assert score_strong > score_plain
+    assert 0.0 <= score_plain <= 1.0
+    assert 0.0 <= score_strong <= 1.0
+
+
+def test_composite_noncompliant_strong_catalyst_does_not_outscore() -> None:
+    """A delisting-flag zeroes the catalyst channel, so an identical name that
+    is compliant must strictly outscore the flagged one -- the red flag can
+    only ever cost confidence, never add it."""
+    strong = {
+        "symbol": "ABC",
+        "confidence": 0.6,
+        "days_to_earnings": 0,
+        "corroboration_score": 1.0,
+        "corroborated": True,
+        "rel_volume": 3.0,
+        "analyst_recent_action": "upgrade",
+        "insider_buy_count": 5,
+    }
+    flagged = dict(strong, compliance_ok=False)
+    score_ok, parts_ok = composite_confidence(
+        candidate=strong, regime="bull", regime_confidence=0.5, ensemble_weight=0.0
+    )
+    score_flagged, parts_flagged = composite_confidence(
+        candidate=flagged, regime="bull", regime_confidence=0.5, ensemble_weight=0.0
+    )
+    assert parts_ok["catalyst"] > 0.0
+    assert parts_flagged["catalyst"] == 0.0
+    assert score_flagged < score_ok
+
+
+def test_composite_stays_in_unit_interval_with_catalyst() -> None:
+    """Even a maxed-out everything-firing candidate clamps to [0, 1]."""
+    cand = {
+        "confidence": 1.0,
+        "reddit_trust": 1.0,
+        "corroborated": True,
+        "corroboration_score": 1.0,
+        "days_to_earnings": 0,
+        "news_headlines": 50,
+        "yahoo_news_count": 50,
+        "rel_volume": 100.0,
+        "analyst_mean_rating": 1.0,
+        "analyst_num": 99,
+        "analyst_recent_action": "upgrade",
+        "insider_buy_count": 99,
+        "insider_form4_30d": 99,
+    }
+    score, _ = composite_confidence(
+        candidate=cand, regime="bull", regime_confidence=1.0, ensemble_weight=1.0
+    )
+    assert 0.0 <= score <= 1.0
+
+
+def test_confidence_weights_include_catalyst_and_sum_to_one() -> None:
+    """The reweighted blend keeps catalyst as a first-class component and the
+    weights still sum to 1.0 so the composite stays in [0, 1]."""
+    assert "catalyst" in CONFIDENCE_WEIGHTS
+    assert sum(CONFIDENCE_WEIGHTS.values()) == pytest.approx(1.0)
+    # Trust default is reduced (dead Reddit feed) but kept non-zero so it
+    # revives if the env weight is raised.
+    assert 0.0 < CONFIDENCE_WEIGHTS["trust"] < 0.20
+
+
+def test_weights_are_env_overridable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every blend weight follows the POLICY_WEIGHT_* env pattern so the blend
+    can be tuned without code changes (e.g. reviving trust if Reddit recovers).
+    """
+    import packages.agents.policy as policy
+
+    monkeypatch.setenv("POLICY_WEIGHT_CANDIDATE", "0.30")
+    monkeypatch.setenv("POLICY_WEIGHT_CATALYST", "0.30")
+    monkeypatch.setenv("POLICY_WEIGHT_REGIME", "0.15")
+    monkeypatch.setenv("POLICY_WEIGHT_ENSEMBLE_ALIGNMENT", "0.10")
+    monkeypatch.setenv("POLICY_WEIGHT_TRUST", "0.15")
+    try:
+        importlib.reload(policy)
+        assert policy.CONFIDENCE_WEIGHTS["candidate"] == pytest.approx(0.30)
+        assert policy.CONFIDENCE_WEIGHTS["catalyst"] == pytest.approx(0.30)
+        assert policy.CONFIDENCE_WEIGHTS["trust"] == pytest.approx(0.15)
+        assert sum(policy.CONFIDENCE_WEIGHTS.values()) == pytest.approx(1.0)
+    finally:
+        # Restore module-level defaults for any later test in this session.
+        importlib.reload(policy)
+
+
+def test_catalyst_noncompliant_cap_is_env_overridable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fundamentals cap ceiling is tunable; raising it lets a flagged name
+    keep SOME (capped) catalyst credit, but the cap can still only reduce."""
+    import packages.agents.policy as policy
+
+    monkeypatch.setenv("POLICY_CATALYST_NONCOMPLIANT_CAP", "0.10")
+    try:
+        importlib.reload(policy)
+        strong = {
+            "days_to_earnings": 0,
+            "corroboration_score": 1.0,
+            "corroborated": True,
+            "rel_volume": 3.0,
+            "analyst_recent_action": "upgrade",
+            "insider_buy_count": 5,
+            "compliance_ok": False,
+        }
+        assert policy.catalyst_score(strong) == pytest.approx(0.10)
+    finally:
+        importlib.reload(policy)
