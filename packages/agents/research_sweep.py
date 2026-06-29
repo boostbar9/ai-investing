@@ -974,9 +974,44 @@ _COMPLIANCE_BAD_KEYWORDS = (
     "delist",
     "bankrupt",
 )
-# Nasdaq financial-status indicator codes that mean "fine". Anything else
-# present (e.g. "CC4", "D", "E") is treated as a compliance concern.
-_COMPLIANCE_OK_INDICATORS = {"", "N", "NORMAL"}
+# EXPLICIT deny-list of Nasdaq financial-status indicator codes that mean
+# non-compliant / deficient / delinquent / bankrupt. This is an allow-by-
+# default contract: ONLY a code in this set (or a bad keyword in the
+# description) flags risk. A blank, null, or UNRECOGNISED code is NEVER risk
+# -- large-caps, ETFs, and Finnhub/RSS-sourced names routinely leave this
+# field blank or carry a code we don't know, and treating absence/unknown as
+# bad is a fail-safe violation in the wrong direction.
+#   D=Deficient  E=Delinquent  G=Deficient+Bankrupt  H=Deficient+Delinquent
+#   J=Delinquent+Bankrupt  K=Deficient+Delinquent+Bankrupt  Q=Bankrupt
+#   CC4=Robinhood-surfaced Noncompliant (the OTLK case)
+_COMPLIANCE_BAD_INDICATORS = {
+    "CC4", "D", "E", "G", "H", "J", "K", "Q",
+}
+# Tokens that identify an ETF / fund / note, which has no corporate
+# "financial status" concept at all and must never carry a compliance badge.
+_ETF_TYPE_TOKENS = ("etf", "etp", "etn", "fund", "trust", "index", "note")
+_ETF_NAME_TOKENS = (
+    " etf", " etn", " fund", " index", " trust", "ishares", "spdr",
+    "vanguard", "invesco", "proshares",
+)
+
+
+def _is_etf_like(row: dict[str, Any]) -> bool:
+    """True when the RH fundamentals row looks like an ETF / fund / note.
+
+    ETFs have no compliance concept, so they must never be flagged. We only
+    return True on a positive signal (an explicit type/category token, or a
+    fund-style name) -- if uncertain we return False and the caller's
+    allow-by-default logic still yields no badge, so a false ETF guess can
+    never manufacture a risk flag."""
+    typ = " ".join(
+        str(row.get(k) or "")
+        for k in ("type", "instrument_type", "category", "asset_type", "fund_type")
+    ).lower()
+    if any(tok in typ for tok in _ETF_TYPE_TOKENS):
+        return True
+    name = str(row.get("name") or row.get("description") or "").lower()
+    return any(tok in name for tok in _ETF_NAME_TOKENS)
 
 
 def _num(v: Any) -> float | None:
@@ -995,16 +1030,23 @@ def _num(v: Any) -> float | None:
 def _compliance_ok(row: dict[str, Any]) -> tuple[bool, str]:
     """``(ok, human_status)`` from RH ``financial_status_*`` fields.
 
-    Innocent until proven otherwise: missing status => ok=True, "" (so a
-    candidate without compliance data is never flagged). A bad keyword in the
-    description, or a non-normal indicator code, marks it noncompliant."""
+    Strict, fail-safe, allow-by-default: a name is flagged non-compliant
+    (``ok=False``) ONLY when RH returns an EXPLICIT, KNOWN deficiency -- a bad
+    keyword in the description (noncompliant / deficien / delist / ...) or an
+    indicator code in the explicit deny-list (CC4 / D / E / ...). Everything
+    else -- blank, null, empty, missing, or an UNRECOGNISED code -- is neutral
+    (``ok=True``, no badge); unknown is NEVER risk. ETFs / funds have no
+    compliance concept and are always neutral."""
+    if _is_etf_like(row):
+        return True, ""
     desc = str(row.get("financial_status_description") or "").strip()
     indicator = str(row.get("financial_status_indicator") or "").strip()
     low = desc.lower()
     if any(k in low for k in _COMPLIANCE_BAD_KEYWORDS):
         return False, desc or "Noncompliant"
-    if indicator and indicator.upper() not in _COMPLIANCE_OK_INDICATORS:
+    if indicator.upper() in _COMPLIANCE_BAD_INDICATORS:
         return False, desc or f"Status {indicator}"
+    # blank / null / empty / missing / unrecognised code => neutral.
     return True, desc
 
 

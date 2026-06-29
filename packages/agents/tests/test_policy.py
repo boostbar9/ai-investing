@@ -703,6 +703,39 @@ def test_catalyst_capped_by_fundamentals_red_flag() -> None:
     assert catalyst_score(strong) == healthy
 
 
+def test_catalyst_gate_via_source_helper_bluechip_etf_vs_otlk() -> None:
+    """End-to-end source->consumer: a blue-chip/ETF parsed through the
+    corrected ``_parse_fundamentals_row`` keeps full catalyst credit, while a
+    true OTLK-style non-compliant name is CAPPED. Proves the catalyst gate
+    only fires on EXPLICIT non-compliance, never on blank/ETF/unknown."""
+    from packages.agents.research_sweep import _parse_fundamentals_row
+
+    events = {
+        "days_to_earnings": 0,
+        "corroboration_score": 1.0,
+        "corroborated": True,
+        "rel_volume": 3.0,
+        "analyst_mean_rating": 1.0,
+        "analyst_num": 10,
+        "analyst_recent_action": "upgrade",
+        "insider_buy_count": 5,
+    }
+    bluechip = dict(events, **_parse_fundamentals_row(
+        {"market_cap": 4.5e11, "pe_ratio": 35.0,
+         "financial_status_indicator": ""}))      # MA: blank status
+    etf = dict(events, **_parse_fundamentals_row(
+        {"name": "SPDR Dow Jones Industrial Average ETF Trust"}))  # DIA
+    otlk = dict(events, **_parse_fundamentals_row(
+        {"financial_status_indicator": "CC4",
+         "financial_status_description": "Noncompliant"}))
+
+    full = catalyst_score(events)
+    assert full > 0.5
+    assert catalyst_score(bluechip) == full       # not capped
+    assert catalyst_score(etf) == full            # not capped
+    assert catalyst_score(otlk) == 0.0            # explicitly capped
+
+
 def test_catalyst_handles_garbage_fields() -> None:
     """Garbage / wrong-typed enrichment fields never crash and never escape
     [0, 1]; they degrade to the neutral floor."""
