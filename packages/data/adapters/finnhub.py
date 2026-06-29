@@ -121,5 +121,49 @@ class FinnhubAdapter(DataAdapter):
                 for row in r.json() or []
             ]
 
+    async def get_market_news(self, category: str = "general") -> list[NewsItem]:
+        """Fetch Finnhub market news for ``category`` (free-tier endpoint).
+
+        The free tier has no dedicated gainers/losers/most-active endpoint,
+        but ``/news?category=general`` IS reachable with the same key and
+        returns a fresh feed of market-moving headlines, each tagged with a
+        ``related`` ticker field. Discovery uses these as a movers proxy.
+
+        Mirrors :meth:`get_company_news`: rate-limited, health-tracked, and
+        raises :class:`DataAdapterError` on a missing key / non-200 so the
+        caller can fail safe. When a row carries a ``related`` ticker we set
+        ``NewsItem.symbol`` to the first one; otherwise it stays ``None`` and
+        the headline text still flows downstream for extraction.
+        """
+        if not self.api_key:
+            raise DataAdapterError("finnhub: FINNHUB_API_KEY not set")
+        await BUCKETS["finnhub"].acquire()
+        reg = health_mod.get_registry()
+        reg.record_attempt("finnhub")
+        with span("data.finnhub.market_news", {"category": category}):
+            r = await self._client.get(
+                f"{self.BASE}/news",
+                params={"category": category, "token": self.api_key},
+            )
+            if r.status_code != 200:
+                reg.record_failure("finnhub", f"HTTP {r.status_code}")
+                raise DataAdapterError(f"finnhub news {category}: {r.status_code}")
+            reg.record_success("finnhub")
+            out: list[NewsItem] = []
+            for row in r.json() or []:
+                related = str(row.get("related") or "").strip()
+                first = related.split(",")[0].strip().upper() if related else ""
+                out.append(
+                    NewsItem(
+                        symbol=first or None,
+                        ts=datetime.fromtimestamp(row.get("datetime", 0) or 0, tz=UTC),
+                        headline=row.get("headline", ""),
+                        summary=row.get("summary"),
+                        url=row.get("url", ""),
+                        source=row.get("source", "finnhub"),
+                    )
+                )
+            return out
+
     async def aclose(self) -> None:
         await self._client.aclose()
