@@ -1264,6 +1264,42 @@ def api_performance() -> dict[str, Any]:
         return compute_performance([], [], [])
 
 
+@app.get("/api/live-readiness")
+def api_live_readiness() -> dict[str, Any]:
+    """Read-only verdict on whether the engine has EARNED the right to go live.
+
+    Surfaces the hard ``live_readiness_gate`` (§16) so the operator can SEE, in
+    plain English, what still blocks live trading. It runs the gate against the
+    REAL paper mark-to-market equity series — the same persisted series
+    ``/api/equity-curve`` and Section A of ``/api/performance`` use
+    (``data/paper_log/runs.jsonl`` ``account_equity``), NOT the compounded
+    ``outcomes.jsonl`` signal journal.
+
+    Returns ``ready`` (bool), ``reasons`` (plain-English blockers), ``metrics``
+    (paper_days / max_drawdown / sharpe), the ``thresholds`` checked, and the
+    read-only ``enable_live_trading`` flag state.
+
+    DISPLAY ONLY: this endpoint never enables live trading and never touches
+    ``ENABLE_LIVE_TRADING``, ``rh_mode`` or ``resolve_mode``. Fail-safe: empty
+    or partial data yields ``ready=false`` with a reason — never a 500, never
+    ``ready=true`` on uncertainty.
+    """
+    from packages.backtests.live_promotion import readiness_report
+    from packages.cockpit.performance_stats import clean_equity_series
+
+    try:
+        runs_chrono = list(reversed(read_runs()))
+        equity_points = [
+            {"t": r.get("ts"), "equity": r.get("account_equity")} for r in runs_chrono
+        ]
+        series = clean_equity_series(equity_points)
+        equity_values = [p["equity"] for p in series]
+        return readiness_report(equity_values)
+    except Exception as exc:  # pragma: no cover — fail safe, never a 500
+        log.warning("live-readiness endpoint failed, returning not-ready: %s", exc)
+        return readiness_report([])
+
+
 # Phase 26 — News sentiment endpoint. Backed by Finnhub /company-news
 # with a 15-min in-process cache. When FINNHUB_API_KEY is unset the
 # endpoint still returns 200 with ``label: "neutral"`` and confidence 0,

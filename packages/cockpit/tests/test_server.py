@@ -1878,3 +1878,118 @@ def test_research_sweep_run_marks_running_immediately(
     # And the persisted heartbeat agrees.
     r2 = client.get("/api/research-sweep")
     assert r2.json()["status"]["status"] == "running"
+
+
+# --------------------------------------------------------------------------
+# /api/live-readiness — read-only surfacing of the §16 live-readiness gate.
+# Display only: the endpoint must NEVER enable live trading or report
+# ready=true on uncertainty. It reads the REAL paper equity series
+# (runs.jsonl account_equity — the same series /api/equity-curve serves),
+# never the compounded outcomes.jsonl journal.
+# --------------------------------------------------------------------------
+
+
+def _write_equity_runs(log: Path, equities: list[float]) -> None:
+    """Seed runs.jsonl with one run per equity mark, chronological (oldest first)."""
+    lines = []
+    for i, eq in enumerate(equities):
+        day = i + 1
+        lines.append(json.dumps({
+            "ts": f"2026-01-{day:02d}T20:00:00+00:00" if day <= 28
+                  else f"2026-{(day // 28) + 1:02d}-{(day % 28) + 1:02d}T20:00:00+00:00",
+            "strategy": "ensemble",
+            "halted": False,
+            "account_equity": float(eq),
+        }))
+    log.write_text("\n".join(lines) + "\n")
+
+
+def _equities_from_returns(rets: list[float], start: float = 100000.0) -> list[float]:
+    eq = [start]
+    for r in rets:
+        eq.append(eq[-1] * (1.0 + r))
+    return eq[1:]
+
+
+def test_live_readiness_shape_and_flag_off(client: TestClient, monkeypatch) -> None:
+    """Default fixture (2 runs, flag unset) → ready False with full shape."""
+    monkeypatch.delenv("ENABLE_LIVE_TRADING", raising=False)
+    r = client.get("/api/live-readiness")
+    assert r.status_code == 200
+    j = r.json()
+    # Contract shape.
+    for key in ("ready", "reasons", "metrics", "thresholds", "enable_live_trading"):
+        assert key in j, f"missing key {key!r}"
+    assert j["ready"] is False
+    assert isinstance(j["reasons"], list)
+    for mkey in ("paper_days", "max_drawdown", "sharpe"):
+        assert mkey in j["metrics"], f"missing metric {mkey!r}"
+    assert j["thresholds"] == {"min_days": 60, "max_dd": 0.08, "min_sharpe": 0.8}
+    assert j["enable_live_trading"] is False
+
+
+def test_live_readiness_too_few_days(client: TestClient, monkeypatch) -> None:
+    """Fewer than 60 paper days → ready False even with the flag on."""
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "true")
+    _write_equity_runs(srv.PAPER_LOG, _equities_from_returns([0.001] * 29))
+    j = client.get("/api/live-readiness").json()
+    assert j["ready"] is False
+    assert j["metrics"]["paper_days"] == 29
+    assert any("trading days" in reason for reason in j["reasons"])
+
+
+def test_live_readiness_drawdown_too_high(client: TestClient, monkeypatch) -> None:
+    """A >8% peak-to-trough drop over the window → ready False (drawdown)."""
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "true")
+    rets = [0.001] * 59 + [-0.10]  # one big drop blows past the 8% limit
+    _write_equity_runs(srv.PAPER_LOG, _equities_from_returns(rets))
+    j = client.get("/api/live-readiness").json()
+    assert j["ready"] is False
+    assert any("drawdown" in reason for reason in j["reasons"])
+
+
+def test_live_readiness_sharpe_too_low(client: TestClient, monkeypatch) -> None:
+    """Near-zero mean return → Sharpe below 0.8 → ready False (sharpe)."""
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "true")
+    rets = [0.001, -0.001] * 30  # mean ~0, non-zero std → Sharpe ~ 0
+    _write_equity_runs(srv.PAPER_LOG, _equities_from_returns(rets))
+    j = client.get("/api/live-readiness").json()
+    assert j["ready"] is False
+    assert any("Sharpe" in reason for reason in j["reasons"])
+
+
+def test_live_readiness_flag_off_blocks_even_with_strong_curve(client: TestClient, monkeypatch) -> None:
+    """All metrics pass but the human switch is off → ready False (display only)."""
+    monkeypatch.delenv("ENABLE_LIVE_TRADING", raising=False)
+    rets = [0.0025, 0.0015] * 30  # strong positive drift, tiny DD, high Sharpe
+    _write_equity_runs(srv.PAPER_LOG, _equities_from_returns(rets))
+    j = client.get("/api/live-readiness").json()
+    assert j["ready"] is False
+    assert j["enable_live_trading"] is False
+    assert any("ENABLE_LIVE_TRADING" in reason for reason in j["reasons"])
+
+
+def test_live_readiness_all_pass(client: TestClient, monkeypatch) -> None:
+    """60 strong days AND the flag explicitly on → ready True, no blockers."""
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "true")
+    rets = [0.0025, 0.0015] * 30  # mean 0.002, std 0.0005 → Sharpe ≫ 0.8, DD 0
+    _write_equity_runs(srv.PAPER_LOG, _equities_from_returns(rets))
+    j = client.get("/api/live-readiness").json()
+    assert j["ready"] is True, j["reasons"]
+    assert j["reasons"] == []
+    assert j["enable_live_trading"] is True
+    assert j["metrics"]["paper_days"] >= 60
+    assert abs(j["metrics"]["max_drawdown"]) < 0.08
+    assert j["metrics"]["sharpe"] > 0.8
+
+
+def test_live_readiness_empty_log_is_not_ready_not_500(client: TestClient, monkeypatch) -> None:
+    """No equity history → 200 with ready False (fail safe), never a 500."""
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "true")
+    srv.PAPER_LOG.write_text("")
+    r = client.get("/api/live-readiness")
+    assert r.status_code == 200
+    j = r.json()
+    assert j["ready"] is False
+    assert j["metrics"]["paper_days"] == 0
+    assert len(j["reasons"]) >= 1
