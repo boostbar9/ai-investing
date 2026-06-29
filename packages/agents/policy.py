@@ -9,6 +9,8 @@ signals don't agree strongly enough to overcome trading friction.
 Composite confidence per symbol is a weighted blend of:
 
     candidate.confidence      (research sweep heuristic in [0, 1])
+    catalyst                  (event quality: earnings/news/volume/analyst,
+                               fail-safe, gated by a fundamentals red flag)
     regime_confidence         (HMM posterior probability of current state)
     trust_score               (reddit_trust + corroboration boost)
     base_ensemble_alignment   (does the ensemble also want this name?)
@@ -63,21 +65,93 @@ CASH_FLOOR = float(os.getenv("POLICY_CASH_FLOOR", "0.05"))
 
 # Composite-confidence blend weights. Must sum to roughly 1.0 -- the
 # composite is clamped to [0, 1] at the end so small drift is fine.
+#
+# Phase 3 (catalyst-swing) rebalance. Every weight is env-overridable via the
+# ``POLICY_WEIGHT_<COMPONENT>`` pattern so the blend can be tuned in production
+# without a redeploy (e.g. raise ``POLICY_WEIGHT_TRUST`` the day Reddit's feed
+# comes back). Rationale for the new defaults vs. the original
+# (candidate .40 / regime .20 / trust .20 / ensemble .20):
+#
+#   * ``trust`` 0.20 -> 0.05. Reddit is 403-blocked live, so the trust feed is
+#     effectively dead weight that always degrades toward 0 and just dilutes
+#     the score. We keep it NON-ZERO (not deleted) so the moment Reddit
+#     recovers, bumping POLICY_WEIGHT_TRUST back up revives it with no code
+#     change.
+#   * ``ensemble_alignment`` 0.20 -> 0.15. It's a coarse binary vote; in a
+#     catalyst-driven discovery flow many genuine event names simply aren't in
+#     the ensemble yet, so leaning on it this hard suppressed good catalysts.
+#   * ``catalyst`` 0.00 -> 0.20 (NEW). The 0.20 freed from trust + ensemble
+#     funds an explicit event-quality component (earnings proximity, fresh-news
+#     recency/corroboration, volume expansion, analyst/insider) gated by a
+#     fundamentals red-flag cap. This is the whole point of the strategy: score
+#     event quality directly instead of inferring it from dead Reddit trust.
+#   * ``candidate`` 0.40 and ``regime`` 0.20 are UNCHANGED -- the dominant
+#     direct research signal and the crisis-gating regime semantics are
+#     preserved.
 CONFIDENCE_WEIGHTS = {
     # The research-sweep heuristic captures mention volume + sentiment.
     # Weighted highest because it's the most direct per-symbol signal.
-    "candidate": 0.40,
+    "candidate": float(os.getenv("POLICY_WEIGHT_CANDIDATE", "0.40")),
+    # Event-quality blend built ONLY from signals already on the candidate
+    # record (earnings proximity, fresh news, volume expansion, analyst/
+    # insider), capped by a fundamentals sanity gate. Each sub-signal degrades
+    # to 0 when its feed is missing -- never bearish, never fabricated.
+    "catalyst": float(os.getenv("POLICY_WEIGHT_CATALYST", "0.20")),
     # Regime posterior: a 0.9-confident bull regime makes us trust BUYs
     # more. In crisis the same candidate confidence buys nothing.
-    "regime": 0.20,
+    "regime": float(os.getenv("POLICY_WEIGHT_REGIME", "0.20")),
+    # Does the existing ensemble also have a non-zero weight on this
+    # name? If yes, full vote into composite; the ensemble has independent
+    # logic so agreement is meaningful.
+    "ensemble_alignment": float(
+        os.getenv("POLICY_WEIGHT_ENSEMBLE_ALIGNMENT", "0.15")
+    ),
     # Reddit trust + corroboration: high-karma authors corroborated by
     # news = strong vote. Missing data degrades to 0 (handled below).
-    "trust": 0.20,
-    # Does the existing ensemble also have a non-zero weight on this
-    # name? If yes, +20% to composite; the ensemble has independent
-    # logic so agreement is meaningful.
-    "ensemble_alignment": 0.20,
+    # Default is low because Reddit is 403-blocked live; raise the env
+    # override to revive it when the feed recovers.
+    "trust": float(os.getenv("POLICY_WEIGHT_TRUST", "0.05")),
 }
+
+
+# ---------------------------------------------------------------------------
+# Catalyst sub-signal knobs (env-overridable). The catalyst component is a
+# weighted blend of four sub-signals, each pulled straight off the candidate /
+# sweep record produced by ``research_sweep`` and each fail-safe: a missing or
+# stale feed contributes EXACTLY 0 (neutral), never a negative/bearish value
+# and never a fabricated one.
+# ---------------------------------------------------------------------------
+
+# Internal weights of the catalyst sub-signals. Sum ~1.0 so the catalyst
+# component itself stays in [0, 1] before the fundamentals cap.
+CATALYST_SUBWEIGHTS = {
+    "earnings": 0.25,         # proximity to next earnings report
+    "news": 0.30,             # fresh-news recency + corroboration
+    "volume": 0.15,           # relative-volume expansion
+    "analyst_insider": 0.30,  # analyst rating/upgrade + insider buying
+}
+
+# Earnings within this many calendar days counts as a near-term catalyst;
+# day 0 scores 1.0 and it ramps linearly to 0 at the window edge.
+CATALYST_EARNINGS_WINDOW_DAYS = float(
+    os.getenv("POLICY_CATALYST_EARNINGS_WINDOW_DAYS", "14")
+)
+# rel_volume (volume / 30d-average) at/above this multiple = full volume score.
+CATALYST_VOLUME_FULL = float(os.getenv("POLICY_CATALYST_VOLUME_FULL", "2.0"))
+# News-headline count (rss + yahoo) that saturates the freshness sub-signal.
+CATALYST_NEWS_SATURATION = float(
+    os.getenv("POLICY_CATALYST_NEWS_SATURATION", "5.0")
+)
+# Form-4 filing count in the last 30d that saturates the insider-activity nudge.
+CATALYST_FORM4_SATURATION = float(
+    os.getenv("POLICY_CATALYST_FORM4_SATURATION", "5.0")
+)
+# Fundamentals sanity gate: a Noncompliant / delisting-risk name has its
+# catalyst score CAPPED at this ceiling (default 0.0 = no catalyst credit at
+# all). It can only ever REDUCE the score, never boost it.
+CATALYST_NONCOMPLIANT_CAP = float(
+    os.getenv("POLICY_CATALYST_NONCOMPLIANT_CAP", "0.0")
+)
 
 
 Action = Literal["buy", "hold", "sell"]
@@ -161,6 +235,134 @@ def _clip01(x: float) -> float:
     return x
 
 
+def _catalyst_earnings(cand: dict[str, Any]) -> float:
+    """Near-term earnings proximity sub-signal in [0, 1].
+
+    ``days_to_earnings`` is ``None`` when the feed didn't run / no future
+    report is known -> 0.0 (unknown is NEUTRAL, never bearish). A report today
+    scores 1.0 and the score ramps linearly to 0 at the window edge; a date
+    past the window (or in the past) is no longer a forward catalyst -> 0.0.
+    """
+    days = cand.get("days_to_earnings")
+    if days is None:
+        return 0.0
+    d = _safe_float(days, default=-1.0)
+    window = CATALYST_EARNINGS_WINDOW_DAYS
+    if d < 0.0 or window <= 0.0 or d >= window:
+        return 0.0
+    return _clip01((window - d) / window)
+
+
+def _catalyst_news(cand: dict[str, Any]) -> float:
+    """Fresh-news recency + corroboration sub-signal in [0, 1].
+
+    Built from the corroboration score (already in [0, 1]) and the volume of
+    fresh headlines (RSS + Yahoo). All inputs default to 0 / False, so a
+    candidate that never saw a news feed scores 0.0 (NEUTRAL). A corroborated
+    story floors the sub-signal at 0.5 even when the raw headline count is thin
+    -- corroboration is the strongest freshness evidence we have.
+    """
+    corro = _clip01(_safe_float(cand.get("corroboration_score"), 0.0))
+    headlines = max(0.0, _safe_float(cand.get("news_headlines"), 0.0)) + max(
+        0.0, _safe_float(cand.get("yahoo_news_count"), 0.0)
+    )
+    saturation = (
+        _clip01(headlines / CATALYST_NEWS_SATURATION)
+        if CATALYST_NEWS_SATURATION > 0.0
+        else 0.0
+    )
+    score = max(corro, saturation)
+    if bool(cand.get("corroborated", False)):
+        score = max(score, 0.5)
+    return _clip01(score)
+
+
+def _catalyst_volume(cand: dict[str, Any]) -> float:
+    """Relative-volume expansion sub-signal in [0, 1].
+
+    ``rel_volume`` is volume / 30d-average; it defaults to 0.0 when the
+    fundamentals feed didn't run (unknown) and is <= 1.0 when there is simply
+    no expansion. BOTH map to 0.0 (NEUTRAL) -- a quiet or unknown tape is never
+    bearish. Expansion ramps linearly from 1x up to ``CATALYST_VOLUME_FULL``.
+    """
+    rv = _safe_float(cand.get("rel_volume"), 0.0)
+    if rv <= 1.0:
+        return 0.0
+    full = CATALYST_VOLUME_FULL if CATALYST_VOLUME_FULL > 1.0 else 2.0
+    return _clip01((rv - 1.0) / (full - 1.0))
+
+
+def _catalyst_analyst_insider(cand: dict[str, Any]) -> float:
+    """Analyst + insider (Form 4) sub-signal in [0, 1].
+
+    Averages whichever of these are actually present (each absent input is
+    simply skipped, NOT scored 0-and-averaged-in, so a single strong present
+    signal isn't diluted by missing feeds):
+
+      * analyst mean rating (1=Strong Buy .. 5=Strong Sell): mapped so 1 -> 1.0
+        and >= 3 (hold/sell) -> 0.0. Only counted when at least one analyst
+        covers the name.
+      * a recent analyst UPGRADE -> 1.0. A downgrade is NOT scored negative
+        (catalyst never goes bearish); it just doesn't contribute.
+      * insider buy/sell mix: net buying -> toward 1.0.
+      * recent Form-4 filing activity: a mild presence nudge.
+
+    Returns 0.0 when none of the feeds are present (NEUTRAL).
+    """
+    parts: list[float] = []
+
+    rating = _safe_float(cand.get("analyst_mean_rating"), 0.0)
+    num = _safe_float(cand.get("analyst_num"), 0.0)
+    if rating > 0.0 and num > 0.0:
+        parts.append(_clip01((3.0 - rating) / 2.0))
+
+    if str(cand.get("analyst_recent_action") or "").strip().lower() == "upgrade":
+        parts.append(1.0)
+
+    buys = max(0.0, _safe_float(cand.get("insider_buy_count"), 0.0))
+    sells = max(0.0, _safe_float(cand.get("insider_sell_count"), 0.0))
+    if buys + sells > 0.0:
+        parts.append(_clip01(buys / (buys + sells)))
+
+    form4 = _safe_float(cand.get("insider_form4_30d"), 0.0)
+    if form4 > 0.0 and CATALYST_FORM4_SATURATION > 0.0:
+        parts.append(_clip01(form4 / CATALYST_FORM4_SATURATION))
+
+    if not parts:
+        return 0.0
+    return _clip01(sum(parts) / len(parts))
+
+
+def catalyst_score(candidate: dict[str, Any] | None) -> float:
+    """Composite event-quality score in [0, 1] from the candidate record.
+
+    Weighted blend of the four catalyst sub-signals (earnings proximity, fresh
+    news, volume expansion, analyst/insider). Each sub-signal is independently
+    fail-safe: a missing/stale feed contributes 0 (NEUTRAL), so a candidate
+    with no enrichment scores exactly 0.0 and is never penalised below zero.
+
+    Fundamentals sanity gate: when the candidate is flagged Noncompliant /
+    delisting-risk (``compliance_ok`` is False -- only ever set by a feed that
+    actually ran), the score is CAPPED at ``CATALYST_NONCOMPLIANT_CAP``
+    (default 0.0). The gate can only REDUCE the score, never boost it. A
+    candidate whose fundamentals feed never ran keeps ``compliance_ok=True`` and
+    is therefore never capped -- absence is not a red flag.
+    """
+    cand = candidate or {}
+    subs = {
+        "earnings": _catalyst_earnings(cand),
+        "news": _catalyst_news(cand),
+        "volume": _catalyst_volume(cand),
+        "analyst_insider": _catalyst_analyst_insider(cand),
+    }
+    score = _clip01(
+        sum(subs[k] * CATALYST_SUBWEIGHTS.get(k, 0.0) for k in subs)
+    )
+    if not bool(cand.get("compliance_ok", True)):
+        score = min(score, _clip01(CATALYST_NONCOMPLIANT_CAP))
+    return _clip01(score)
+
+
 def composite_confidence(
     *,
     candidate: dict[str, Any] | None,
@@ -209,8 +411,15 @@ def composite_confidence(
     aligned = abs(_safe_float(ensemble_weight, 0.0)) >= 1e-4
     align_component = 1.0 if aligned else 0.0
 
+    # Component 5: catalyst (event quality). Built ONLY from signals already on
+    # the candidate record; fully fail-safe (missing feed -> 0, never bearish,
+    # never fabricated) and capped by the fundamentals red-flag gate. See
+    # ``catalyst_score``.
+    catalyst_component = catalyst_score(cand)
+
     components = {
         "candidate": cand_conf,
+        "catalyst": catalyst_component,
         "regime": reg_component,
         "trust": trust_component,
         "ensemble_alignment": align_component,
@@ -435,6 +644,7 @@ class ConfidenceGatedPolicy:
 __all__ = [
     "BUY_THRESHOLD",
     "CASH_FLOOR",
+    "CATALYST_SUBWEIGHTS",
     "CONFIDENCE_WEIGHTS",
     "MAX_POSITIONS",
     "REGIME_BUY_MULTIPLIER",
@@ -442,5 +652,6 @@ __all__ = [
     "Action",
     "ConfidenceGatedPolicy",
     "PolicyDecision",
+    "catalyst_score",
     "composite_confidence",
 ]
