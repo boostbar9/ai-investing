@@ -1285,7 +1285,11 @@ def api_live_readiness() -> dict[str, Any]:
     ``ready=true`` on uncertainty.
     """
     from packages.backtests.live_promotion import readiness_report
-    from packages.cockpit.performance_stats import clean_equity_series
+    from packages.cockpit.performance_stats import (
+        clean_equity_series,
+        fifo_round_trips,
+        realized_trade_stats,
+    )
 
     try:
         runs_chrono = list(reversed(read_runs()))
@@ -1294,7 +1298,14 @@ def api_live_readiness() -> dict[str, Any]:
         ]
         series = clean_equity_series(equity_points)
         equity_values = [p["equity"] for p in series]
-        return readiness_report(equity_values)
+        # Real FIFO round-trip stats, made AVAILABLE to the readiness view
+        # (display only — the gate thresholds and verdict are unchanged).
+        trades: list[dict[str, Any]] = []
+        for r in runs_chrono:
+            for order in r.get("orders_submitted", []) or []:
+                trades.append({**order, "run_ts": r.get("ts")})
+        realized = realized_trade_stats(fifo_round_trips(trades))
+        return readiness_report(equity_values, realized=realized)
     except Exception as exc:  # pragma: no cover — fail safe, never a 500
         log.warning("live-readiness endpoint failed, returning not-ready: %s", exc)
         return readiness_report([])

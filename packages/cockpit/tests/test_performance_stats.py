@@ -225,6 +225,126 @@ def test_realized_stats_insufficient_when_no_sells():
     assert rz["note"] is not None
 
 
+# --- Section A: fill-source provenance (measured vs unmeasured round-trips) --
+
+
+def test_realized_stats_known_fills_with_explicit_source_are_measured():
+    # broker_fill + mark_estimate legs both count toward the real ratios.
+    trades = [
+        _trade("buy", "AAPL", 10, 100.0, ts="t1", fill_source="broker_fill"),
+        _trade("sell", "AAPL", 10, 120.0, ts="t2", fill_source="mark_estimate"),  # +200
+        _trade("buy", "MSFT", 10, 200.0, ts="t3", fill_source="broker_fill"),
+        _trade("sell", "MSFT", 10, 190.0, ts="t4", fill_source="broker_fill"),    # -100
+    ]
+    rz = ps.realized_trade_stats(ps.fifo_round_trips(trades))
+    assert rz["insufficient_data"] is False
+    assert rz["closed_round_trips"] == 2
+    assert rz["unmeasured_round_trips"] == 0
+    assert math.isclose(rz["gross_profit"], 200.0)
+    assert math.isclose(rz["gross_loss"], 100.0)
+    assert math.isclose(rz["profit_factor"], 2.0)
+    assert math.isclose(rz["expectancy"], (200 - 100) / 2)
+    assert math.isclose(rz["round_trip_win_rate"], 0.5)
+    assert math.isclose(rz["avg_winner"], 200.0)
+    assert math.isclose(rz["avg_loser"], -100.0)
+
+
+def test_unknown_leg_excluded_and_counted_as_unmeasured():
+    # A profitable-looking exit whose fill_source is explicitly "unknown" must
+    # NOT be scored — it is reported as unmeasured and excluded from ratios.
+    trades = [
+        _trade("buy", "AAPL", 10, 100.0, ts="t1", fill_source="broker_fill"),
+        _trade("sell", "AAPL", 10, 130.0, ts="t2", fill_source="unknown"),  # excluded
+        _trade("buy", "MSFT", 5, 200.0, ts="t3", fill_source="broker_fill"),
+        _trade("sell", "MSFT", 5, 220.0, ts="t4", fill_source="broker_fill"),  # +100 measured
+    ]
+    fifo = ps.fifo_round_trips(trades)
+    assert fifo["measured_round_trips"] == 1
+    assert fifo["unmeasured_round_trips"] == 1
+    rz = ps.realized_trade_stats(fifo)
+    assert rz["closed_round_trips"] == 1
+    assert rz["unmeasured_round_trips"] == 1
+    # Only the MSFT +100 round-trip is graded; the AAPL unknown leg is ignored.
+    assert math.isclose(rz["total_pnl_dollars"], 100.0)
+    assert rz["wins"] == 1 and rz["losses"] == 0
+
+
+def test_unknown_leg_never_fabricates_when_it_is_the_only_round_trip():
+    # Fail-safe: the sole round-trip has an unknown leg -> insufficient_data,
+    # NO fabricated win/loss, surfaced as unmeasured.
+    trades = [
+        _trade("buy", "AAPL", 10, 100.0, ts="t1", fill_source="unknown"),
+        _trade("sell", "AAPL", 10, 130.0, ts="t2", fill_source="broker_fill"),
+    ]
+    rz = ps.realized_trade_stats(ps.fifo_round_trips(trades))
+    assert rz["insufficient_data"] is True
+    assert rz["closed_round_trips"] == 0
+    assert rz["unmeasured_round_trips"] == 1
+    assert rz["profit_factor"] is None
+    assert rz["expectancy"] is None
+    assert rz["note"] and "unmeasured" in rz["note"].lower()
+
+
+def test_backward_compat_old_rows_without_fill_source_still_measured():
+    # Legacy ledger rows carry a fill_price but no fill_source. They must still
+    # parse and remain measurable (a real historical price is never discarded).
+    trades = [
+        _trade("buy", "AAPL", 10, 100.0, ts="t1"),   # no fill_source key
+        _trade("sell", "AAPL", 10, 110.0, ts="t2"),  # no fill_source key
+    ]
+    rz = ps.realized_trade_stats(ps.fifo_round_trips(trades))
+    assert rz["insufficient_data"] is False
+    assert rz["closed_round_trips"] == 1
+    assert rz["unmeasured_round_trips"] == 0
+    assert math.isclose(rz["total_pnl_dollars"], 100.0)
+
+
+def test_failsafe_missing_price_is_unmeasured_never_fabricated():
+    # No price anywhere -> matched by qty but unmeasured; never a P&L value.
+    trades = [
+        _trade("buy", "AAPL", 10, ts="t1"),
+        _trade("sell", "AAPL", 10, ts="t2"),
+    ]
+    fifo = ps.fifo_round_trips(trades)
+    assert fifo["measured_round_trips"] == 0
+    assert fifo["unmeasured_round_trips"] == 1
+    assert fifo["round_trips"][0]["pnl_dollars"] is None
+    rz = ps.realized_trade_stats(fifo)
+    assert rz["insufficient_data"] is True
+    assert rz["unpriced_fills"] == 2
+    assert rz["closed_round_trips"] == 0
+
+
+def test_low_confidence_below_measured_floor():
+    trades = [
+        _trade("buy", "AAPL", 10, 100.0, ts="t1", fill_source="broker_fill"),
+        _trade("sell", "AAPL", 10, 110.0, ts="t2", fill_source="broker_fill"),
+    ]
+    rz = ps.realized_trade_stats(ps.fifo_round_trips(trades))
+    assert rz["closed_round_trips"] < ps.MIN_MEASURED_ROUND_TRIPS
+    assert rz["confidence"] == "low"
+    assert rz["note"] and "low-confidence" in rz["note"].lower()
+
+
+def test_account_section_exposes_flattened_realized_fields():
+    pts = [
+        {"t": "2026-05-01", "equity": 100000.0},
+        {"t": "2026-05-02", "equity": 101000.0},
+    ]
+    trades = [
+        _trade("buy", "AAPL", 10, 100.0, ts="t1", fill_source="broker_fill"),
+        _trade("sell", "AAPL", 10, 110.0, ts="t2", fill_source="broker_fill"),
+    ]
+    acct = ps.account_performance(pts, trades)
+    for key in (
+        "round_trip_win_rate", "profit_factor", "expectancy", "avg_winner",
+        "avg_loser", "closed_round_trips", "unmeasured_round_trips",
+    ):
+        assert key in acct, f"missing flattened account field {key!r}"
+    assert acct["closed_round_trips"] == 1
+    assert acct["round_trip_win_rate"] == 1.0
+
+
 # --- Section B: signal quality / hit rate ----------------------------------
 
 
