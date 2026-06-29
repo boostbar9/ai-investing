@@ -1220,14 +1220,22 @@ def api_equity_curve(window: int = 90) -> list[dict[str, Any]]:
 
 @app.get("/api/performance")
 def api_performance() -> dict[str, Any]:
-    """Realized track-record stats on ACTUAL CLOSED TRADES.
+    """Track-record stats — two clearly-separated, correctly-computed sections.
 
-    Reads the labeled outcomes journal (``data/learning/outcomes.jsonl``) — the
-    same store the /learning page uses — and computes win rate, avg win/loss,
-    profit factor, expectancy, max drawdown, Sharpe, total trades/return and the
-    realized equity curve, with breakdowns by trading mode (shadow/paper/live),
-    signal source, strategy preset and regime. Pure/deterministic and fail safe:
-    an empty journal returns a valid payload with zero/null metrics and
+    **Section A (``account``) — the REAL track record.** Drawdown, total return
+    and Sharpe are computed from the actual persisted paper mark-to-market
+    equity series (the one ``/api/equity-curve`` serves); realized win rate /
+    profit factor / expectancy come from FIFO-matched buy→sell round-trips in
+    the order ledger (``data/paper_log/runs.jsonl`` ``orders_submitted``). If the
+    ledger lacks fill prices, the realized block is ``insufficient_data`` rather
+    than fabricated.
+
+    **Section B (``signal_quality``) — the research SIGNAL hit rate.** The
+    ``outcomes.jsonl`` forward-return analysis, relabeled honestly and NEVER
+    compounded as account equity, segmented by source / regime / confidence
+    bucket / horizon.
+
+    Pure/deterministic and fail safe: empty stores yield a valid payload with
     ``insufficient_data: true`` — never a 500.
     """
     from packages.cockpit.performance_stats import compute_performance
@@ -1236,8 +1244,24 @@ def api_performance() -> dict[str, Any]:
         load_outcomes,
     )
 
-    rows = load_outcomes(DEFAULT_OUTCOMES_PATH)
-    return compute_performance(rows)
+    try:
+        # Full chronological run history (not the 50-row UI cap) so the equity
+        # series and FIFO matcher see every mark/fill.
+        runs_chrono = list(reversed(read_runs()))
+        equity_points = [
+            {"t": r.get("ts"), "equity": r.get("account_equity")} for r in runs_chrono
+        ]
+        trades: list[dict[str, Any]] = []
+        for r in runs_chrono:
+            run_ts = r.get("ts")
+            strategy = r.get("strategy")
+            for order in r.get("orders_submitted", []) or []:
+                trades.append({**order, "run_ts": run_ts, "strategy": strategy})
+        rows = load_outcomes(DEFAULT_OUTCOMES_PATH)
+        return compute_performance(equity_points, trades, rows)
+    except Exception as exc:  # pragma: no cover — fail safe, never a 500
+        log.warning("performance endpoint failed, returning empty payload: %s", exc)
+        return compute_performance([], [], [])
 
 
 # Phase 26 — News sentiment endpoint. Backed by Finnhub /company-news
