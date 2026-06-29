@@ -56,7 +56,51 @@ SELL_THRESHOLD = float(os.getenv("POLICY_SELL_THRESHOLD", "0.35"))
 # Maximum number of concurrent BUY positions. Caps both diversification
 # floor (so we don't go all-in on one name) and capital efficiency on a
 # $300 float (so each position is at least $30).
-MAX_POSITIONS = int(os.getenv("POLICY_MAX_POSITIONS", "10"))
+#
+# The engine's own reflection lesson — "Tighten focus_count: pick fewer,
+# higher-conviction symbols" — drove the move from 10 to a tighter default
+# so capital concentrates in our best ideas instead of spreading thin.
+# Override with POLICY_MAX_POSITIONS. Fail-safe: any unparseable, zero,
+# negative, or absurdly large value falls back to the default rather than
+# leaving risk effectively unbounded.
+DEFAULT_MAX_POSITIONS = 5
+# Hard ceiling so a fat-fingered env var can never uncap concurrency.
+MAX_POSITIONS_CEILING = 20
+
+
+def _safe_max_positions(
+    raw: str | None,
+    *,
+    default: int = DEFAULT_MAX_POSITIONS,
+    ceiling: int = MAX_POSITIONS_CEILING,
+) -> int:
+    """Parse POLICY_MAX_POSITIONS fail-safe; never returns unbounded risk."""
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        val = int(str(raw).strip())
+    except (ValueError, TypeError):
+        logger.warning(
+            "POLICY_MAX_POSITIONS=%r is not an int; using default %d",
+            raw, default,
+        )
+        return default
+    if val <= 0:
+        logger.warning(
+            "POLICY_MAX_POSITIONS=%d is non-positive; using default %d",
+            val, default,
+        )
+        return default
+    if val > ceiling:
+        logger.warning(
+            "POLICY_MAX_POSITIONS=%d exceeds ceiling %d; clamping",
+            val, ceiling,
+        )
+        return ceiling
+    return val
+
+
+MAX_POSITIONS = _safe_max_positions(os.getenv("POLICY_MAX_POSITIONS"))
 
 # Floor on portfolio cash. Even with 10 perfect signals we keep 5% cash
 # so the rebalancer has wiggle room.

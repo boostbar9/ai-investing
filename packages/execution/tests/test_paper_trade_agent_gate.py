@@ -151,7 +151,7 @@ async def test_agent_ok_allows_plan_orders(monkeypatch):
     """When the agent graph approves (halted=False), plan_orders MUST run."""
     plan_called = {"n": 0}
 
-    async def _fake_plan_orders(target, broker, equity):
+    async def _fake_plan_orders(target, broker, equity, skipped=None):
         plan_called["n"] += 1
         return []  # empty plan -> nothing submitted
 

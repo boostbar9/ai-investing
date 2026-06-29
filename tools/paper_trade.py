@@ -1039,6 +1039,7 @@ async def plan_orders(
     target_weights: dict[str, float],
     broker: AlpacaPaperBroker,
     equity: float,
+    skipped: list[dict[str, Any]] | None = None,
 ) -> list[PlannedOrder]:
     """Diff target weights against current positions; size in shares.
 
@@ -1122,9 +1123,40 @@ async def plan_orders(
             continue
         # Don't sell more than we hold; cap to current qty.
         if side == "sell":
-            current_qty = pos_by_sym[sym].qty if sym in pos_by_sym else 0.0
+            pos = pos_by_sym.get(sym)
+            current_qty = pos.qty if pos is not None else 0.0
             qty = min(qty, current_qty)
             if qty <= 0:
+                continue
+            # Held-qty guard. Shares locked by a working order (e.g. an OCO
+            # bracket sell leg) are reported by the broker as unavailable:
+            # ``qty_available`` < ``qty``. Submitting another sell for those
+            # held shares is certain to be rejected by Alpaca with a 403
+            # ``insufficient qty available ... held_for_orders`` — which used
+            # to flood the exit ledger with executed:false broker-error rows.
+            # When the broker doesn't report availability (``None``) we
+            # fall open and treat the full position as sellable.
+            available = pos.qty_available if pos is not None else None
+            if available is not None and available < qty:
+                if skipped is not None:
+                    skipped.append(
+                        {
+                            "symbol": sym,
+                            "side": "sell",
+                            "requested_qty": qty,
+                            "available_qty": max(available, 0.0),
+                            "held_qty": max(current_qty - available, 0.0),
+                            "reason": "skipped_qty_held",
+                        }
+                    )
+                log.info(
+                    "skipping sell %s: %.4f shares held for working orders "
+                    "(requested %.4f, available %.4f)",
+                    sym,
+                    max(current_qty - available, 0.0),
+                    qty,
+                    max(available, 0.0),
+                )
                 continue
         planned.append(
             PlannedOrder(
@@ -1440,8 +1472,15 @@ async def run(
             }
             log.info("agent-approved symbols: %s", sorted(approved_syms))
 
-        planned = await plan_orders(target, broker, equity)
+        skipped_held: list[dict[str, Any]] = []
+        planned = await plan_orders(target, broker, equity, skipped=skipped_held)
         log.info("planned %d orders", len(planned))
+        if skipped_held:
+            log.info(
+                "held-qty guard: skipped %d sell(s) whose shares are held "
+                "for working orders",
+                len(skipped_held),
+            )
 
         submitted = []
         errors = []
@@ -1598,6 +1637,10 @@ async def run(
             ],
             "orders_submitted": submitted,
             "errors": errors,
+            # Sells skipped because their shares are held for working orders.
+            # A distinct, non-error outcome (reason=skipped_qty_held) so the
+            # exit ledger isn't polluted with certain-to-reject broker 403s.
+            "orders_skipped": skipped_held,
             # Phase 35 — per-entry OCO bracket attach outcomes.
             "brackets_attached": brackets_attached,
             "agent_decision_id": str(agent_result.decision_id),

@@ -131,7 +131,7 @@ def stub_pipeline(monkeypatch):
     monkeypatch.setattr(pt, "compute_target_weights", lambda *a, **k: {"AAPL": 0.1})
     monkeypatch.setattr(pt, "load_panel", lambda syms: __import__("pandas").DataFrame())
 
-    async def _fake_plan(target, broker, equity):
+    async def _fake_plan(target, broker, equity, skipped=None):
         return [_PlannedOrder()]
 
     monkeypatch.setattr(pt, "plan_orders", _fake_plan)
