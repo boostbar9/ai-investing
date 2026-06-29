@@ -27,8 +27,9 @@ so they are trivially testable and replayable from audit data.
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 import pandas as pd
 
@@ -125,6 +126,7 @@ def readiness_report(
     min_days: int = PAPER_MIN_DAYS,
     max_dd: float = PAPER_MAX_DD,
     min_sharpe: float = PAPER_MIN_SHARPE,
+    realized: Mapping[str, Any] | None = None,
 ) -> dict:
     """JSON-able readiness view for callers that don't speak pandas.
 
@@ -134,6 +136,14 @@ def readiness_report(
     ``ready``, ``reasons``, ``metrics`` (paper_days / max_drawdown / sharpe —
     the latter two ``None`` until there is enough history), the ``thresholds``
     being checked, and the read-only ``enable_live_trading`` flag state.
+
+    ``realized`` is the optional FIFO round-trip stat block from
+    ``performance_stats.realized_trade_stats``. When supplied, its REAL profit
+    factor / expectancy / win rate (and measured/unmeasured counts) are surfaced
+    under a ``realized`` key so the operator can SEE the true track record
+    alongside the gate verdict. This is **display only**: the gate thresholds
+    are unchanged and the realized numbers do NOT loosen or alter the ready
+    decision — the gate stays exactly as fail-closed as before.
 
     Fail-safe: a short/empty series yields ``ready=False`` with a clear reason
     (never ``ready=True`` on uncertainty). This function only reads and
@@ -157,7 +167,7 @@ def readiness_report(
         min_sharpe=min_sharpe,
         enable_flag=flag,
     )
-    return {
+    report = {
         "ready": verdict.ready,
         "reasons": verdict.reasons,
         "metrics": {
@@ -172,6 +182,21 @@ def readiness_report(
         },
         "enable_live_trading": flag_on,
     }
+    if realized is not None:
+        report["realized"] = {
+            "profit_factor": realized.get("profit_factor"),
+            "expectancy": realized.get("expectancy"),
+            "round_trip_win_rate": realized.get(
+                "round_trip_win_rate", realized.get("win_rate")
+            ),
+            "closed_round_trips": realized.get(
+                "closed_round_trips", realized.get("total_round_trips", 0)
+            ),
+            "unmeasured_round_trips": realized.get("unmeasured_round_trips", 0),
+            "confidence": realized.get("confidence"),
+            "insufficient_data": realized.get("insufficient_data", True),
+        }
+    return report
 
 
 # ---------------------------------------------------------------------------

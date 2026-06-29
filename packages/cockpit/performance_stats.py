@@ -69,6 +69,18 @@ DEFAULT_HORIZON = "eod"
 _PRICE_KEYS = ("fill_price", "price", "avg_price", "last_price")
 _QTY_KEYS = ("filled_qty", "qty")
 
+# Fill-provenance values stamped at record time (see tools/paper_trade.py).
+# ``broker_fill``/``mark_estimate`` are usable for realized P&L; ``unknown``
+# (or an explicitly-unknown source) is NEVER counted — the round-trip touching
+# it is reported as "unmeasured" instead of fabricating a win/loss.
+_FILL_SOURCES = ("broker_fill", "mark_estimate", "unknown")
+_MEASURABLE_FILL_SOURCES = ("broker_fill", "mark_estimate")
+
+# Minimum measured (priceable) round-trips before realized ratios are treated
+# as anything but a low-confidence sample. Below this floor we still REPORT the
+# numbers (never "not yet measurable") but flag ``confidence="low"``.
+MIN_MEASURED_ROUND_TRIPS = 5
+
 # Max points to emit for the display equity curve (the real series can be long;
 # the math still runs on the full cleaned series).
 _MAX_CURVE_POINTS = 240
@@ -260,27 +272,62 @@ def _trade_ts(row: Mapping[str, Any]) -> str:
     return str(row.get("run_ts") or row.get("ts") or "")
 
 
+def _trade_fill_source(row: Mapping[str, Any]) -> str | None:
+    """Normalized fill provenance, or ``None`` when the field is absent.
+
+    Backward compatible: rows written before fill-source capture have no
+    ``fill_source`` key and return ``None`` (the leg is then judged purely on
+    whether it carries a usable fill price). An EXPLICIT ``"unknown"`` is
+    distinct from ``None`` — it marks a fill we could not source and must never
+    count, so the leg is treated as unmeasured even if a price is present.
+    """
+    fs = row.get("fill_source")
+    if isinstance(fs, str):
+        s = fs.strip().lower()
+        if s in _FILL_SOURCES:
+            return s
+    return None
+
+
+def _leg_is_measurable(price: float | None, fill_source: str | None) -> bool:
+    """A leg counts toward realized P&L only with a usable price AND a source
+    that is not explicitly ``unknown``. Missing source (legacy rows) is allowed
+    as long as a real price is present — we never fabricate, we just don't
+    discard a genuine historical fill price for lacking the new label."""
+    if price is None or price <= 0:
+        return False
+    return fill_source != "unknown"
+
+
 def fifo_round_trips(trades: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     """Match buy lots to sell lots per symbol (FIFO) into closed round-trips.
 
-    Each matched buy-chunk→sell pair becomes one closed round-trip with its
-    realized P&L in $ and %. Long-only: only buy→sell pairs are matched (the
-    paper strategy never shorts). Fills missing a usable price or qty are
-    counted in ``unpriced_fills`` and skipped, so a ledger without fill prices
-    yields zero round-trips rather than a fabricated P&L.
+    Each matched buy-chunk→sell pair becomes one closed round-trip. Long-only:
+    only buy→sell pairs are matched (the paper strategy never shorts).
+
+    Matching is driven by QUANTITY so position tracking stays correct even for
+    legs whose fill price is missing/unknown. A round-trip is **measured** only
+    when BOTH legs carry a usable fill (a real price and a ``fill_source`` that
+    is not explicitly ``unknown``); those carry realized P&L in $ and %. A
+    round-trip touching any unknown/unpriced leg is **unmeasured**: its
+    ``pnl_dollars``/``pnl_pct`` are ``None`` and it is EXCLUDED from the
+    realized ratios rather than fabricated as a win or loss.
 
     Returns a diagnostics dict::
 
         {
-          "round_trips": [ {symbol, qty, entry_price, exit_price,
-                            entry_ts, exit_ts, pnl_dollars, pnl_pct}, ... ],
+          "round_trips": [ {symbol, qty, entry_price, exit_price, entry_ts,
+                            exit_ts, pnl_dollars, pnl_pct, measured,
+                            entry_fill_source, exit_fill_source}, ... ],
           "buys": int, "sells": int, "unpriced_fills": int,
+          "measured_round_trips": int, "unmeasured_round_trips": int,
           "open_lots": int,            # unmatched buy qty still open
           "unmatched_sell_qty": float, # sell qty with no prior buy lot
         }
     """
     ordered = sorted(enumerate(trades), key=lambda pr: (_trade_ts(pr[1]), pr[0]))
-    open_lots: dict[str, list[list[float]]] = {}  # symbol -> [[qty, price], ...]
+    # symbol -> [[qty, price|None, ts, fill_source|None], ...]
+    open_lots: dict[str, list[list[Any]]] = {}
     round_trips: list[dict[str, Any]] = []
     buys = sells = unpriced = 0
     unmatched_sell_qty = 0.0
@@ -290,15 +337,19 @@ def fifo_round_trips(trades: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         symbol = _trade_symbol(row)
         if side not in ("buy", "sell") or symbol is None:
             continue
-        price = _trade_field(row, _PRICE_KEYS)
         qty = _trade_field(row, _QTY_KEYS)
-        if price is None or qty is None:
+        price = _trade_field(row, _PRICE_KEYS)  # may be None
+        source = _trade_fill_source(row)
+        if price is None:
             unpriced += 1
+        if qty is None:
+            # Without a quantity we cannot FIFO-match the leg at all; skip it
+            # (already counted as unpriced if the price was also missing).
             continue
         ts = _trade_ts(row) or None
         if side == "buy":
             buys += 1
-            open_lots.setdefault(symbol, []).append([qty, price, ts])
+            open_lots.setdefault(symbol, []).append([qty, price, ts, source])
         else:  # sell — close oldest open buy lots first
             sells += 1
             lots = open_lots.get(symbol) or []
@@ -307,7 +358,16 @@ def fifo_round_trips(trades: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
                 lot = lots[0]
                 matched = min(remaining, lot[0])
                 entry_price = lot[1]
-                pnl_pct = (price / entry_price - 1.0) if entry_price > 0 else None
+                entry_source = lot[3]
+                entry_ok = _leg_is_measurable(entry_price, entry_source)
+                exit_ok = _leg_is_measurable(price, source)
+                measured = entry_ok and exit_ok
+                if measured:
+                    pnl_pct = (price / entry_price - 1.0) if entry_price > 0 else None
+                    pnl_dollars = (price - entry_price) * matched
+                else:
+                    pnl_pct = None
+                    pnl_dollars = None
                 round_trips.append({
                     "symbol": symbol,
                     "qty": matched,
@@ -315,8 +375,11 @@ def fifo_round_trips(trades: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
                     "exit_price": price,
                     "entry_ts": lot[2],
                     "exit_ts": ts,
-                    "pnl_dollars": (price - entry_price) * matched,
+                    "pnl_dollars": pnl_dollars,
                     "pnl_pct": pnl_pct,
+                    "measured": measured,
+                    "entry_fill_source": entry_source,
+                    "exit_fill_source": source,
                 })
                 lot[0] -= matched
                 remaining -= matched
@@ -326,11 +389,14 @@ def fifo_round_trips(trades: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
                 unmatched_sell_qty += remaining
 
     open_qty = sum(lot[0] for lots in open_lots.values() for lot in lots)
+    measured_rt = sum(1 for t in round_trips if t["measured"])
     return {
         "round_trips": round_trips,
         "buys": buys,
         "sells": sells,
         "unpriced_fills": unpriced,
+        "measured_round_trips": measured_rt,
+        "unmeasured_round_trips": len(round_trips) - measured_rt,
         "open_lots": round(open_qty, 8),
         "unmatched_sell_qty": round(unmatched_sell_qty, 8),
     }
@@ -339,22 +405,37 @@ def fifo_round_trips(trades: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
 def realized_trade_stats(fifo: Mapping[str, Any]) -> dict[str, Any]:
     """Win rate / profit factor / expectancy from closed FIFO round-trips.
 
-    All headline figures are dollar-based (the real account unit); percentage
-    win/loss/expectancy are also exposed. ``insufficient_data=True`` (with a
-    note) when there are no priceable closed round-trips — never a fabricated
-    P&L.
+    Only **measured** round-trips (both legs carry a usable fill price and a
+    non-``unknown`` source) feed the ratios. Round-trips touching any
+    unknown/unpriced leg are counted in ``unmeasured_round_trips`` and EXCLUDED
+    — never scored as a win or a loss. All headline figures are dollar-based
+    (the real account unit); percentage win/loss/expectancy are also exposed.
+    ``insufficient_data=True`` (with a note) when there are no measured closed
+    round-trips — never a fabricated P&L.
+
+    ``confidence`` is ``"low"`` while fewer than ``MIN_MEASURED_ROUND_TRIPS``
+    measured round-trips exist (the numbers are still reported, just flagged as
+    a small sample) and ``"ok"`` once the floor is met.
     """
     trips: list[Mapping[str, Any]] = list(fifo.get("round_trips") or [])
+    measured = [t for t in trips if t.get("measured")]
+    unmeasured = int(fifo.get("unmeasured_round_trips", len(trips) - len(measured)))
     base = {
         "insufficient_data": True,
         "note": None,
+        "confidence": "low",
         "total_round_trips": 0,
+        "closed_round_trips": 0,
+        "unmeasured_round_trips": unmeasured,
         "wins": 0,
         "losses": 0,
         "scratches": 0,
         "win_rate": None,
+        "round_trip_win_rate": None,
         "avg_win": None,
         "avg_loss": None,
+        "avg_winner": None,
+        "avg_loser": None,
         "avg_win_pct": None,
         "avg_loss_pct": None,
         "profit_factor": None,
@@ -368,8 +449,14 @@ def realized_trade_stats(fifo: Mapping[str, Any]) -> dict[str, Any]:
         "unpriced_fills": int(fifo.get("unpriced_fills", 0)),
         "open_lots": fifo.get("open_lots", 0),
     }
-    if not trips:
-        if base["unpriced_fills"]:
+    if not measured:
+        if unmeasured:
+            base["note"] = (
+                f"{unmeasured} closed round-trip(s) have an unknown/unpriced "
+                "fill leg — excluded from realized P&L as unmeasured (never "
+                "fabricated)."
+            )
+        elif base["unpriced_fills"]:
             base["note"] = (
                 "Order ledger has fills but no usable fill prices — realized "
                 "round-trip P&L is unavailable."
@@ -380,22 +467,35 @@ def realized_trade_stats(fifo: Mapping[str, Any]) -> dict[str, Any]:
             base["note"] = "No matched buy→sell round-trips yet."
         return base
 
-    dollars = [t["pnl_dollars"] for t in trips]
-    pcts = [t["pnl_pct"] for t in trips if t.get("pnl_pct") is not None]
+    dollars = [t["pnl_dollars"] for t in measured]
+    pcts = [t["pnl_pct"] for t in measured if t.get("pnl_pct") is not None]
     wins = sum(1 for d in dollars if d > 0)
     losses = sum(1 for d in dollars if d < 0)
     gross_profit = sum(d for d in dollars if d > 0)
     gross_loss = -sum(d for d in dollars if d < 0)
+    low_sample = len(measured) < MIN_MEASURED_ROUND_TRIPS
+    note = (
+        f"Only {len(measured)} measured round-trip(s) (< {MIN_MEASURED_ROUND_TRIPS}); "
+        "treat realized ratios as a low-confidence sample."
+        if low_sample
+        else None
+    )
     return {
         "insufficient_data": False,
-        "note": None,
-        "total_round_trips": len(trips),
+        "note": note,
+        "confidence": "low" if low_sample else "ok",
+        "total_round_trips": len(measured),
+        "closed_round_trips": len(measured),
+        "unmeasured_round_trips": unmeasured,
         "wins": wins,
         "losses": losses,
-        "scratches": len(trips) - wins - losses,
+        "scratches": len(measured) - wins - losses,
         "win_rate": win_rate(dollars),
+        "round_trip_win_rate": win_rate(dollars),
         "avg_win": avg_win(dollars),
         "avg_loss": avg_loss(dollars),
+        "avg_winner": avg_win(dollars),
+        "avg_loser": avg_loss(dollars),
         "avg_win_pct": avg_win(pcts),
         "avg_loss_pct": avg_loss(pcts),
         "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else None,
@@ -425,6 +525,20 @@ def account_performance(
     equities = [p["equity"] for p in series]
     realized = realized_trade_stats(fifo_round_trips(trades))
 
+    # Flatten the headline realized round-trip figures onto the account section
+    # so callers (UI, readiness gate) can read them without reaching into the
+    # nested ``realized`` block. The nested block stays the source of truth.
+    realized_summary = {
+        "round_trip_win_rate": realized.get("round_trip_win_rate"),
+        "profit_factor": realized.get("profit_factor"),
+        "expectancy": realized.get("expectancy"),
+        "avg_winner": realized.get("avg_winner"),
+        "avg_loser": realized.get("avg_loser"),
+        "closed_round_trips": realized.get("closed_round_trips", 0),
+        "unmeasured_round_trips": realized.get("unmeasured_round_trips", 0),
+        "realized_confidence": realized.get("confidence"),
+    }
+
     if len(equities) < 2:
         return {
             "insufficient_data": True,
@@ -437,6 +551,7 @@ def account_performance(
             "sharpe": None,
             "equity_curve": [dict(p) for p in series],
             "realized": realized,
+            **realized_summary,
         }
 
     period_returns = [
@@ -455,6 +570,7 @@ def account_performance(
         "sharpe": sharpe(period_returns),
         "equity_curve": _resample_for_display(series),
         "realized": realized,
+        **realized_summary,
     }
 
 

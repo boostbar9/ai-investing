@@ -153,6 +153,61 @@ def _is_rth(now_utc: datetime | None = None) -> bool:
     return _RTH_OPEN <= et.time() < _RTH_CLOSE
 
 
+def _safe_pos_float(val: Any) -> float | None:
+    """Coerce to a strictly-positive float, rejecting bools/None/garbage."""
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        f = float(val)
+        return f if f > 0 else None
+    return None
+
+
+def resolve_fill_provenance(
+    fill_meta: Any,
+    last_price: Any,
+    requested_qty: Any,
+) -> dict[str, Any]:
+    """Determine ``fill_price`` / ``filled_qty`` / ``fill_source`` at record time.
+
+    READ-ONLY and fail-safe. Priority (per the fill-capture spec):
+
+    a. ``broker_fill`` — the broker reported an average execution price for this
+       order. In paper mode that is whatever the paper broker put in
+       ``last_fill_meta`` (the realistic Robinhood sim records the modeled
+       fill); we treat that as the broker's own fill, never a guess.
+    b. ``mark_estimate`` — no broker fill available, so fall back to the
+       last-known quote/mark for the symbol at submit time, CLEARLY labeled an
+       estimate.
+    c. ``unknown`` — neither is available: ``fill_price`` is ``None`` and the
+       leg is later excluded from realized P&L. We NEVER fabricate a price.
+
+    This function places no orders and mutates nothing on the broker; it only
+    reads values already produced by the (read-only) submit path.
+    """
+    if isinstance(fill_meta, dict):
+        price = _safe_pos_float(fill_meta.get("fill_price"))
+        if price is not None:
+            qty = _safe_pos_float(fill_meta.get("filled_qty"))
+            if qty is None:
+                qty = _safe_pos_float(requested_qty)
+            return {
+                "fill_price": price,
+                "filled_qty": qty,
+                "fill_source": "broker_fill",
+            }
+
+    mark = _safe_pos_float(last_price)
+    if mark is not None:
+        return {
+            "fill_price": mark,
+            "filled_qty": _safe_pos_float(requested_qty),
+            "fill_source": "mark_estimate",
+        }
+
+    return {"fill_price": None, "filled_qty": None, "fill_source": "unknown"}
+
+
 def _auto_default_strategy(now_utc: datetime | None = None) -> str:
     """Pick the right default strategy for the current wall-clock instant.
 
@@ -1467,6 +1522,18 @@ async def run(
                         ):
                             if _k in fill_meta:
                                 rec[_k] = fill_meta[_k]
+                    # Stamp the authoritative fill provenance the performance
+                    # engine consumes: an average fill_price + filled_qty +
+                    # fill_source (broker_fill | mark_estimate | unknown).
+                    # Read-only and fail-safe — a missing fill yields
+                    # fill_source="unknown" with a null price, never a guess.
+                    rec.update(
+                        resolve_fill_provenance(
+                            fill_meta=fill_meta,
+                            last_price=po.last_price,
+                            requested_qty=po.qty,
+                        )
+                    )
                     submitted.append(rec)
                     log.info("submitted %s %s %.4f -> %s", po.side, po.symbol, po.qty, ack.status)
                     # Phase 35 — attach OCO bracket on successful long
