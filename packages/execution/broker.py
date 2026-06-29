@@ -239,6 +239,11 @@ class BrokerPosition:
     avg_price: float
     last_price: float | None
     pnl_pct: float | None
+    # Shares free to trade right now, i.e. total ``qty`` minus any shares
+    # locked by an open/working order (Alpaca's ``held_for_orders``). When
+    # the broker doesn't report it the field stays ``None`` and callers
+    # must treat the full ``qty`` as available (fail-open on reads).
+    qty_available: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -247,6 +252,7 @@ class BrokerPosition:
             "avg_price": self.avg_price,
             "last_price": self.last_price,
             "pnl_pct": self.pnl_pct,
+            "qty_available": self.qty_available,
         }
 
 
@@ -377,6 +383,15 @@ class AlpacaPaperBroker(Broker):
                     avg = float(p["avg_entry_price"])
                     last = float(p["current_price"]) if p.get("current_price") else None
                     pnl = (last - avg) / avg if (last is not None and avg > 0) else None
+                    # ``qty_available`` = shares not locked by a working order.
+                    # Alpaca returns it as a string; if absent/garbage we leave
+                    # it ``None`` so callers fall back to the full ``qty``.
+                    avail: float | None = None
+                    if p.get("qty_available") is not None:
+                        try:
+                            avail = float(p["qty_available"])
+                        except (ValueError, TypeError):
+                            avail = None
                     out.append(
                         BrokerPosition(
                             symbol=p["symbol"],
@@ -384,6 +399,7 @@ class AlpacaPaperBroker(Broker):
                             avg_price=avg,
                             last_price=last,
                             pnl_pct=pnl,
+                            qty_available=avail,
                         )
                     )
                 except (KeyError, ValueError, TypeError):
