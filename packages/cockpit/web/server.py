@@ -656,6 +656,12 @@ def agents_page() -> HTMLResponse:
     return _render("agents.html")
 
 
+@app.get("/performance", response_class=HTMLResponse)
+def performance_page() -> HTMLResponse:
+    """Plain-language track-record dashboard. Client-side polls /api/performance."""
+    return _render("performance.html")
+
+
 @app.get("/shadow", response_class=HTMLResponse)
 def shadow_page() -> HTMLResponse:
     """Shadow-trading dashboard (Phase 6).
@@ -1210,6 +1216,28 @@ def api_regime() -> dict[str, Any]:
 @app.get("/api/equity-curve")
 def api_equity_curve(window: int = 90) -> list[dict[str, Any]]:
     return equity_curve_points(window=window)
+
+
+@app.get("/api/performance")
+def api_performance() -> dict[str, Any]:
+    """Realized track-record stats on ACTUAL CLOSED TRADES.
+
+    Reads the labeled outcomes journal (``data/learning/outcomes.jsonl``) — the
+    same store the /learning page uses — and computes win rate, avg win/loss,
+    profit factor, expectancy, max drawdown, Sharpe, total trades/return and the
+    realized equity curve, with breakdowns by trading mode (shadow/paper/live),
+    signal source, strategy preset and regime. Pure/deterministic and fail safe:
+    an empty journal returns a valid payload with zero/null metrics and
+    ``insufficient_data: true`` — never a 500.
+    """
+    from packages.cockpit.performance_stats import compute_performance
+    from packages.learning.outcome_labeler import (
+        DEFAULT_OUTCOMES_PATH,
+        load_outcomes,
+    )
+
+    rows = load_outcomes(DEFAULT_OUTCOMES_PATH)
+    return compute_performance(rows)
 
 
 # Phase 26 — News sentiment endpoint. Backed by Finnhub /company-news

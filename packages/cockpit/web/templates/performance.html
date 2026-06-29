@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0B0F14" />
+  <title>Track Record · The Seer</title>
+  {% include "_head_icons.html" %}
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/cockpit.css" />
+  <script src="/static/cockpit.js"></script>
+  <style>
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .lead-num { font-size: 38px; font-weight: 700; letter-spacing: -0.02em; line-height: 1; color: var(--text-primary); }
+    .stat-num { font-size: 26px; font-weight: 600; letter-spacing: -0.01em; color: var(--text-primary); }
+    .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); margin-bottom: 6px; }
+    .plain { font-size: 12px; color: var(--text-muted); line-height: 1.5; margin-top: 8px; }
+    .good { color: var(--success, #34D399); }
+    .bad { color: var(--danger, #FB7185); }
+    .muted { color: var(--text-muted); }
+    .spark { width: 100%; height: 140px; }
+    .mode-pill { font-size: 12px; font-weight: 700; letter-spacing: 0.06em; padding: 4px 12px; border-radius: 999px; text-transform: uppercase; }
+    .mode-shadow { background: rgba(139,92,246,.18); color: #C4B5FD; border: 1px solid rgba(139,92,246,.4); }
+    .mode-paper  { background: rgba(0,229,196,.16); color: #5EEAD4; border: 1px solid rgba(0,229,196,.4); }
+    .mode-live   { background: rgba(251,113,133,.16); color: #FDA4AF; border: 1px solid rgba(251,113,133,.4); }
+    table.seg { width: 100%; border-collapse: collapse; font-size: 12px; }
+    table.seg th { text-align: left; padding: 8px 10px; color: var(--text-dim); font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; font-size: 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    table.seg td { padding: 8px 10px; border-bottom: 1px solid var(--border-faint); color: var(--text-secondary); }
+    table.seg td.num { font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body class="min-h-screen">
+  {% include "_nav.html" %}
+
+  <main id="seer-main" class="max-w-5xl mx-auto p-4 md:p-6">
+    <header class="flex items-start justify-between gap-3 mb-5 flex-wrap">
+      <div>
+        <h1 class="text-2xl font-semibold" style="color:var(--text-primary);">Track Record</h1>
+        <p class="text-sm mt-1" style="color:var(--text-secondary);">
+          The proof of the edge: how the AI's finished trades have actually
+          performed. Every number below is from real closed trades — not a
+          prediction.
+        </p>
+      </div>
+      <span id="mode-pill" class="mode-pill mode-shadow shrink-0">SHADOW</span>
+    </header>
+
+    <!-- ============ THE STORY (plain English) ============ -->
+    <section class="card p-5 mb-4">
+      <p id="story-text" class="text-base" style="color:var(--text-secondary); line-height:1.6;">Loading…</p>
+      <p id="mode-note" class="plain"></p>
+    </section>
+
+    <!-- ============ HEADLINE EDGE METRICS (big plain-language cards) ============ -->
+    <section class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+      <div class="card p-5">
+        <div class="stat-label">Win rate</div>
+        <div class="lead-num" id="m-winrate">—</div>
+        <div class="plain">How often a finished trade made money. <span id="m-winrate-detail" class="muted"></span></div>
+      </div>
+      <div class="card p-5">
+        <div class="stat-label">Average winner vs average loser</div>
+        <div class="lead-num"><span id="m-avgwin" class="good">—</span> <span class="muted" style="font-size:20px;">vs</span> <span id="m-avgloss" class="bad">—</span></div>
+        <div class="plain">When we win, this is the typical gain; when we lose, the typical loss. A bigger winner than loser is good.</div>
+      </div>
+      <div class="card p-5">
+        <div class="stat-label">Profit factor (made per $1 risked)</div>
+        <div class="lead-num" id="m-pf">—</div>
+        <div class="plain">Total winnings divided by total losses. Above 1.0 means the strategy makes money overall. Shown only once there have been some losing trades to measure against.</div>
+      </div>
+      <div class="card p-5">
+        <div class="stat-label">Worst drawdown</div>
+        <div class="lead-num bad" id="m-dd">—</div>
+        <div class="plain">The biggest drop from a high point to a later low. Smaller is safer — it's the worst losing streak you'd have lived through.</div>
+      </div>
+    </section>
+
+    <!-- ============ EQUITY CURVE ============ -->
+    <section class="card p-5 mb-4">
+      <div class="flex items-center justify-between mb-1">
+        <h2 class="section-h">Growth of $1</h2>
+        <span id="total-return" class="stat-num">—</span>
+      </div>
+      <p class="text-xs muted mb-3">
+        If you'd put $1 to work on the very first trade and let the results
+        compound, this line is where it stands now. Up and to the right is good.
+      </p>
+      <div id="equity-spark" class="mono" style="min-height:140px;">
+        <div class="text-xs muted">Loading…</div>
+      </div>
+    </section>
+
+    <!-- ============ SUPPORTING STATS ============ -->
+    <section class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+      <div class="card p-4"><div class="stat-label">Trades finished</div><div class="stat-num" id="s-trades">—</div></div>
+      <div class="card p-4"><div class="stat-label">Per-trade edge</div><div class="stat-num" id="s-expectancy">—</div></div>
+      <div class="card p-4"><div class="stat-label">Sharpe (risk-adjusted)</div><div class="stat-num" id="s-sharpe">—</div></div>
+      <div class="card p-4"><div class="stat-label">Total return</div><div class="stat-num" id="s-totalret">—</div></div>
+    </section>
+
+    <!-- ============ BREAKDOWNS ============ -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+      <section class="card p-5">
+        <h2 class="section-h mb-1">By mode</h2>
+        <p class="text-xs muted mb-3">Training (shadow/paper) results are kept separate so they're never confused with real money.</p>
+        <div id="seg-mode"><div class="text-xs muted">—</div></div>
+      </section>
+      <section class="card p-5">
+        <h2 class="section-h mb-1">By strategy</h2>
+        <p class="text-xs muted mb-3">Which preset has actually delivered.</p>
+        <div id="seg-strategy"><div class="text-xs muted">—</div></div>
+      </section>
+      <section class="card p-5">
+        <h2 class="section-h mb-1">By signal source</h2>
+        <p class="text-xs muted mb-3">Where the winning ideas came from (shown when the source is recorded).</p>
+        <div id="seg-source"><div class="text-xs muted">—</div></div>
+      </section>
+      <section class="card p-5">
+        <h2 class="section-h mb-1">By market regime</h2>
+        <p class="text-xs muted mb-3">How the edge holds up in calm vs choppy markets.</p>
+        <div id="seg-regime"><div class="text-xs muted">—</div></div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const fmtPct = (v) => v == null ? "—" : (v * 100).toFixed(1) + "%";
+    const fmtPct2 = (v) => v == null ? "—" : (v >= 0 ? "+" : "") + (v * 100).toFixed(2) + "%";
+    const fmtNum = (v) => v == null ? "—" : Number(v).toFixed(2);
+    const esc = (s) => String(s ?? "").replace(/[<>&"]/g, (c) => ({ "<":"&lt;",">":"&gt;","&":"&amp;","\"":"&quot;" }[c]));
+
+    function setMode(mode) {
+      const m = (mode || "shadow").toLowerCase();
+      const pill = document.getElementById("mode-pill");
+      pill.textContent = m.toUpperCase();
+      pill.className = "mode-pill shrink-0 " + (m === "live" ? "mode-live" : m === "paper" ? "mode-paper" : "mode-shadow");
+      const note = document.getElementById("mode-note");
+      if (m === "live") {
+        note.innerHTML = `These are <strong>LIVE</strong> results with real money.`;
+      } else if (m === "paper") {
+        note.innerHTML = `These are <strong>PAPER</strong> (simulated brokerage) results — no real money is at risk.`;
+      } else {
+        note.innerHTML = `These are <strong>SHADOW</strong> (training) results — the AI is practising. No real money is at risk, and these numbers don't represent live trading.`;
+      }
+    }
+
+    function renderHeadline(o) {
+      document.getElementById("m-winrate").innerHTML =
+        o.win_rate == null ? "<span class='muted'>—</span>" : fmtPct(o.win_rate);
+      document.getElementById("m-winrate-detail").textContent =
+        (o.wins != null && o.losses != null) ? `${o.wins} won, ${o.losses} lost` : "";
+      document.getElementById("m-avgwin").textContent = o.avg_win == null ? "—" : fmtPct2(o.avg_win);
+      document.getElementById("m-avgloss").textContent = o.avg_loss == null ? "—" : fmtPct2(o.avg_loss);
+      const pf = document.getElementById("m-pf");
+      if (o.profit_factor == null) {
+        pf.innerHTML = "<span class='muted' style='font-size:20px;'>not yet measurable</span>";
+      } else {
+        pf.textContent = fmtNum(o.profit_factor);
+        pf.className = "lead-num " + (o.profit_factor >= 1 ? "good" : "bad");
+      }
+      document.getElementById("m-dd").textContent = o.max_drawdown == null ? "—" : fmtPct(o.max_drawdown);
+
+      document.getElementById("s-trades").textContent = o.total_trades ?? "—";
+      document.getElementById("s-expectancy").textContent = o.expectancy == null ? "—" : fmtPct2(o.expectancy);
+      document.getElementById("s-sharpe").textContent = o.sharpe == null ? "—" : fmtNum(o.sharpe);
+      document.getElementById("s-totalret").textContent = o.total_return == null ? "—" : fmtPct2(o.total_return);
+      const tr = document.getElementById("total-return");
+      tr.textContent = o.total_return == null ? "—" : fmtPct2(o.total_return);
+      tr.className = "stat-num " + (o.total_return == null ? "muted" : o.total_return >= 0 ? "good" : "bad");
+    }
+
+    function renderStory(d) {
+      const o = d.overall || {};
+      const el = document.getElementById("story-text");
+      if (d.insufficient_data || !o.total_trades) {
+        el.innerHTML = `No trades have finished yet, so there's nothing to grade. `
+          + `As soon as the AI's trades close out, the win rate, profit factor and `
+          + `equity curve will appear here.`;
+        return;
+      }
+      const pfTxt = o.profit_factor == null
+        ? `We haven't had a losing trade yet, so the profit factor isn't measurable.`
+        : `For every $1 lost, it has made <strong>$${fmtNum(o.profit_factor)}</strong>.`;
+      el.innerHTML = `Across <strong>${o.total_trades}</strong> finished trades, the AI won `
+        + `<strong class="${(o.win_rate || 0) >= 0.5 ? "good" : ""}">${fmtPct(o.win_rate)}</strong> of the time. `
+        + pfTxt;
+    }
+
+    function renderEquity(points) {
+      const host = document.getElementById("equity-spark");
+      const vals = (points || []).map(p => p.equity).filter(v => typeof v === "number");
+      if (vals.length < 2) {
+        host.innerHTML = `<div class="text-xs muted">Not enough finished trades to draw a curve yet.</div>`;
+        return;
+      }
+      host.innerHTML = Cockpit.sparkline(vals, { width: 600, height: 140 });
+      const svg = host.querySelector("svg");
+      if (svg) { svg.setAttribute("class", "spark"); svg.setAttribute("preserveAspectRatio", "none"); }
+    }
+
+    function segTable(seg) {
+      const names = Object.keys(seg || {});
+      if (!names.length) return `<div class="text-xs muted">No data yet.</div>`;
+      let rows = "";
+      for (const name of names) {
+        const s = seg[name];
+        rows += `<tr>`
+          + `<td>${esc(name)}</td>`
+          + `<td class="num">${s.total_trades ?? 0}</td>`
+          + `<td class="num">${fmtPct(s.win_rate)}</td>`
+          + `<td class="num">${s.profit_factor == null ? "—" : fmtNum(s.profit_factor)}</td>`
+          + `<td class="num">${fmtPct2(s.total_return)}</td>`
+          + `</tr>`;
+      }
+      return `<table class="seg"><thead><tr>`
+        + `<th>Name</th><th>Trades</th><th>Win rate</th><th>Profit factor</th><th>Return</th>`
+        + `</tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function load() {
+      try {
+        const r = await fetch("/api/performance");
+        const d = await r.json();
+        const o = d.overall || {};
+        // Pick the dominant mode for the headline label (shadow by default).
+        const modes = Object.keys(d.by_mode || {});
+        setMode(modes.length === 1 ? modes[0] : (modes.includes("live") ? "live" : modes.includes("paper") ? "paper" : "shadow"));
+        renderStory(d);
+        renderHeadline(o);
+        renderEquity(d.equity_curve);
+        document.getElementById("seg-mode").innerHTML = segTable(d.by_mode);
+        document.getElementById("seg-strategy").innerHTML = segTable(d.by_strategy);
+        document.getElementById("seg-source").innerHTML = segTable(d.by_source);
+        document.getElementById("seg-regime").innerHTML = segTable(d.by_regime);
+      } catch (e) {
+        document.getElementById("story-text").textContent = "Couldn't load the track record. Try refreshing.";
+      }
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      if (window.Cockpit && Cockpit.initNav) Cockpit.initNav();
+      load();
+    });
+  </script>
+</body>
+</html>
