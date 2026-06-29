@@ -36,6 +36,7 @@ import logging
 import os
 import tempfile
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,8 +44,11 @@ from typing import Any, Literal
 
 from packages.data.adapters.base import NewsItem
 from packages.data.adapters.sentiment import (
+    _TICKER_BLACKLIST,
     SentimentAdapter,
     aggregate_sentiment,
+    extract_tickers,
+    score_headline,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,6 +86,17 @@ MIN_MENTIONS = 3
 # to the same candidate budget the rest of the pipeline already works with.
 RH_FUNDAMENTALS_MAX_SYMBOLS = MAX_CANDIDATES
 RH_EARNINGS_MAX_SYMBOLS = MAX_CANDIDATES
+
+# Pre-rank cap for the ADDITIVE discovery sources (news extraction + Finnhub
+# movers). Deliberately larger than ``MAX_CANDIDATES`` so a healthy news/movers
+# universe (target ~15-40 names) isn't starved before the downstream ranker
+# gets to see it. These never touch the dashboard-display cap.
+NEWS_MAX_CANDIDATES = 40
+MOVERS_MAX_SYMBOLS = 40
+
+# A news mention alone is a weak signal, so we surface news candidates from a
+# single headline (min 1) -- the confidence stays low until corroborated.
+NEWS_MIN_MENTIONS = 1
 
 
 SignalKind = Literal["portfolio", "sentiment", "news", "scan"]
@@ -443,6 +458,179 @@ def merge_scan_candidates(
     return base
 
 
+def _symbols_from_news(item: NewsItem) -> list[str]:
+    """Validated ticker symbols mentioned by a single :class:`NewsItem`.
+
+    Reuses the vetted :func:`extract_tickers` extractor (cashtags + known-
+    ticker allowlist + company-name map) over the headline/summary. A symbol
+    the source already tagged (RSS ``symbol`` or a Finnhub ``related`` field)
+    is folded in through the cashtag path so it goes through the same dedupe.
+    The shared ``_TICKER_BLACKLIST`` denylist is applied last so junk like
+    "CEO"/"USA" never leaks in even via the cashtag path.
+    """
+    text = item.headline or ""
+    if item.summary:
+        text = f"{text} {item.summary}"
+    if item.symbol:
+        text = f"{text} ${item.symbol.upper()}"
+    return [s for s in extract_tickers(text) if s not in _TICKER_BLACKLIST]
+
+
+def candidates_from_news(
+    news_items: list[NewsItem],
+    *,
+    min_mentions: int = NEWS_MIN_MENTIONS,
+    max_candidates: int = NEWS_MAX_CANDIDATES,
+) -> list[Candidate]:
+    """Turn raw news headlines into ranked ``news``-kind candidates.
+
+    This is the source that keeps discovery alive when Reddit/StockTwits are
+    403-blocked: the RSS feed still yields headlines into ``news_items``, but
+    until now their tickers were discarded for candidate purposes. We extract
+    tickers per item (via :func:`_symbols_from_news`), count mentions across
+    the window, derive a sentiment score + confidence from the existing
+    :func:`score_headline`/:func:`_confidence` helpers, and keep the top N.
+
+    Empty / ticker-less input is a no-op (returns ``[]``); a news mention is a
+    'worth a look' nudge, never bearish on its own.
+    """
+    if not news_items:
+        return []
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    counts: Counter[str] = Counter()
+    scores: dict[str, list[float]] = {}
+    headlines: dict[str, list[str]] = {}
+    for it in news_items:
+        syms = _symbols_from_news(it)
+        if not syms:
+            continue
+        s = score_headline(it.headline or "")
+        for sym in syms:
+            counts[sym] += 1
+            scores.setdefault(sym, []).append(s)
+            bucket = headlines.setdefault(sym, [])
+            if it.headline and it.headline not in bucket and len(bucket) < 5:
+                bucket.append(it.headline)
+    out: list[Candidate] = []
+    for sym, mentions in counts.items():
+        if mentions < min_mentions:
+            continue
+        sym_scores = scores.get(sym) or []
+        score = sum(sym_scores) / len(sym_scores) if sym_scores else 0.0
+        out.append(
+            Candidate(
+                symbol=sym,
+                signal_kind="news",
+                thesis=_thesis_line(sym, score, mentions),
+                confidence=_confidence(score, mentions),
+                sentiment_score=round(score, 4),
+                mentions=mentions,
+                sources=["rss_news"],
+                sample_headlines=headlines.get(sym, [])[:5],
+                created_at=now,
+            )
+        )
+    out.sort(key=lambda c: (-c.confidence, c.symbol))
+    return out[:max_candidates]
+
+
+def merge_news_candidates(
+    base: list[Candidate],
+    news_candidates: list[Candidate],
+) -> list[Candidate]:
+    """ADDITIVELY union news-derived candidates into the universe.
+
+    A news candidate for a symbol that isn't already present is appended; a
+    symbol that already exists (sentiment/portfolio/scan) is left in place and
+    only has ``"rss_news"`` unioned into its ``sources`` -- we never displace
+    or down-rank an existing candidate. Empty input is a no-op, so the universe
+    only ever grows. Works even when Reddit/StockTwits are fully down.
+    """
+    if not news_candidates:
+        return base
+    existing = {c.symbol.upper(): c for c in base}
+    for nc in news_candidates:
+        key = nc.symbol.upper()
+        cur = existing.get(key)
+        if cur is None:
+            base.append(nc)
+            existing[key] = nc
+            continue
+        for src in nc.sources:
+            if src not in cur.sources:
+                cur.sources.append(src)
+    return base
+
+
+def merge_movers_candidates(
+    base: list[Candidate],
+    mover_symbols: list[str],
+) -> list[Candidate]:
+    """ADDITIVELY union Finnhub market-mover tickers into the candidate list.
+
+    Mirrors :func:`merge_scan_candidates` exactly: mover tickers that aren't
+    already candidates are appended as low-confidence ``scan`` candidates so
+    the research view surfaces them, but they NEVER displace or down-rank
+    sentiment/portfolio/news candidates. An empty ``mover_symbols`` leaves
+    ``base`` untouched (no-op), so the universe only ever grows. A mover hit is
+    NEVER bearish: it's a 'worth a look' nudge, ``sources=["finnhub_movers"]``.
+    """
+    if not mover_symbols:
+        return base
+    existing = {c.symbol.upper() for c in base}
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    for raw in mover_symbols:
+        sym = str(raw or "").strip().upper()
+        if not sym or sym in existing:
+            continue
+        existing.add(sym)
+        base.append(
+            Candidate(
+                symbol=sym,
+                signal_kind="scan",
+                thesis=(
+                    f"{sym}: active in Finnhub market news. No sentiment "
+                    "signal yet -- worth a look before next session."
+                ),
+                confidence=0.3,
+                sentiment_score=0.0,
+                mentions=0,
+                sources=["finnhub_movers"],
+                created_at=now,
+            )
+        )
+    return base
+
+
+def _dedupe_candidates(candidates: list[Candidate]) -> list[Candidate]:
+    """Collapse any duplicate-symbol candidates, keeping the highest-confidence
+    instance and unioning the ``sources``/``sample_headlines`` of the dropped
+    duplicates onto the survivor.
+
+    The additive merges already keep the universe unique by symbol, so this is
+    a defensive belt-and-braces pass that also guarantees deterministic output
+    order (preserving first-seen order of the survivors). Never raises.
+    """
+    survivor: dict[str, Candidate] = {}
+    order: list[str] = []
+    for c in candidates:
+        key = c.symbol.upper()
+        cur = survivor.get(key)
+        if cur is None:
+            survivor[key] = c
+            order.append(key)
+            continue
+        keep, drop = (c, cur) if c.confidence > cur.confidence else (cur, c)
+        for src in drop.sources:
+            if src not in keep.sources:
+                keep.sources.append(src)
+        for h in drop.sample_headlines:
+            if h not in keep.sample_headlines and len(keep.sample_headlines) < 5:
+                keep.sample_headlines.append(h)
+        survivor[key] = keep
+    return [survivor[k] for k in order]
+
+
 # ---------------------------------------------------------------------------
 # Async gatherers (network)
 # ---------------------------------------------------------------------------
@@ -475,6 +663,47 @@ async def _gather_rh_scans() -> list[str]:
     except Exception as exc:  # pragma: no cover — defensive
         logger.warning("rh scans gather failed: %s", exc.__class__.__name__)
         return []
+
+
+async def _gather_finnhub_movers(
+    *, max_symbols: int = MOVERS_MAX_SYMBOLS
+) -> list[str]:
+    """Finnhub market-movers proxy, ADDITIVE candidate sourcing (READ-ONLY).
+
+    Finnhub's free tier has no dedicated gainers/losers/most-active endpoint,
+    so we use the reachable ``/news?category=general`` feed (via the existing
+    :class:`FinnhubAdapter` and its ``FINNHUB_API_KEY`` plumbing -- no new key
+    path) as a movers proxy: the tickers that show up most often across fresh
+    market headlines are the names actually moving. Symbols are extracted with
+    the same vetted extractor the news path uses, counted, and returned
+    most-common-first.
+
+    Returns ``[]`` on any failure / when the key is unset -- the caller then
+    just keeps the existing universe. Never raises.
+    """
+    try:
+        from packages.data.adapters.finnhub import FinnhubAdapter
+    except Exception as exc:  # pragma: no cover — import safety
+        logger.warning("finnhub movers import failed: %s", exc.__class__.__name__)
+        return []
+    adapter = FinnhubAdapter()
+    if not adapter.has_key:
+        with contextlib.suppress(Exception):
+            await adapter.aclose()
+        return []
+    try:
+        items = await adapter.get_market_news(category="general")
+    except Exception as exc:  # pragma: no cover — network/defensive
+        logger.warning("finnhub movers gather failed: %s", exc.__class__.__name__)
+        return []
+    finally:
+        with contextlib.suppress(Exception):
+            await adapter.aclose()
+    counts: Counter[str] = Counter()
+    for it in items:
+        for sym in _symbols_from_news(it):
+            counts[sym] += 1
+    return [sym for sym, _ in counts.most_common(max_symbols)]
 
 
 async def _gather_news(adapter: SentimentAdapter) -> list[NewsItem]:
@@ -1127,6 +1356,44 @@ async def run_sweep(
             scan_symbols = await _gather_rh_scans()
             _meta("rh_scans", True, len(scan_symbols), scan_t0)
             cands = merge_scan_candidates(cands, scan_symbols)
+
+        # ADDITIVE: extract candidates straight from the RSS/news headlines we
+        # already fetched. This is the source that keeps discovery alive when
+        # Reddit/StockTwits are 403-blocked -- RSS still flows into news_items,
+        # so its tickers become real candidates instead of being discarded.
+        # Fully fail-safe: any error leaves the existing universe untouched.
+        # Recorded empty-is-success (a quiet news day is reachable, not DOWN).
+        try:
+            news_cand_t0 = time.monotonic()
+            news_cands = candidates_from_news(news_items)
+            cands = merge_news_candidates(cands, news_cands)
+            _meta("news_candidates", True, len(news_cands), news_cand_t0)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                "news candidate merge failed: %s", exc.__class__.__name__
+            )
+
+        # ADDITIVE: Finnhub market-movers proxy (general-news ticker frequency)
+        # -> low-confidence scan candidates. Only runs when FINNHUB_API_KEY is
+        # set, so in tests / when the key is absent this is a no-op: no call, no
+        # sources_meta entry, existing behaviour unchanged. Fully fail-safe --
+        # an empty/erroring feed leaves the universe untouched and is recorded
+        # empty-is-success (closed market / quiet feed != a DOWN source).
+        if os.getenv("FINNHUB_API_KEY"):
+            try:
+                movers_t0 = time.monotonic()
+                mover_symbols = await _gather_finnhub_movers()
+                cands = merge_movers_candidates(cands, mover_symbols)
+                _meta("finnhub_movers", True, len(mover_symbols), movers_t0)
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning(
+                    "finnhub movers merge failed: %s", exc.__class__.__name__
+                )
+
+        # Belt-and-braces: guarantee a symbol-unique universe after every
+        # additive merge (the merges already keep it unique; this also unions
+        # provenance from any incidental duplicate).
+        cands = _dedupe_candidates(cands)
 
         # Phase 10: per-ticker fan-out for Yahoo + EDGAR + per-ticker
         # Reddit. Runs AFTER first-pass candidate generation so we
