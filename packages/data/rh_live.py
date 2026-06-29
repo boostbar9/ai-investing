@@ -371,6 +371,31 @@ async def get_earnings(
     )
 
 
+async def get_earnings_results(
+    symbol: str, *, fallback: Fallback | None = None
+) -> Provenanced:
+    """Per-symbol earnings results via RH ``get_earnings_results``, RH-primary.
+
+    ``value`` is a list of result rows (trailing quarters + report dates,
+    estimated/actual EPS) on success. READ-ONLY: this only ever issues the
+    ``get_earnings_results`` read tool through the broker. Same fail-safe /
+    provenance contract as every other accessor -- an absent feed yields
+    ``ok=False`` and the caller treats earnings proximity as simply unknown
+    (NEVER bearish, NEVER fabricated)."""
+
+    async def _fetch(broker: Any) -> Any:
+        return await broker.earnings_results(symbol)
+
+    return await _serve(
+        SRC_EARNINGS,
+        f"results:{symbol.strip().upper()}",
+        TTL_EARNINGS_S,
+        _fetch,
+        is_empty=lambda v: not v,
+        fallback=fallback,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Regime inputs: live index levels (VIX) + daily closes (SPY etc.).
 # These are RH-primary with NO fabricated fallback here -- the regime module

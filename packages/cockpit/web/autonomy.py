@@ -256,6 +256,7 @@ FEATURE_LABELS: tuple[str, ...] = (
     "stocktwits",
     "yahoo_news",
     "ranker",         # Phase 34: supervised LightGBM probability arm
+    "fundamentals",   # Robinhood read-only fundamentals momentum signal
 )
 
 
@@ -390,6 +391,50 @@ def _score_candidate(
                 score *= mult
             except Exception:  # pragma: no cover — defensive
                 pass
+
+    # Robinhood fundamentals: GUARDRAIL-FIRST safety + a modest momentum
+    # signal. Fires ONLY when the read-only fundamentals phase actually ran
+    # (``fundamentals_source`` is set); otherwise it contributes EXACTLY 0.0
+    # and the rule-based scoring output is byte-for-byte unchanged (protects
+    # the yfinance-ordering + scorer tests). The net contribution is clamped
+    # to a protective-skewed band [-0.20, +0.08] so it can dampen or veto a
+    # pick (push it below min_confidence) but only ever nudge it up. Safety
+    # PENALTIES are applied at FULL strength (not bandit-weighted) so the
+    # bandit can never learn to weaken a delisting / earnings guardrail; the
+    # small POSITIVES flow through the bandit like every other signal. A
+    # missing field stays at its neutral default => no contribution, never
+    # bearish.
+    if c.get("fundamentals_source"):
+        fund = 0.0
+        # --- SAFETY (never boosts) ---
+        if c.get("compliance_ok") is False:
+            fund -= 0.15
+            reasons.append("delisting/compliance risk")
+        dte = c.get("days_to_earnings")
+        if isinstance(dte, (int, float)) and not isinstance(dte, bool) and dte <= 1:
+            fund -= 0.08
+            reasons.append("earnings imminent")
+        try:
+            relv = float(c.get("rel_volume") or 0.0)
+            mcap = float(c.get("market_cap") or 0.0)
+            pfh = float(c.get("pct_from_52w_high") or 0.0)
+        except (TypeError, ValueError):
+            relv = mcap = pfh = 0.0
+        # Extreme illiquidity AND micro-cap: a small protective penalty.
+        if 0.0 < relv < 0.3 and 0.0 < mcap < 5e7:
+            fund -= 0.05
+            reasons.append("thin liquidity")
+        # --- MODEST POSITIVE (bandit-weighted, bounded) ---
+        if relv >= 1.5:
+            fund += gain("fundamentals", 0.04)
+            reasons.append(f"volume {relv:.1f}x normal")
+            features.append("fundamentals")
+        if pfh <= -0.05:
+            fund += gain("fundamentals", 0.02)
+            reasons.append("not extended vs 52w high")
+            if "fundamentals" not in features:
+                features.append("fundamentals")
+        score += max(-0.20, min(0.08, fund))
 
     # LLM thesis sanity-check nudge. Applied LAST — AFTER scoring, bandit,
     # regime, and agent-weight steps — and CLAMPED to [-0.10, +0.10] so the

@@ -156,6 +156,8 @@
       .pill-ai   { background: #312e81; color: #c7d2fe; }
       .pill-rule { background: #1f2937; color: #9ca3af; }
       .pill-risk { background: #422006; color: #fcd34d; }
+      .pill-danger { background: #7f1d1d; color: #fecaca; }
+      .pill-fund { background: #0f172a; color: #93c5fd; }
       .ai-on  { color: #6ee7b7; }
       .ai-off { color: #9ca3af; }
     </style>
@@ -198,6 +200,34 @@
           return Math.round(c * 100) + "%";
         }
 
+        function fmtCap(v) {
+          if (typeof v !== "number" || !(v > 0)) return "";
+          if (v >= 1e12) return "$" + (v / 1e12).toFixed(1) + "T";
+          if (v >= 1e9) return "$" + (v / 1e9).toFixed(1) + "B";
+          if (v >= 1e6) return "$" + (v / 1e6).toFixed(0) + "M";
+          return "$" + Math.round(v);
+        }
+
+        // Plain-language fundamentals strip, provenance Robinhood. Each stat
+        // is omitted unless it parsed (no fabricated zeros).
+        function fundStrip(c) {
+          const bits = [];
+          const cap = fmtCap(c.market_cap);
+          if (cap) bits.push("Cap " + cap);
+          if (typeof c.pe_ratio === "number" && c.pe_ratio > 0)
+            bits.push("P/E " + c.pe_ratio.toFixed(1));
+          if (typeof c.rel_volume === "number" && c.rel_volume > 0)
+            bits.push("Vol " + c.rel_volume.toFixed(1) + "× normal");
+          if (typeof c.pct_from_52w_high === "number" && c.pct_from_52w_high < 0)
+            bits.push(Math.round(c.pct_from_52w_high * 100) + "% from 52w high");
+          if (c.next_earnings_date)
+            bits.push("Earnings " + String(c.next_earnings_date));
+          if (!bits.length) return "";
+          return `<div class="mt-1 text-xs text-gray-500">`
+            + `<span class="pill pill-fund" title="Robinhood read-only fundamentals">Robinhood</span> `
+            + esc(bits.join(" · ")) + `</div>`;
+        }
+
         function renderCandidates(sweep) {
           $list.innerHTML = "";
           if (!sweep || !sweep.candidates || sweep.candidates.length === 0) {
@@ -213,9 +243,18 @@
             const provBadge = isLlm
               ? `<span class="pill pill-ai" title="${esc(c.thesis_source)}">AI</span>`
               : `<span class="pill pill-rule" title="rule-based thesis">rule</span>`;
-            const riskBadge = (c.risk_flag && String(c.risk_flag).trim())
-              ? `<div class="mt-1"><span class="pill pill-risk">⚠ ${esc(c.risk_flag)}</span></div>`
+            // Delisting/compliance is the only RED (critical) flag; earnings
+            // and liquidity warnings are amber. Plain language for a
+            // non-technical user.
+            const riskTxt = (c.risk_flag && String(c.risk_flag).trim()) || "";
+            const riskCls = /delist|compliance/i.test(riskTxt)
+              ? "pill-danger" : "pill-risk";
+            const riskBadge = riskTxt
+              ? `<div class="mt-1"><span class="pill ${riskCls}">⚠ ${esc(riskTxt)}</span></div>`
               : "";
+            // Robinhood read-only fundamentals strip (plain language,
+            // mobile-first). Only shown when the fundamentals phase ran.
+            const fundBadge = c.fundamentals_source ? fundStrip(c) : "";
             row.innerHTML = `
               <div class="min-w-0 flex-1">
                 <div class="flex items-center gap-2 mb-1">
@@ -226,6 +265,7 @@
                 </div>
                 <div class="text-xs text-gray-400 truncate">${esc(c.thesis)}</div>
                 ${riskBadge}
+                ${fundBadge}
               </div>
               <div class="text-sm font-semibold text-gray-200 whitespace-nowrap">${fmtConfidence(c.confidence)}</div>
             `;

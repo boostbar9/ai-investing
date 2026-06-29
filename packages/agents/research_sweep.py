@@ -78,6 +78,11 @@ MAX_CANDIDATES = 10
 # sentiment signal. Single tweets get ignored.
 MIN_MENTIONS = 3
 
+# Cap the per-symbol RH fundamentals/earnings fan-out (one cached read each)
+# to the same candidate budget the rest of the pipeline already works with.
+RH_FUNDAMENTALS_MAX_SYMBOLS = MAX_CANDIDATES
+RH_EARNINGS_MAX_SYMBOLS = MAX_CANDIDATES
+
 
 SignalKind = Literal["portfolio", "sentiment", "news", "scan"]
 SweepStatus = Literal["idle", "running", "done", "failed"]
@@ -134,6 +139,25 @@ class Candidate:
     direction: str = ""                  # "bull" | "bear" | "neutral" | ""
     risk_flag: str = ""                  # short plain-language risk, or ""
     confidence_adjustment: float = 0.0   # bounded nudge in [-0.10, +0.10]
+    # Robinhood read-only fundamentals (guardrail-first signal). Defaults are
+    # deliberately NEUTRAL so a candidate that never went through the
+    # fundamentals phase scores byte-for-byte the same as before this feature:
+    # ``fundamentals_source==""`` tells the scorer the phase didn't run, so it
+    # contributes exactly 0.0. ``compliance_ok`` defaults True (innocent until
+    # the feed says otherwise) and ``days_to_earnings`` defaults None (unknown)
+    # so a missing feed NEVER penalises a candidate.
+    fundamentals_source: str = ""        # "" | "rh_fundamentals" | "stale"
+    market_cap: float = 0.0
+    pe_ratio: float = 0.0
+    float_shares: float = 0.0
+    rel_volume: float = 0.0              # volume / average_volume_30_days
+    pct_from_52w_high: float = 0.0       # <=0; how far below the 52w high
+    pct_above_52w_low: float = 0.0       # >=0; how far above the 52w low
+    sector: str = ""
+    compliance_status: str = ""          # RH financial_status_description
+    compliance_ok: bool = True           # False => Nasdaq noncompliant/delisting
+    next_earnings_date: str = ""         # ISO date of next report, or ""
+    days_to_earnings: int | None = None  # days until next report, or None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -703,6 +727,283 @@ def _apply_phase10_enrichment(
 
 
 # ---------------------------------------------------------------------------
+# Robinhood fundamentals + earnings enrichment (READ-ONLY, fail-safe).
+#
+# Two new phases, both behind the same provenance/fail-safe contract as the
+# rest of the sweep: a missing or erroring feed simply leaves the candidate's
+# NEUTRAL defaults in place (fundamentals_source="" / compliance_ok=True /
+# days_to_earnings=None), records the attempt in sources_meta, and NEVER
+# fabricates a value or turns absence into a bearish signal. All parsing is
+# pure so tests drive it with fixture dicts -- no network.
+# ---------------------------------------------------------------------------
+_COMPLIANCE_BAD_KEYWORDS = (
+    "noncompliant",
+    "non-compliant",
+    "delinquent",
+    "deficient",
+    "deficiency",
+    "delist",
+    "bankrupt",
+)
+# Nasdaq financial-status indicator codes that mean "fine". Anything else
+# present (e.g. "CC4", "D", "E") is treated as a compliance concern.
+_COMPLIANCE_OK_INDICATORS = {"", "N", "NORMAL"}
+
+
+def _num(v: Any) -> float | None:
+    """Best-effort float, or ``None`` for missing/garbage. Never raises."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):  # NaN / inf guard
+        return None
+    return f
+
+
+def _compliance_ok(row: dict[str, Any]) -> tuple[bool, str]:
+    """``(ok, human_status)`` from RH ``financial_status_*`` fields.
+
+    Innocent until proven otherwise: missing status => ok=True, "" (so a
+    candidate without compliance data is never flagged). A bad keyword in the
+    description, or a non-normal indicator code, marks it noncompliant."""
+    desc = str(row.get("financial_status_description") or "").strip()
+    indicator = str(row.get("financial_status_indicator") or "").strip()
+    low = desc.lower()
+    if any(k in low for k in _COMPLIANCE_BAD_KEYWORDS):
+        return False, desc or "Noncompliant"
+    if indicator and indicator.upper() not in _COMPLIANCE_OK_INDICATORS:
+        return False, desc or f"Status {indicator}"
+    return True, desc
+
+
+def _parse_fundamentals_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Pure: RH fundamentals row -> the subset of fields we persist/score.
+
+    Only fields that parse cleanly are filled; the rest keep their neutral
+    Candidate defaults. ``rel_volume`` and the 52-week distances are derived
+    only when their inputs are present and positive (no fabricated zeros)."""
+    out: dict[str, Any] = {}
+    mc = _num(row.get("market_cap"))
+    if mc is not None:
+        out["market_cap"] = mc
+    pe = _num(row.get("pe_ratio"))
+    if pe is not None:
+        out["pe_ratio"] = pe
+    flt = _num(row.get("float"))
+    if flt is not None:
+        out["float_shares"] = flt
+    vol = _num(row.get("volume"))
+    avg = _num(row.get("average_volume_30_days")) or _num(
+        row.get("average_volume_2_weeks")
+    )
+    if vol is not None and avg and avg > 0:
+        out["rel_volume"] = round(vol / avg, 4)
+    hi = _num(row.get("high_52_weeks"))
+    last = (
+        _num(row.get("last_trade_price"))
+        or _num(row.get("last_price"))
+        or _num(row.get("high"))
+    )
+    if hi and hi > 0 and last and last > 0:
+        # <= 0: how far (fraction) the last price sits below the 52w high.
+        out["pct_from_52w_high"] = round((last - hi) / hi, 4)
+    lo = _num(row.get("low_52_weeks"))
+    if lo and lo > 0 and last and last > 0:
+        out["pct_above_52w_low"] = round((last - lo) / lo, 4)
+    sector = str(row.get("sector") or "").strip()
+    if sector:
+        out["sector"] = sector
+    ok, status = _compliance_ok(row)
+    out["compliance_ok"] = ok
+    out["compliance_status"] = status
+    return out
+
+
+def _apply_fundamentals_enrichment(
+    candidates: list[Candidate],
+    fundamentals_by_symbol: dict[str, dict[str, Any]],
+    *,
+    source_label: str = "rh_fundamentals",
+) -> list[Candidate]:
+    """Stamp parsed RH fundamentals onto each candidate (pure, no I/O).
+
+    A symbol absent from ``fundamentals_by_symbol`` keeps its neutral defaults
+    (``fundamentals_source`` stays "") so it scores exactly as before. Sets the
+    safety ``risk_flag`` for a delisting/compliance concern -- that flag takes
+    precedence over a prior (e.g. LLM) flag because a guardrail must win."""
+    if not candidates or not fundamentals_by_symbol:
+        return candidates
+    for c in candidates:
+        row = fundamentals_by_symbol.get(c.symbol.upper())
+        if not isinstance(row, dict) or not row:
+            continue
+        parsed = _parse_fundamentals_row(row)
+        for k, v in parsed.items():
+            setattr(c, k, v)
+        c.fundamentals_source = source_label
+        if not c.compliance_ok and not c.risk_flag.startswith("delisting"):
+            c.risk_flag = "delisting/compliance risk"
+    return candidates
+
+
+def _coerce_date(value: Any) -> datetime | None:
+    """Parse an ISO-ish date/datetime string to an aware UTC datetime, else
+    ``None``. Accepts ``YYYY-MM-DD`` and full ISO timestamps (incl. trailing
+    Z). Never raises."""
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    s = s.replace("Z", "+00:00")
+    for parse in (datetime.fromisoformat,):
+        try:
+            dt = parse(s)
+        except ValueError:
+            try:
+                dt = datetime.strptime(s[:10], "%Y-%m-%d")
+            except ValueError:
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+    return None
+
+
+def _row_report_dates(row: dict[str, Any]) -> list[datetime]:
+    """All plausible report dates on an earnings row (results or calendar)."""
+    out: list[datetime] = []
+    for key in ("report_date", "date", "next_earnings_date", "report"):
+        v = row.get(key)
+        if isinstance(v, dict):  # e.g. {"date": ..., "timing": ...}
+            v = v.get("date")
+        dt = _coerce_date(v)
+        if dt is not None:
+            out.append(dt)
+    return out
+
+
+def _next_earnings(
+    rows: list[dict[str, Any]], *, now: datetime | None = None
+) -> tuple[str, int | None]:
+    """``(next_earnings_date_iso, days_to_earnings)`` from earnings rows.
+
+    Picks the soonest report date that is today or in the future. Returns
+    ``("", None)`` when no usable future date exists (treated as unknown,
+    never bearish)."""
+    if not rows:
+        return ("", None)
+    ref = now or datetime.now(UTC)
+    today = ref.date()
+    future: list[datetime] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for dt in _row_report_dates(row):
+            if dt.date() >= today:
+                future.append(dt)
+    if not future:
+        return ("", None)
+    nxt = min(future)
+    return (nxt.date().isoformat(), (nxt.date() - today).days)
+
+
+def _apply_earnings_proximity(
+    candidates: list[Candidate],
+    earnings_by_symbol: dict[str, list[dict[str, Any]]],
+    *,
+    now: datetime | None = None,
+) -> list[Candidate]:
+    """Stamp next-earnings date/days onto each candidate (pure, no I/O).
+
+    Sets the ``risk_flag`` "earnings imminent" when a report is today/tomorrow
+    and no higher-priority (delisting) flag is already set."""
+    if not candidates or not earnings_by_symbol:
+        return candidates
+    for c in candidates:
+        rows = earnings_by_symbol.get(c.symbol.upper())
+        if not rows:
+            continue
+        date_iso, days = _next_earnings(rows, now=now)
+        if not date_iso:
+            continue
+        c.next_earnings_date = date_iso
+        c.days_to_earnings = days
+        if (
+            days is not None
+            and days <= 1
+            and not c.risk_flag.startswith("delisting")
+        ):
+            c.risk_flag = "earnings imminent"
+    return candidates
+
+
+async def _gather_rh_fundamentals(
+    symbols: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Fetch RH fundamentals for ``symbols`` via the existing per-symbol,
+    cached, READ-ONLY ``rh_fundamentals`` facade.
+
+    Returns ``{SYMBOL: row}`` for whatever resolved; ``{}`` on any failure or
+    when RH is off. Never raises -- the caller treats an empty map as
+    'fundamentals unavailable' and candidates keep flowing untouched."""
+    if not symbols:
+        return {}
+    try:
+        from packages.data import rh_live
+    except Exception as exc:  # pragma: no cover — import safety
+        logger.warning("rh fundamentals import failed: %s", exc.__class__.__name__)
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for sym in symbols[:RH_FUNDAMENTALS_MAX_SYMBOLS]:
+        try:
+            res = await rh_live.get_fundamentals(sym)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                "rh fundamentals gather failed for %s: %s",
+                sym,
+                exc.__class__.__name__,
+            )
+            continue
+        if res.ok and isinstance(res.value, dict) and res.value:
+            out[sym.upper()] = res.value
+    return out
+
+
+async def _gather_rh_earnings(
+    symbols: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Fetch per-symbol RH earnings results for ``symbols``, READ-ONLY.
+
+    Returns ``{SYMBOL: [rows]}``; ``{}`` on any failure / RH off. Never
+    raises."""
+    if not symbols:
+        return {}
+    try:
+        from packages.data import rh_live
+    except Exception as exc:  # pragma: no cover — import safety
+        logger.warning("rh earnings import failed: %s", exc.__class__.__name__)
+        return {}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for sym in symbols[:RH_EARNINGS_MAX_SYMBOLS]:
+        try:
+            res = await rh_live.get_earnings_results(sym)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                "rh earnings gather failed for %s: %s",
+                sym,
+                exc.__class__.__name__,
+            )
+            continue
+        if res.ok and isinstance(res.value, list) and res.value:
+            out[sym.upper()] = res.value
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Top-level sweep orchestration
 # ---------------------------------------------------------------------------
 
@@ -905,6 +1206,24 @@ async def run_sweep(
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("llm thesis enrichment skipped: %s", exc)
             llm_meta = {}
+
+        # Robinhood read-only fundamentals + earnings proximity. Runs LAST so
+        # its guardrail risk_flags (delisting / earnings-imminent) take
+        # precedence over any prior flag. ONLY when RH is actually connected,
+        # so in tests / when RH is off this is a no-op: candidates keep their
+        # neutral defaults, no sources_meta entry, and scoring stays
+        # byte-for-byte unchanged. Fully fail-safe -- an empty/erroring feed
+        # leaves every candidate untouched and is recorded as an attempt.
+        if _rh_connected() and cands:
+            fund_syms = sorted({c.symbol.upper() for c in cands})
+            fund_t0 = time.monotonic()
+            fundamentals = await _gather_rh_fundamentals(fund_syms)
+            cands = _apply_fundamentals_enrichment(cands, fundamentals)
+            _meta("rh_fundamentals", True, len(fundamentals), fund_t0)
+            earn_t0 = time.monotonic()
+            earnings = await _gather_rh_earnings(fund_syms)
+            cands = _apply_earnings_proximity(cands, earnings)
+            _meta("rh_earnings", True, len(earnings), earn_t0)
 
         finished = datetime.now(UTC)
         return SweepResult(

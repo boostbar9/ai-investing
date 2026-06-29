@@ -66,6 +66,7 @@ DEFAULT_ARMS: tuple[str, ...] = (
     "stocktwits",
     "yahoo_news",
     "ranker",          # Phase 34: supervised LightGBM probability
+    "fundamentals",    # Robinhood read-only fundamentals momentum signal
 )
 
 GAMMA = 0.10  # exploration rate — 10% uniform mass
