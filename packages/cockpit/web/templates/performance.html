@@ -29,6 +29,16 @@
     table.seg td.num { font-variant-numeric: tabular-nums; }
     .section-tag { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); }
     .note { font-size: 12px; color: var(--text-muted); margin-top: 10px; }
+    /* Live-readiness banner + checklist */
+    .lr-banner { border-radius: 10px; padding: 14px 16px; font-weight: 700; font-size: 15px; letter-spacing: 0.01em; display: flex; align-items: center; gap: 10px; }
+    .lr-not-ready { background: rgba(251,113,133,.12); color: #FDA4AF; border: 1px solid rgba(251,113,133,.45); }
+    .lr-ready { background: rgba(52,211,153,.12); color: #6EE7B7; border: 1px solid rgba(52,211,153,.45); }
+    .lr-check { display: flex; align-items: flex-start; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border-faint); font-size: 13px; color: var(--text-secondary); }
+    .lr-check:last-child { border-bottom: none; }
+    .lr-mark { font-weight: 700; width: 1.4em; flex: none; text-align: center; }
+    .lr-pass { color: var(--success, #34D399); }
+    .lr-fail { color: var(--danger, #FB7185); }
+    .lr-detail { color: var(--text-dim); font-size: 12px; margin-left: auto; padding-left: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
   </style>
 </head>
 <body class="min-h-screen">
@@ -51,6 +61,25 @@
     <section class="card p-5 mb-4">
       <p id="story-text" class="text-base" style="color:var(--text-secondary); line-height:1.6;">Loading…</p>
       <p id="mode-note" class="plain"></p>
+    </section>
+
+    <!-- ====================================================================
+         LIVE READINESS — has the engine EARNED the right to trade live?
+    ===================================================================== -->
+    <div class="section-tag mb-2">Live readiness · prove it before real money</div>
+    <section class="card p-5 mb-4">
+      <div id="lr-banner" class="lr-banner lr-not-ready mb-3">
+        <span>Checking readiness…</span>
+      </div>
+      <div id="lr-checklist">
+        <div class="text-xs muted">Loading the readiness checks…</div>
+      </div>
+      <p class="plain" id="lr-explain">
+        Live trading turns on only when <strong>every</strong> check below passes
+        <strong>and</strong> a human explicitly flips the live switch. The system
+        will never enable itself — until then it stays in <strong>SHADOW</strong>
+        (training), with no real money at risk.
+      </p>
     </section>
 
     <!-- ====================================================================
@@ -280,6 +309,70 @@
       document.getElementById("sq-horizon-tbl").innerHTML = hitTable(sq.by_horizon);
     }
 
+    // Live-readiness checklist: each row maps a hard gate requirement to a
+    // pass/fail mark in plain English. Display only — the page never enables
+    // live trading.
+    function renderReadiness(d) {
+      d = d || {};
+      const m = d.metrics || {};
+      const t = d.thresholds || {};
+      const minDays = t.min_days ?? 60;
+      const maxDd = t.max_dd ?? 0.08;
+      const minSharpe = t.min_sharpe ?? 0.8;
+      const days = m.paper_days ?? 0;
+      const dd = m.max_drawdown;        // <= 0 fraction, null until enough data
+      const sharpe = m.sharpe;          // null until enough data
+      const flagOn = d.enable_live_trading === true;
+
+      const daysOk = days >= minDays;
+      // Drawdown / Sharpe can't be graded until there are enough days.
+      const ddOk = daysOk && dd != null && Math.abs(dd) < maxDd;
+      const sharpeOk = daysOk && sharpe != null && sharpe > minSharpe;
+      // The live switch being OFF is the SAFE state we want to see.
+      const switchSafe = !flagOn;
+
+      const checks = [
+        {
+          ok: daysOk,
+          label: "Has practised for at least " + minDays + " days",
+          detail: days + "/" + minDays + " days",
+        },
+        {
+          ok: ddOk,
+          label: "Worst drawdown stays under " + (maxDd * 100).toFixed(0) + "%",
+          detail: dd == null ? "not measurable yet" : fmtPct(Math.abs(dd)) + " vs " + (maxDd * 100).toFixed(0) + "%",
+        },
+        {
+          ok: sharpeOk,
+          label: "Risk-adjusted return (Sharpe) above " + minSharpe.toFixed(1),
+          detail: sharpe == null ? "not measurable yet" : fmtNum(sharpe) + " vs " + minSharpe.toFixed(1),
+        },
+        {
+          ok: switchSafe,
+          label: "Live trading switch is intentionally turned on by a human",
+          detail: flagOn ? "ON" : "off (as it should be)",
+        },
+      ];
+
+      const host = document.getElementById("lr-checklist");
+      host.innerHTML = checks.map((c) => {
+        const cls = c.ok ? "lr-pass" : "lr-fail";
+        const mark = c.ok ? "✓" : "✕";
+        return `<div class="lr-check"><span class="lr-mark ${cls}">${mark}</span>`
+          + `<span>${esc(c.label)}</span>`
+          + `<span class="lr-detail">${esc(c.detail)}</span></div>`;
+      }).join("");
+
+      const banner = document.getElementById("lr-banner");
+      if (d.ready === true) {
+        banner.className = "lr-banner lr-ready mb-3";
+        banner.innerHTML = `<span>✓ ALL CHECKS PASSED — eligible for live, pending a human's explicit go-ahead</span>`;
+      } else {
+        banner.className = "lr-banner lr-not-ready mb-3";
+        banner.innerHTML = `<span>NOT READY FOR LIVE — practising in shadow</span>`;
+      }
+    }
+
     async function load() {
       try {
         const r = await fetch("/api/performance");
@@ -292,6 +385,13 @@
         renderSignalQuality(d.signal_quality);
       } catch (e) {
         document.getElementById("story-text").textContent = "Couldn't load the track record. Try refreshing.";
+      }
+      try {
+        const rr = await fetch("/api/live-readiness");
+        renderReadiness(await rr.json());
+      } catch (e) {
+        document.getElementById("lr-checklist").innerHTML =
+          `<div class="text-xs muted">Couldn't load the readiness checks. Try refreshing.</div>`;
       }
     }
 

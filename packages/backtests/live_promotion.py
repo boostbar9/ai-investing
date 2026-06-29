@@ -27,6 +27,7 @@ so they are trivially testable and replayable from audit data.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -115,6 +116,62 @@ def live_readiness_gate(
         reasons=reasons,
         metrics=metrics,
     )
+
+
+def readiness_report(
+    equity_values: Sequence[float],
+    *,
+    enable_flag: str | None = None,
+    min_days: int = PAPER_MIN_DAYS,
+    max_dd: float = PAPER_MAX_DD,
+    min_sharpe: float = PAPER_MIN_SHARPE,
+) -> dict:
+    """JSON-able readiness view for callers that don't speak pandas.
+
+    Builds the ``pd.Series`` the gate expects from a plain list of equity
+    marks (so the cockpit never has to import pandas), runs
+    ``live_readiness_gate`` and flattens the verdict into a display payload:
+    ``ready``, ``reasons``, ``metrics`` (paper_days / max_drawdown / sharpe —
+    the latter two ``None`` until there is enough history), the ``thresholds``
+    being checked, and the read-only ``enable_live_trading`` flag state.
+
+    Fail-safe: a short/empty series yields ``ready=False`` with a clear reason
+    (never ``ready=True`` on uncertainty). This function only reads and
+    reports — it never enables live trading or touches any flag.
+    """
+    clean: list[float] = []
+    for v in equity_values:
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            clean.append(float(v))
+    series = pd.Series(clean, dtype=float)
+
+    flag = enable_flag if enable_flag is not None else os.getenv("ENABLE_LIVE_TRADING", "")
+    flag_on = flag.strip().lower() in {"true", "1", "yes", "on"}
+
+    verdict = live_readiness_gate(
+        series,
+        min_days=min_days,
+        max_dd=max_dd,
+        min_sharpe=min_sharpe,
+        enable_flag=flag,
+    )
+    return {
+        "ready": verdict.ready,
+        "reasons": verdict.reasons,
+        "metrics": {
+            "paper_days": len(series),
+            "max_drawdown": verdict.metrics.get("max_drawdown"),
+            "sharpe": verdict.metrics.get("sharpe"),
+        },
+        "thresholds": {
+            "min_days": min_days,
+            "max_dd": max_dd,
+            "min_sharpe": min_sharpe,
+        },
+        "enable_live_trading": flag_on,
+    }
 
 
 # ---------------------------------------------------------------------------
