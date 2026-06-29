@@ -1,9 +1,14 @@
-"""Unit tests for the realized-performance stats engine.
+"""Unit tests for the performance / track-record engine.
 
-Every stat is exercised against a hand-computed fixture so the math is
-pinned, plus the fail-safe paths: empty store -> insufficient_data, all-wins
--> profit factor undefined, segmentation correctness, and exclusion of
-unsettled (return_eod is None) rows.
+Two clearly-separated sections are exercised against hand-computed fixtures:
+
+* **Section A — account performance** from a REAL equity series (known
+  drawdown / total return / Sharpe) plus FIFO-matched order-ledger round-trips
+  (known win rate / profit factor / expectancy; FIFO correctness; missing fill
+  prices -> insufficient_data, never fabricated).
+* **Section B — signal quality** from outcome rows (hit rate + real
+  segmentation by source / regime / confidence bucket / horizon, with a missing
+  field landing in an explicit ``"unknown"`` bucket, never collapsed/dropped).
 """
 from __future__ import annotations
 
@@ -12,8 +17,8 @@ import math
 from packages.cockpit import performance_stats as ps
 
 
-def _row(ret, *, ts="2026-05-01T12:00:00+00:00", mode=None, source=None,
-         strategy=None, regime="risk_on", symbol="AAPL"):
+def _row(ret, *, ts="2026-05-01T12:00:00+00:00", source=None, confidence=None,
+         regime="risk_on", symbol="AAPL", r2h=None, mode=None):
     row = {
         "pick_id": f"p-{ts}-{symbol}",
         "ts": ts,
@@ -21,12 +26,22 @@ def _row(ret, *, ts="2026-05-01T12:00:00+00:00", mode=None, source=None,
         "regime_at_pick": regime,
         "return_eod": ret,
     }
-    if mode is not None:
-        row["mode"] = mode
     if source is not None:
         row["source"] = source
-    if strategy is not None:
-        row["strategy"] = strategy
+    if confidence is not None:
+        row["confidence"] = confidence
+    if r2h is not None:
+        row["return_2h"] = r2h
+    if mode is not None:
+        row["mode"] = mode
+    return row
+
+
+def _trade(side, symbol, qty, price=None, ts="2026-05-01T12:00:00+00:00", **extra):
+    row = {"side": side, "symbol": symbol, "qty": qty, "run_ts": ts}
+    if price is not None:
+        row["fill_price"] = price
+    row.update(extra)
     return row
 
 
@@ -39,9 +54,8 @@ def test_win_rate_basic():
 
 
 def test_win_rate_excludes_scratches_and_empty():
-    # one win, one loss, one scratch -> decided = 2 -> 0.5
     assert ps.win_rate([0.02, -0.02, 0.0]) == 0.5
-    assert ps.win_rate([0.0, 0.0]) is None  # no decided trades
+    assert ps.win_rate([0.0, 0.0]) is None
     assert ps.win_rate([]) is None
 
 
@@ -54,14 +68,13 @@ def test_avg_win_and_loss():
 
 
 def test_profit_factor():
-    # gross profit 0.06, gross loss 0.04 -> 1.5
     assert ps.profit_factor([0.02, 0.04, -0.01, -0.03]) == 1.5
 
 
 def test_profit_factor_undefined_when_no_losses():
-    assert ps.profit_factor([0.02, 0.03]) is None  # all wins -> undefined
+    assert ps.profit_factor([0.02, 0.03]) is None
     assert ps.profit_factor([]) is None
-    assert ps.profit_factor([0.0]) is None  # no gross loss
+    assert ps.profit_factor([0.0]) is None
 
 
 def test_expectancy():
@@ -79,22 +92,16 @@ def test_equity_curve_compounds():
 
 
 def test_max_drawdown():
-    # 1.0 -> 1.1 -> 0.55 -> 0.66 ; worst dd from peak 1.1 to 0.55 = -0.5
     curve = ps.equity_curve([0.1, -0.5, 0.2])
     assert math.isclose(ps.max_drawdown(curve), -0.5)
-    assert ps.max_drawdown([1.0]) is None  # < 2 points
-    # monotonically rising -> no drawdown
+    assert ps.max_drawdown([1.0]) is None
     assert ps.max_drawdown(ps.equity_curve([0.1, 0.1])) == 0.0
 
 
 def test_sharpe_known_series():
-    rets = [0.01, -0.01, 0.01, -0.01]
-    mean = 0.0
-    # mean is 0 -> sharpe 0 (variance nonzero) -> 0.0, not None
-    assert ps.sharpe(rets) == 0.0
-    # constant series -> zero variance -> None
+    assert ps.sharpe([0.01, -0.01, 0.01, -0.01]) == 0.0
     assert ps.sharpe([0.01, 0.01]) is None
-    assert ps.sharpe([0.01]) is None  # < 2
+    assert ps.sharpe([0.01]) is None
 
 
 def test_sharpe_value():
@@ -111,104 +118,212 @@ def test_total_return():
     assert ps.total_return([1.0]) is None
 
 
-# --- compute_performance (the endpoint payload) ----------------------------
+# --- Section A: equity-series cleaning -------------------------------------
 
 
-def test_empty_store_is_insufficient_data():
-    rep = ps.compute_performance([])
-    assert rep["insufficient_data"] is True
-    o = rep["overall"]
-    assert o["total_trades"] == 0
-    assert o["win_rate"] is None
-    assert o["profit_factor"] is None
-    assert o["max_drawdown"] is None
-    assert o["sharpe"] is None
-    assert rep["equity_curve"] == []
-    assert rep["by_mode"] == {}
+def test_clean_equity_series_sorts_dedupes_and_drops_nonnumeric():
+    pts = [
+        {"t": "2026-05-03", "equity": 101.0},
+        {"t": "2026-05-01", "equity": 100.0},
+        {"t": "2026-05-02", "equity": "oops"},   # dropped
+        {"t": "2026-05-03", "equity": 101.5},    # same ts -> keep last
+    ]
+    out = ps.clean_equity_series(pts)
+    assert [p["t"] for p in out] == ["2026-05-01", "2026-05-03"]
+    assert out[-1]["equity"] == 101.5
 
 
-def test_unsettled_rows_excluded_but_counted():
+# --- Section A: account performance from REAL equity series ----------------
+
+
+def test_account_performance_real_drawdown_and_return():
+    pts = [
+        {"t": "2026-05-01", "equity": 100000.0},
+        {"t": "2026-05-02", "equity": 101000.0},
+        {"t": "2026-05-03", "equity": 99000.0},
+        {"t": "2026-05-04", "equity": 101500.0},
+    ]
+    acct = ps.account_performance(pts, [])
+    assert acct["insufficient_data"] is False
+    assert acct["starting_equity"] == 100000.0
+    assert acct["current_equity"] == 101500.0
+    assert acct["peak_equity"] == 101500.0
+    assert math.isclose(acct["total_return"], 0.015)
+    # worst dd is peak 101000 -> 99000 = -2000/101000 (NOT -100%)
+    assert math.isclose(acct["max_drawdown"], -2000.0 / 101000.0)
+    assert acct["max_drawdown"] > -0.05   # realistic, not the old -100% artifact
+    assert acct["sharpe"] is not None
+
+
+def test_account_performance_insufficient_with_one_point():
+    acct = ps.account_performance([{"t": "2026-05-01", "equity": 100000.0}], [])
+    assert acct["insufficient_data"] is True
+    assert acct["max_drawdown"] is None
+    assert acct["total_return"] is None
+    assert acct["sharpe"] is None
+
+
+# --- Section A: FIFO round-trip matching -----------------------------------
+
+
+def test_fifo_matches_buy_lots_to_sells():
+    trades = [
+        _trade("buy", "AAPL", 10, 100.0, ts="t1"),
+        _trade("buy", "AAPL", 10, 110.0, ts="t2"),
+        _trade("sell", "AAPL", 15, 120.0, ts="t3"),
+    ]
+    fifo = ps.fifo_round_trips(trades)
+    trips = fifo["round_trips"]
+    assert len(trips) == 2
+    # first sell-chunk closes the oldest lot (10 @ 100)
+    assert trips[0]["qty"] == 10 and trips[0]["entry_price"] == 100.0
+    assert math.isclose(trips[0]["pnl_dollars"], 200.0)
+    assert math.isclose(trips[0]["pnl_pct"], 0.2)
+    # remaining 5 close part of the 110 lot
+    assert trips[1]["qty"] == 5 and trips[1]["entry_price"] == 110.0
+    assert math.isclose(trips[1]["pnl_dollars"], 50.0)
+    assert math.isclose(fifo["open_lots"], 5.0)
+
+
+def test_realized_stats_win_rate_profit_factor_expectancy():
+    trades = [
+        _trade("buy", "AAPL", 10, 100.0, ts="t1"),
+        _trade("buy", "AAPL", 10, 110.0, ts="t2"),
+        _trade("sell", "AAPL", 15, 120.0, ts="t3"),   # +200, +50
+        _trade("buy", "MSFT", 10, 200.0, ts="t4"),
+        _trade("sell", "MSFT", 10, 190.0, ts="t5"),    # -100
+    ]
+    rz = ps.realized_trade_stats(ps.fifo_round_trips(trades))
+    assert rz["insufficient_data"] is False
+    assert rz["total_round_trips"] == 3
+    assert rz["wins"] == 2 and rz["losses"] == 1
+    assert math.isclose(rz["win_rate"], 2 / 3)
+    assert math.isclose(rz["gross_profit"], 250.0)
+    assert math.isclose(rz["gross_loss"], 100.0)
+    assert math.isclose(rz["profit_factor"], 2.5)
+    assert math.isclose(rz["expectancy"], (200 + 50 - 100) / 3)
+    assert math.isclose(rz["total_pnl_dollars"], 150.0)
+
+
+def test_realized_stats_insufficient_when_no_fill_prices():
+    trades = [
+        _trade("buy", "AAPL", 10, ts="t1"),   # no fill_price
+        _trade("sell", "AAPL", 10, ts="t2"),
+    ]
+    rz = ps.realized_trade_stats(ps.fifo_round_trips(trades))
+    assert rz["insufficient_data"] is True
+    assert rz["total_round_trips"] == 0
+    assert rz["unpriced_fills"] == 2
+    assert rz["note"] and "price" in rz["note"].lower()
+
+
+def test_realized_stats_insufficient_when_no_sells():
+    trades = [_trade("buy", "AAPL", 10, 100.0, ts="t1")]
+    rz = ps.realized_trade_stats(ps.fifo_round_trips(trades))
+    assert rz["insufficient_data"] is True
+    assert rz["open_lots"] == 10.0
+    assert rz["note"] is not None
+
+
+# --- Section B: signal quality / hit rate ----------------------------------
+
+
+def test_signal_quality_hit_rate_and_segmentation():
+    rows = [
+        _row(0.02, source="news", confidence=0.8, regime="risk_on", r2h=0.01),
+        _row(-0.01, source="news", confidence=0.2, regime="chop"),
+        _row(0.03, confidence=0.5, regime="risk_on"),   # no source -> unknown
+    ]
+    sq = ps.signal_quality(rows, horizon="eod")
+    assert sq["insufficient_data"] is False
+    assert sq["total_recorded"] == 3 and sq["total_settled"] == 3
+    assert math.isclose(sq["hit_rate"], 2 / 3)
+    # source segmentation keeps a real 'unknown' bucket (never collapsed)
+    assert set(sq["by_source"]) == {"news", "unknown"}
+    assert sq["by_source"]["news"]["n"] == 2
+    assert sq["by_source"]["unknown"]["n"] == 1
+    # confidence buckets are real (low/medium/high)
+    assert set(sq["by_confidence"]) == {"low (<0.34)", "medium (0.34-0.67)", "high (>=0.67)"}
+    # regime segmentation
+    assert set(sq["by_regime"]) == {"risk_on", "chop"}
+    assert sq["by_regime"]["risk_on"]["n"] == 2
+    # horizon breakdown: eod has 3, 2h has 1
+    assert sq["by_horizon"]["eod"]["n"] == 3
+    assert sq["by_horizon"]["2h"]["n"] == 1
+
+
+def test_signal_quality_missing_regime_and_confidence_go_to_unknown():
+    rows = [{"return_eod": 0.01}, {"return_eod": -0.02}]
+    sq = ps.signal_quality(rows)
+    assert set(sq["by_regime"]) == {"unknown"}
+    assert set(sq["by_confidence"]) == {"unknown"}
+    assert set(sq["by_source"]) == {"unknown"}
+
+
+def test_signal_quality_empty_is_insufficient():
+    sq = ps.signal_quality([])
+    assert sq["insufficient_data"] is True
+    assert sq["hit_rate"] is None
+    assert sq["by_source"] == {}
+
+
+def test_signal_quality_unsettled_rows_excluded():
     rows = [_row(0.02), _row(None), _row(-0.01)]
-    rep = ps.compute_performance(rows)
-    o = rep["overall"]
-    assert o["total_recorded"] == 3
-    assert o["total_trades"] == 2  # the None row is excluded from stats
-    assert o["wins"] == 1
-    assert o["losses"] == 1
+    sq = ps.signal_quality(rows)
+    assert sq["total_recorded"] == 3
+    assert sq["total_settled"] == 2
 
 
-def test_all_wins_profit_factor_undefined_in_report():
-    rep = ps.compute_performance([_row(0.02), _row(0.03)])
-    o = rep["overall"]
-    assert o["insufficient_data"] is False
-    assert o["profit_factor"] is None
-    assert o["win_rate"] == 1.0
-    assert o["losses"] == 0
+def test_signal_quality_is_never_compounded():
+    # 10k tiny negative signal rows must NOT drive a -100% "equity"; signal
+    # quality reports a hit rate, never an account equity field.
+    rows = [_row(-0.001, ts=f"2026-05-01T00:{i:02d}:00+00:00", symbol="X") for i in range(60)]
+    sq = ps.signal_quality(rows)
+    assert "equity" not in sq and "current_equity" not in sq
+    assert sq["hit_rate"] == 0.0  # all losers, but no -100% artifact
 
 
-def test_overall_metrics_match_hand_computation():
-    rows = [
-        _row(0.02, ts="2026-05-01T12:00:00+00:00"),
-        _row(-0.01, ts="2026-05-02T12:00:00+00:00"),
-        _row(0.03, ts="2026-05-03T12:00:00+00:00"),
-        _row(-0.02, ts="2026-05-04T12:00:00+00:00"),
+# --- Top-level report ------------------------------------------------------
+
+
+def test_compute_performance_combines_both_sections():
+    pts = [
+        {"t": "2026-05-01", "equity": 100000.0},
+        {"t": "2026-05-02", "equity": 101500.0},
     ]
-    o = ps.compute_performance(rows)["overall"]
-    assert o["total_trades"] == 4
-    assert o["win_rate"] == 0.5
-    assert o["avg_win"] == 0.025
-    assert o["avg_loss"] == -0.015
-    assert o["profit_factor"] == 0.05 / 0.03
-    assert math.isclose(o["expectancy"], 0.005)
-    # equity: 1.02, 1.0098, 1.040094, 1.01929212 -> dd from peak 1.040094
-    assert o["max_drawdown"] is not None and o["max_drawdown"] < 0
-    assert o["total_return"] is not None
-
-
-def test_equity_curve_ordered_by_ts():
-    # supplied out of order; engine must sort chronologically
-    rows = [
-        _row(0.03, ts="2026-05-03T12:00:00+00:00"),
-        _row(0.02, ts="2026-05-01T12:00:00+00:00"),
-        _row(-0.01, ts="2026-05-02T12:00:00+00:00"),
+    trades = [
+        _trade("buy", "AAPL", 10, 100.0, ts="t1"),
+        _trade("sell", "AAPL", 10, 110.0, ts="t2"),
     ]
-    curve = ps.compute_performance(rows)["equity_curve"]
-    # first point is the synthetic start, then ascending ts
-    ts_seq = [p["t"] for p in curve[1:]]
-    assert ts_seq == sorted(ts_seq)
-    assert curve[0]["equity"] == 1.0
+    rows = [_row(0.02, source="news"), _row(-0.01, source="scan")]
+    rep = ps.compute_performance(pts, trades, rows)
+    assert set(rep) == {"mode", "insufficient_data", "account", "signal_quality"}
+    assert rep["mode"] == "shadow"
+    assert rep["account"]["insufficient_data"] is False
+    assert math.isclose(rep["account"]["total_return"], 0.015)
+    assert rep["account"]["realized"]["total_round_trips"] == 1
+    assert rep["signal_quality"]["total_settled"] == 2
 
 
-def test_segmentation_by_mode_strategy_source_regime():
-    rows = [
-        _row(0.02, mode="shadow", strategy="ensemble", source="news", regime="risk_on"),
-        _row(-0.01, mode="shadow", strategy="ensemble", source="scan", regime="chop"),
-        _row(0.05, mode="paper", strategy="momentum", source="news", regime="risk_on"),
-    ]
-    rep = ps.compute_performance(rows)
-    assert set(rep["by_mode"]) == {"shadow", "paper"}
-    assert rep["by_mode"]["shadow"]["total_trades"] == 2
-    assert rep["by_mode"]["paper"]["total_trades"] == 1
-    assert set(rep["by_strategy"]) == {"ensemble", "momentum"}
-    assert set(rep["by_source"]) == {"news", "scan"}
-    assert rep["by_source"]["news"]["total_trades"] == 2
-    assert set(rep["by_regime"]) == {"risk_on", "chop"}
+def test_compute_performance_empty_is_failsafe():
+    rep = ps.compute_performance([], [], [])
+    assert rep["insufficient_data"] is True
+    assert rep["account"]["insufficient_data"] is True
+    assert rep["account"]["max_drawdown"] is None
+    assert rep["account"]["realized"]["insufficient_data"] is True
+    assert rep["signal_quality"]["insufficient_data"] is True
+    assert rep["mode"] == "shadow"
 
 
-def test_mode_defaults_to_shadow_when_absent():
-    rep = ps.compute_performance([_row(0.02), _row(-0.01)])
-    assert set(rep["by_mode"]) == {"shadow"}
-    assert rep["by_mode"]["shadow"]["total_trades"] == 2
+def test_compute_performance_detects_mode_but_never_live_by_accident():
+    rep = ps.compute_performance([], [], [_row(0.01, mode="paper"), _row(0.02, mode="paper")])
+    assert rep["mode"] == "paper"
+    rep2 = ps.compute_performance([], [], [_row(0.01)])
+    assert rep2["mode"] == "shadow"
 
 
-def test_source_segment_skips_rows_without_source():
-    # no source field on any row -> by_source empty (no fabricated buckets)
-    rep = ps.compute_performance([_row(0.02), _row(-0.01)])
-    assert rep["by_source"] == {}
-
-
-def test_deterministic_pure():
-    rows = [_row(0.02, strategy="ensemble"), _row(-0.01, strategy="ensemble")]
-    a = ps.compute_performance(rows)
-    b = ps.compute_performance(rows)
-    assert a == b
+def test_compute_performance_deterministic_pure():
+    pts = [{"t": "2026-05-01", "equity": 100.0}, {"t": "2026-05-02", "equity": 101.0}]
+    trades = [_trade("buy", "AAPL", 1, 100.0, ts="t1"), _trade("sell", "AAPL", 1, 101.0, ts="t2")]
+    rows = [_row(0.02, source="news")]
+    assert ps.compute_performance(pts, trades, rows) == ps.compute_performance(pts, trades, rows)
