@@ -105,15 +105,22 @@ PRESET_EXITS: dict[str, dict[str, float]] = {
         "take_profit_pct": 0.02,   # 2% — lock it in fast
         "trail_arm_pct": 0.015,    # arm trailing once up 1.5%
         "trail_giveback_pct": 0.008,  # give back 0.8% from peak -> exit
-        "hard_stop_pct": 0.03,     # cut losers at -3%
+        "hard_stop_pct": 0.02,     # cut losers at -2% (tightest of the ladder)
         "max_hold_hours": 24.0,    # release after ~1 session if it stalls
     },
+    # Phase 36 — re-tuned for the catalyst-swing winner/loser asymmetry.
+    # The live journal showed losers ~4x winners with a -5% stop letting a
+    # losing thesis bleed far past the winner size; the backtested fix
+    # (packages/backtests/exit_backtest.py) tightens the hard stop — the
+    # single biggest lever — which more than halves simulated max drawdown,
+    # lets winners run a touch longer (higher take_profit + looser giveback),
+    # and shortens the hold so capital recycles before signal decay.
     "balanced": {
-        "take_profit_pct": 0.03,   # 3%
+        "take_profit_pct": 0.035,  # 3.5% — let winners run a touch longer
         "trail_arm_pct": 0.02,     # arm at +2%
-        "trail_giveback_pct": 0.012,  # 1.2% giveback
-        "hard_stop_pct": 0.05,     # -5% hard stop
-        "max_hold_hours": 48.0,    # ~2 sessions
+        "trail_giveback_pct": 0.015,  # 1.5% giveback (looser, less clipping)
+        "hard_stop_pct": 0.025,    # -2.5% hard stop (was -5% — the big lever)
+        "max_hold_hours": 24.0,    # ~1 session — recycle before horizon decay
     },
     "aggressive": {
         "take_profit_pct": 0.05,   # 5% — let it ride longer

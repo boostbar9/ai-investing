@@ -46,11 +46,23 @@ def _th(
 
 
 def test_current_thresholds_defaults_to_balanced(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("POLICY_SIZING_PRESET", raising=False)
-    monkeypatch.delenv("POLICY_TAKE_PROFIT_PCT", raising=False)
+    for var in (
+        "POLICY_SIZING_PRESET",
+        "POLICY_TAKE_PROFIT_PCT",
+        "POLICY_TRAIL_ARM_PCT",
+        "POLICY_TRAIL_GIVEBACK_PCT",
+        "POLICY_HARD_STOP_PCT",
+        "POLICY_MAX_HOLD_HOURS",
+    ):
+        monkeypatch.delenv(var, raising=False)
     th = exit_rules.current_thresholds()
     assert th.preset == "balanced"
-    assert th.take_profit_pct == 0.03
+    # Phase 36 re-tuned balanced defaults.
+    assert th.take_profit_pct == 0.035
+    assert th.trail_arm_pct == 0.02
+    assert th.trail_giveback_pct == 0.015
+    assert th.hard_stop_pct == 0.025
+    assert th.max_hold_hours == 24.0
 
 
 def test_current_thresholds_respects_preset(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -67,6 +79,30 @@ def test_current_thresholds_env_override_beats_preset(
     monkeypatch.setenv("POLICY_TAKE_PROFIT_PCT", "0.075")
     th = exit_rules.current_thresholds()
     assert th.take_profit_pct == 0.075
+
+
+def test_env_override_beats_new_hard_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit POLICY_HARD_STOP_PCT must still win over the tighter default."""
+    monkeypatch.setenv("POLICY_SIZING_PRESET", "balanced")
+    monkeypatch.setenv("POLICY_HARD_STOP_PCT", "0.06")
+    th = exit_rules.current_thresholds()
+    assert th.hard_stop_pct == 0.06
+
+
+def test_preset_hard_stop_ladder_is_coherent() -> None:
+    """conservative cuts at least as tight as balanced, which is tighter than
+    aggressive. Tightening balanced must not break that ordering."""
+    presets = exit_rules.PRESET_EXITS
+    assert (
+        presets["conservative"]["hard_stop_pct"]
+        <= presets["balanced"]["hard_stop_pct"]
+        <= presets["aggressive"]["hard_stop_pct"]
+    )
+    assert (
+        presets["conservative"]["max_hold_hours"]
+        <= presets["balanced"]["max_hold_hours"]
+        <= presets["aggressive"]["max_hold_hours"]
+    )
 
 
 def test_unknown_preset_falls_back_to_balanced(monkeypatch: pytest.MonkeyPatch) -> None:
