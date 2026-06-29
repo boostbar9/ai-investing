@@ -349,6 +349,10 @@ async def get_fundamentals(
         _fetch,
         is_empty=lambda v: not v,
         fallback=fallback,
+        # An illiquid name with no fundamentals row is a SUCCESSFUL but empty
+        # response, not a failure: record success-but-empty and fall back
+        # quietly. Only a raised RH error marks rh_fundamentals down.
+        empty_is_success=True,
     )
 
 
@@ -368,6 +372,10 @@ async def get_earnings(
         _fetch,
         is_empty=lambda v: not v,
         fallback=fallback,
+        # A symbol with no upcoming earnings is a SUCCESSFUL but empty response,
+        # not a failure: record success-but-empty and fall back quietly. Only a
+        # raised RH error marks rh_earnings down.
+        empty_is_success=True,
     )
 
 
@@ -393,6 +401,10 @@ async def get_earnings_results(
         _fetch,
         is_empty=lambda v: not v,
         fallback=fallback,
+        # A symbol with no trailing earnings results is a SUCCESSFUL but empty
+        # response, not a failure: record success-but-empty and fall back
+        # quietly. Only a raised RH error marks rh_earnings down.
+        empty_is_success=True,
     )
 
 

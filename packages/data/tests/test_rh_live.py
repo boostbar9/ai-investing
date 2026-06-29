@@ -46,6 +46,12 @@ class FakeBroker:
         self.calls.append("earnings_calendar")
         return self._overrides.get("earnings", [{"symbol": "AAPL", "date": "2026-07-01"}])
 
+    async def earnings_results(self, symbol):
+        self.calls.append("earnings_results")
+        return self._overrides.get(
+            "earnings_results", [{"symbol": symbol, "eps_actual": 1.2}]
+        )
+
     async def indexes(self):
         self.calls.append("indexes")
         return self._overrides.get(
@@ -111,6 +117,91 @@ async def test_fundamentals_rh_primary():
     res = await rh_live.get_fundamentals("AAPL")
     assert res.ok and res.source == rh_live.SRC_FUNDAMENTALS
     assert res.value["pe_ratio"] == 20.0
+
+
+# ---------------------------------------------------------------------------
+# rh_fundamentals / rh_earnings: empty-but-reachable is SUCCESS, raised=failure
+# ---------------------------------------------------------------------------
+async def test_fundamentals_empty_is_success_not_failure():
+    # An illiquid name with no fundamentals row is a SUCCESSFUL-but-empty
+    # response: record a health SUCCESS, fall back quietly, NEVER a failure.
+    rh_live.set_broker_for_test(FakeBroker(fundamentals=None))
+    fb = await _fallback_factory({"symbol": "AAPL", "pe_ratio": 9.0}, "yfinance")
+    res = await rh_live.get_fundamentals("AAPL", fallback=fb)
+    assert res.ok is True and res.source == "yfinance"
+    snap = rh_live.get_registry().snapshot(rh_live.SRC_FUNDAMENTALS)
+    assert snap["consecutive_failures"] == 0
+    assert snap["total_successes"] >= 1
+    assert snap["status"] != "down"
+
+
+async def test_fundamentals_real_error_records_failure():
+    class Boom(FakeBroker):
+        async def equity_fundamentals(self, symbol):
+            raise RuntimeError("rh fundamentals down")
+
+    rh_live.set_broker_for_test(Boom())
+    fb = await _fallback_factory({"pe_ratio": 8.0}, "yfinance")
+    res = await rh_live.get_fundamentals("AAPL", fallback=fb)
+    assert res.source == "yfinance"  # fail safe, never fabricated
+    snap = rh_live.get_registry().snapshot(rh_live.SRC_FUNDAMENTALS)
+    assert snap["consecutive_failures"] >= 1  # a genuine error IS a failure
+
+
+async def test_earnings_empty_is_success_not_failure():
+    # A symbol with no upcoming earnings is a SUCCESSFUL-but-empty response.
+    rh_live.set_broker_for_test(FakeBroker(earnings=[]))
+    fb = await _fallback_factory([{"symbol": "AAPL"}], "yfinance")
+    res = await rh_live.get_earnings("AAPL", fallback=fb)
+    assert res.ok is True and res.source == "yfinance"
+    snap = rh_live.get_registry().snapshot(rh_live.SRC_EARNINGS)
+    assert snap["consecutive_failures"] == 0
+    assert snap["total_successes"] >= 1
+    assert snap["status"] != "down"
+
+
+async def test_earnings_real_error_records_failure():
+    class Boom(FakeBroker):
+        async def earnings_calendar(self, symbol=None):
+            raise RuntimeError("rh earnings down")
+
+    rh_live.set_broker_for_test(Boom())
+    fb = await _fallback_factory([{"symbol": "AAPL"}], "yfinance")
+    res = await rh_live.get_earnings("AAPL", fallback=fb)
+    assert res.source == "yfinance"
+    snap = rh_live.get_registry().snapshot(rh_live.SRC_EARNINGS)
+    assert snap["consecutive_failures"] >= 1
+
+
+async def test_earnings_results_empty_is_success_not_failure():
+    rh_live.set_broker_for_test(FakeBroker(earnings_results=[]))
+    fb = await _fallback_factory([{"eps_actual": 1.0}], "yfinance")
+    res = await rh_live.get_earnings_results("AAPL", fallback=fb)
+    assert res.ok is True and res.source == "yfinance"
+    snap = rh_live.get_registry().snapshot(rh_live.SRC_EARNINGS)
+    assert snap["consecutive_failures"] == 0
+    assert snap["total_successes"] >= 1
+    assert snap["status"] != "down"
+
+
+async def test_earnings_results_rh_primary():
+    rh_live.set_broker_for_test(FakeBroker())
+    res = await rh_live.get_earnings_results("AAPL")
+    assert res.ok and res.source == rh_live.SRC_EARNINGS
+    assert res.value[0]["eps_actual"] == 1.2
+
+
+async def test_earnings_results_real_error_records_failure():
+    class Boom(FakeBroker):
+        async def earnings_results(self, symbol):
+            raise RuntimeError("rh earnings results down")
+
+    rh_live.set_broker_for_test(Boom())
+    fb = await _fallback_factory([{"eps_actual": 1.0}], "yfinance")
+    res = await rh_live.get_earnings_results("AAPL", fallback=fb)
+    assert res.source == "yfinance"
+    snap = rh_live.get_registry().snapshot(rh_live.SRC_EARNINGS)
+    assert snap["consecutive_failures"] >= 1
 
 
 # ---------------------------------------------------------------------------

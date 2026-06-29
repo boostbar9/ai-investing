@@ -997,8 +997,11 @@ class RobinhoodAgenticBroker(Broker):
             return None
         try:
             client = await self._client()
+            # get_equity_fundamentals takes a ``symbols`` array but NO account
+            # arg; injecting account_number makes the live server return empty
+            # (same lesson as get_indexes). Call it bare.
             res = await client.call_tool(
-                "get_equity_fundamentals", self._acct_args({"symbols": [sym]})
+                "get_equity_fundamentals", {"symbols": [sym]}
             )
         except (BrokerError, McpError) as exc:
             logger.warning(
@@ -1031,9 +1034,9 @@ class RobinhoodAgenticBroker(Broker):
             args["symbols"] = [sym]
         try:
             client = await self._client()
-            res = await client.call_tool(
-                "get_earnings_calendar", self._acct_args(args)
-            )
+            # Market-data tool: NO account arg (injecting one makes the live
+            # server return empty, same as get_indexes). Call it bare.
+            res = await client.call_tool("get_earnings_calendar", args)
         except (BrokerError, McpError) as exc:
             logger.warning(
                 "robinhood earnings calendar failed: %s", exc.__class__.__name__
@@ -1056,8 +1059,11 @@ class RobinhoodAgenticBroker(Broker):
             return []
         try:
             client = await self._client()
+            # Schema requires a singular ``symbol`` string (NOT a ``symbols``
+            # array) and takes NO account arg; injecting either makes the live
+            # server return empty.
             res = await client.call_tool(
-                "get_earnings_results", self._acct_args({"symbols": [sym]})
+                "get_earnings_results", {"symbol": sym}
             )
         except (BrokerError, McpError) as exc:
             logger.warning(

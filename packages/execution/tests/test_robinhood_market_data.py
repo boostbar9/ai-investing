@@ -109,6 +109,19 @@ async def test_equity_fundamentals_matches_symbol():
     assert row["pe_ratio"] == 30.0
 
 
+async def test_equity_fundamentals_no_account_arg():
+    # Market-data tool: a ``symbols`` array but NO account_number (injecting
+    # one makes the live server return empty, same lesson as get_indexes).
+    fake = FakeMcp(
+        {"get_equity_fundamentals": _envelope({"fundamentals": [{"symbol": "AAPL"}]})}
+    )
+    await _broker(fake).equity_fundamentals("AAPL")
+    name, args = fake.calls[0]
+    assert name == "get_equity_fundamentals"
+    assert "account_number" not in args
+    assert args == {"symbols": ["AAPL"]}
+
+
 async def test_equity_fundamentals_failsafe_none():
     fake = FakeMcp(error=McpError("boom"))
     assert await _broker(fake).equity_fundamentals("AAPL") is None
@@ -125,6 +138,19 @@ async def test_earnings_calendar_no_symbol():
     assert rows == [{"symbol": "MSFT"}]
     _, args = fake.calls[0]
     assert "symbols" not in args  # no-arg form
+    assert "account_number" not in args  # market-data tool: bare call
+    assert args == {}
+
+
+async def test_earnings_calendar_with_symbol_no_account_arg():
+    fake = FakeMcp(
+        {"get_earnings_calendar": _envelope({"earnings": [{"symbol": "AAPL"}]})}
+    )
+    await _broker(fake).earnings_calendar("AAPL")
+    name, args = fake.calls[0]
+    assert name == "get_earnings_calendar"
+    assert "account_number" not in args
+    assert args == {"symbols": ["AAPL"]}
 
 
 async def test_earnings_results_per_symbol():
@@ -133,6 +159,22 @@ async def test_earnings_results_per_symbol():
     )
     rows = await _broker(fake).earnings_results("AAPL")
     assert rows == [{"eps_actual": 1.2}]
+
+
+async def test_earnings_results_uses_singular_symbol_no_account_arg():
+    # Schema requires {"symbol": "<one string>"} (NOT a "symbols" array) and
+    # takes NO account arg; either wrong shape makes the live server return
+    # empty.
+    fake = FakeMcp(
+        {"get_earnings_results": _envelope({"results": [{"eps_actual": 1.2}]})}
+    )
+    await _broker(fake).earnings_results("AAPL")
+    name, args = fake.calls[0]
+    assert name == "get_earnings_results"
+    assert "symbols" not in args
+    assert "account_number" not in args
+    assert args == {"symbol": "AAPL"}
+    assert isinstance(args["symbol"], str)
 
 
 # ---------------------------------------------------------------------------
