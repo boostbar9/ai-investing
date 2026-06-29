@@ -4646,6 +4646,43 @@ async def _autonomy_startup() -> None:  # pragma: no cover
             return None
         return sel.broker
 
+    async def _exit_thesis_signals(symbols: list[str]) -> dict[str, dict[str, Any]]:
+        """READ-ONLY RH fundamentals → {SYMBOL: thesis-state signal}.
+
+        The only invalidation key we surface today is the Nasdaq compliance
+        status (delisting / Noncompliant), reusing the audited helper from
+        research_sweep. Never raises and never fabricates: any failure, an
+        RH-off environment, or a symbol that simply doesn't resolve is just
+        omitted from the map, so exit_rules treats it as 'no signal' and
+        holds. A dead feed is never bearish.
+        """
+        out: dict[str, dict[str, Any]] = {}
+        if not symbols:
+            return out
+        try:
+            from packages.agents.research_sweep import _compliance_ok
+            from packages.data import rh_live
+        except Exception:
+            return out
+        for sym in symbols:
+            try:
+                res = await rh_live.get_fundamentals(sym)
+            except Exception:
+                continue
+            if not (getattr(res, "ok", False) and isinstance(
+                getattr(res, "value", None), dict
+            ) and res.value):
+                continue
+            try:
+                ok, status = _compliance_ok(res.value)
+            except Exception:
+                continue
+            out[sym.upper()] = {
+                "compliance_ok": ok,
+                "compliance_status": status,
+            }
+        return out
+
     async def _phase25_exit_rules_tick() -> dict[str, Any]:
         from packages.cockpit.web.dip_watch import arm as dip_arm
         from packages.cockpit.web.exit_rules import run_tick as exit_run_tick
@@ -4662,9 +4699,11 @@ async def _autonomy_startup() -> None:  # pragma: no cover
 
             # Capture qty from positions so dip_watch can re-arm same size.
             qty_map: dict[str, float] = {}
+            held_symbols: list[str] = []
             try:
                 for p in await broker.positions():
                     qty_map[p.symbol] = abs(float(p.qty))
+                    held_symbols.append(p.symbol)
             except Exception:
                 pass
 
@@ -4676,10 +4715,20 @@ async def _autonomy_startup() -> None:  # pragma: no cover
                     qty=qty_map.get(symbol, 1.0),
                 )
 
+            # Thesis-invalidation signal — READ-ONLY RH fundamentals compliance
+            # status for each held symbol. Pre-fetched once per tick and looked
+            # up synchronously by exit_rules. Entirely fail-safe: any failure /
+            # RH-off yields an empty map → no symbol is ever invalidated.
+            thesis_signals = await _exit_thesis_signals(held_symbols)
+            thesis_getter = (
+                (lambda sym: thesis_signals.get(sym)) if thesis_signals else None
+            )
+
             r = await exit_run_tick(
                 positions_getter=broker.positions,
                 submit_sell=_submit_sell,
                 on_profit_taken=_on_profit,
+                thesis_getter=thesis_getter,
             )
             return {
                 "evaluated": r.evaluated,

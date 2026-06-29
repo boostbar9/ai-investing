@@ -41,7 +41,7 @@ import contextlib
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -69,6 +69,12 @@ EXIT_PEAKS_PATH = DATA_DIR / "exit_peaks.json"
 # exit this session so we don't keep slicing the position. Cleared on
 # session rollover and when a position fully closes.
 EXIT_SCALEOUT_PATH = DATA_DIR / "exit_scaleout.json"
+# Phase 1 (exit-engine completion) — first-seen entry timestamp per open
+# symbol, used by the max-hold-time exit. UNLIKE the peak/scale-out stores
+# this is NOT session-scoped: a swing position can legitimately span
+# several sessions and we must remember when we first saw it. Pruned only
+# when the position closes.
+EXIT_ENTRIES_PATH = DATA_DIR / "exit_entries.json"
 
 # Phase 35 — default fraction of position sold at scale-out trigger.
 SCALE_OUT_FRACTION: float = 0.5
@@ -82,6 +88,10 @@ MAX_AUDIT_ROWS = 5000
 
 # Each preset's (take_profit_pct, trail_arm_pct, trail_giveback_pct, hard_stop_pct).
 # Numbers are fractions, not percents — 0.03 means 3%.
+#
+# ``max_hold_hours`` (Phase 1 exit-engine completion) is the wall-clock age
+# at which a position that NEVER hit take-profit/stop is released so capital
+# recycles. 0 == disabled (fail safe — never force-sell on uncertainty).
 PRESET_EXITS: dict[str, dict[str, float]] = {
     "off": {
         # No exit rules. Strategy-level stops still apply.
@@ -89,24 +99,28 @@ PRESET_EXITS: dict[str, dict[str, float]] = {
         "trail_arm_pct": 0.0,
         "trail_giveback_pct": 0.0,
         "hard_stop_pct": 0.0,
+        "max_hold_hours": 0.0,
     },
     "conservative": {
         "take_profit_pct": 0.02,   # 2% — lock it in fast
         "trail_arm_pct": 0.015,    # arm trailing once up 1.5%
         "trail_giveback_pct": 0.008,  # give back 0.8% from peak -> exit
         "hard_stop_pct": 0.03,     # cut losers at -3%
+        "max_hold_hours": 24.0,    # release after ~1 session if it stalls
     },
     "balanced": {
         "take_profit_pct": 0.03,   # 3%
         "trail_arm_pct": 0.02,     # arm at +2%
         "trail_giveback_pct": 0.012,  # 1.2% giveback
         "hard_stop_pct": 0.05,     # -5% hard stop
+        "max_hold_hours": 48.0,    # ~2 sessions
     },
     "aggressive": {
         "take_profit_pct": 0.05,   # 5% — let it ride longer
         "trail_arm_pct": 0.03,     # arm at +3%
         "trail_giveback_pct": 0.02,  # 2% giveback
         "hard_stop_pct": 0.07,     # -7% hard stop
+        "max_hold_hours": 96.0,    # let a swing thesis breathe ~4 sessions
     },
 }
 
@@ -118,6 +132,8 @@ class ExitThresholds:
     trail_giveback_pct: float
     hard_stop_pct: float
     preset: str
+    # Phase 1 exit-engine completion — max-hold horizon in hours. 0 == off.
+    max_hold_hours: float = 0.0
 
     def is_off(self) -> bool:
         return self.take_profit_pct == 0.0 and self.hard_stop_pct == 0.0
@@ -140,6 +156,10 @@ def current_thresholds() -> ExitThresholds:
     if preset not in PRESET_EXITS:
         preset = "balanced"
     base = PRESET_EXITS[preset]
+    # Max-hold uses an explicit None-check (not ``or``) so an operator can set
+    # POLICY_MAX_HOLD_HOURS=0 to DISABLE the exit rather than fall back to the
+    # preset default.
+    max_hold_override = _env_float("POLICY_MAX_HOLD_HOURS")
     return ExitThresholds(
         take_profit_pct=_env_float("POLICY_TAKE_PROFIT_PCT") or base["take_profit_pct"],
         trail_arm_pct=_env_float("POLICY_TRAIL_ARM_PCT") or base["trail_arm_pct"],
@@ -147,6 +167,11 @@ def current_thresholds() -> ExitThresholds:
         or base["trail_giveback_pct"],
         hard_stop_pct=_env_float("POLICY_HARD_STOP_PCT") or base["hard_stop_pct"],
         preset=preset,
+        max_hold_hours=(
+            max_hold_override
+            if max_hold_override is not None
+            else base.get("max_hold_hours", 0.0)
+        ),
     )
 
 
@@ -411,6 +436,168 @@ SCALED_OUT = _ScaleOutStore()
 
 
 # ---------------------------------------------------------------------------
+# Phase 1 exit-engine completion — entry-time tracking (max-hold exit)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _EntryStore:
+    """First-seen entry timestamp (ISO-UTC) per open symbol.
+
+    The broker position object carries no entry time, so we stamp one the
+    first time a symbol shows up in a tick and keep it until the position
+    closes. Atomic temp+rename flush mirrors ``_PeakStore``.
+
+    Deliberately **NOT session-scoped**: a swing/catalyst position can span
+    multiple sessions and the max-hold clock must measure true wall-clock
+    age, not reset at the ET roll-over.
+    """
+
+    path: Path = EXIT_ENTRIES_PATH
+    _cache: dict[str, str] = field(default_factory=dict)
+    _loaded: bool = False
+
+    def _ensure(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        if self.path.exists():
+            try:
+                with self.path.open("r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+                if isinstance(data, dict):
+                    self._cache = {
+                        str(k): str(v)
+                        for k, v in data.items()
+                        if isinstance(v, str)
+                    }
+            except (OSError, ValueError, json.JSONDecodeError):
+                self._cache = {}
+
+    def touch(self, symbol: str, now: datetime | None = None) -> str:
+        """Record entry time on first sight; return the stored timestamp."""
+        self._ensure()
+        existing = self._cache.get(symbol)
+        if existing is not None:
+            return existing
+        ts = (now or datetime.now(UTC)).astimezone(UTC).isoformat(
+            timespec="seconds"
+        )
+        self._cache[symbol] = ts
+        self._flush()
+        return ts
+
+    def get(self, symbol: str) -> str | None:
+        self._ensure()
+        return self._cache.get(symbol)
+
+    def forget(self, symbol: str) -> None:
+        self._ensure()
+        if symbol in self._cache:
+            del self._cache[symbol]
+            self._flush()
+
+    def prune(self, keep_symbols: set[str]) -> None:
+        self._ensure()
+        before = set(self._cache.keys())
+        for sym in before - keep_symbols:
+            del self._cache[sym]
+        if before != set(self._cache.keys()):
+            self._flush()
+
+    def snapshot(self) -> dict[str, str]:
+        self._ensure()
+        return dict(self._cache)
+
+    def reset(self) -> None:
+        """Clear in-memory + on-disk state. For tests / position wipe."""
+        self._loaded = True
+        self._cache = {}
+        self._flush()
+
+    def _flush(self) -> None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(dict(self._cache), f)
+            tmp.replace(self.path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                if tmp.exists():
+                    tmp.unlink()
+
+
+ENTRIES = _EntryStore()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 exit-engine completion — thesis-invalidation check (pure)
+# ---------------------------------------------------------------------------
+
+
+def _thesis_invalidation_reason(signal: Any) -> str | None:
+    """Return a ``thesis_invalidated:<detail>`` reason, or ``None``.
+
+    Conservative + deterministic + fail-safe. ``signal`` is whatever the
+    caller attached to the position (a dict) describing the live state of
+    the entry thesis. Rules, in priority order:
+
+    1. **Stale / missing** — ``signal`` is falsy, not a dict, or carries
+       ``stale=True`` → ``None`` (NEVER invalidate on absent data; a dead
+       feed is not bearish).
+    2. **Hard fundamentals red flag** — ``compliance_ok`` is *explicitly*
+       ``False`` (a real RH read returned a Noncompliant/delisting status).
+       A missing ``compliance_ok`` key is treated as unknown → no flag.
+    3. **Catalyst/news decay** — both ``catalyst_score`` and
+       ``catalyst_floor`` present as numbers AND score < floor.
+    """
+    if not signal or not isinstance(signal, dict):
+        return None
+    if signal.get("stale") is True:
+        return None
+
+    # 2. Hard fundamentals red flag (delisting / Nasdaq noncompliance).
+    if signal.get("compliance_ok") is False:
+        status = str(signal.get("compliance_status") or "noncompliant").strip()
+        # Keep the reason string compact + log-safe.
+        status = status.replace("\n", " ")[:60] or "noncompliant"
+        return f"thesis_invalidated:compliance:{status}"
+
+    # 3. Catalyst/news decay — only when both numbers are present.
+    score = signal.get("catalyst_score")
+    floor = signal.get("catalyst_floor")
+    score_ok = isinstance(score, (int, float)) and not isinstance(score, bool)
+    floor_ok = isinstance(floor, (int, float)) and not isinstance(floor, bool)
+    if score_ok and floor_ok and float(score) < float(floor):
+        return "thesis_invalidated:catalyst_decay"
+
+    return None
+
+
+def _max_hold_exceeded(
+    entry_ts: str | None,
+    max_hold_hours: float,
+    now: datetime | None = None,
+) -> bool:
+    """True iff the position is older than ``max_hold_hours``.
+
+    Fail safe: a missing/unparseable entry timestamp or a non-positive
+    horizon never triggers an exit.
+    """
+    if not entry_ts or max_hold_hours <= 0:
+        return False
+    try:
+        entered = datetime.fromisoformat(entry_ts)
+    except (TypeError, ValueError):
+        return False
+    if entered.tzinfo is None:
+        entered = entered.replace(tzinfo=UTC)
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    return (current - entered) >= timedelta(hours=max_hold_hours)
+
+
+# ---------------------------------------------------------------------------
 # Decision logic — pure, easy to test
 # ---------------------------------------------------------------------------
 
@@ -422,7 +609,9 @@ class ExitDecision:
     # Phase 35: "scale_out" added — sell only ``qty_fraction`` of the
     # position, leave the rest to ride the trail. Locks in real money
     # at the arm threshold without giving up upside.
-    reason: str  # "take_profit" | "trailing_stop" | "hard_stop" | "scale_out" | "hold"
+    # "take_profit" | "trailing_stop" | "hard_stop" | "scale_out"
+    # | "max_hold" | "thesis_invalidated:<detail>" | "hold"
+    reason: str
     pnl_pct: float
     peak_pct: float
     threshold: float
@@ -437,6 +626,9 @@ def evaluate_position(
     peaks: _PeakStore | None = None,
     *,
     already_scaled_out: bool = False,
+    entry_ts: str | None = None,
+    thesis_signal: Any = None,
+    now: datetime | None = None,
 ) -> ExitDecision:
     """Pure decision function: should we sell this position right now?
 
@@ -447,6 +639,12 @@ def evaluate_position(
     its Phase 35 partial exit so we don't keep slicing the position.
     The caller is responsible for tracking that flag (see
     ``_ScaleOutStore`` / ``run_tick``).
+
+    ``entry_ts`` (ISO-UTC) + ``now`` drive the max-hold exit; ``None`` /
+    a non-positive ``max_hold_hours`` simply disables it (fail safe).
+    ``thesis_signal`` is an optional dict describing the live state of the
+    entry thesis; see ``_thesis_invalidation_reason`` for the rules. Both
+    new exits NEVER fire on missing/stale data.
     """
     if thresholds.is_off():
         return ExitDecision(symbol, "hold", "rules_off", pnl_pct, pnl_pct, 0.0)
@@ -469,6 +667,13 @@ def evaluate_position(
         return ExitDecision(
             symbol, "sell", "take_profit", pnl_pct, peak, thresholds.take_profit_pct
         )
+
+    # 2b. Thesis-invalidation — a clear, deterministic red flag (e.g. RH
+    # financial_status going Noncompliant/delisting, or catalyst decay).
+    # Conservative + fail safe: missing/stale data never invalidates.
+    thesis_reason = _thesis_invalidation_reason(thesis_signal)
+    if thesis_reason is not None:
+        return ExitDecision(symbol, "sell", thesis_reason, pnl_pct, peak, 0.0)
 
     # 3. Trailing stop — only armed if peak ever crossed trail_arm_pct.
     if thresholds.trail_arm_pct > 0 and peak >= thresholds.trail_arm_pct:
@@ -510,6 +715,14 @@ def evaluate_position(
                 thresholds.trail_arm_pct,
                 qty_fraction=SCALE_OUT_FRACTION,
             )
+
+    # 5. Max-hold — last-resort release for a position that never hit
+    # take-profit/stop and whose thesis hasn't been invalidated. Checked
+    # last so a winner/loser is always attributed to its price rule first.
+    if _max_hold_exceeded(entry_ts, thresholds.max_hold_hours, now):
+        return ExitDecision(
+            symbol, "sell", "max_hold", pnl_pct, peak, thresholds.max_hold_hours
+        )
 
     return ExitDecision(symbol, "hold", "hold", pnl_pct, peak, 0.0)
 
@@ -591,8 +804,11 @@ def _push_chatter(decision: ExitDecision, *, executed: bool) -> None:
         "trailing_stop": "trailing-stop",
         "hard_stop": "hard-stop",
         "scale_out": "scale-out partial",
+        "max_hold": "max-hold",
     }
     label = reason_labels.get(decision.reason, decision.reason)
+    if decision.reason.startswith("thesis_invalidated"):
+        label = "thesis-invalidation"
     pnl_str = f"{decision.pnl_pct * 100:+.2f}%"
     if executed:
         if decision.reason == "scale_out":
@@ -641,6 +857,8 @@ async def run_tick(
     submit_sell: Any | None = None,  # async (symbol, qty) -> ack-like
     on_profit_taken: Any | None = None,  # (symbol, exit_price, pnl_pct) -> None
     thresholds: ExitThresholds | None = None,
+    thesis_getter: Any | None = None,  # (symbol) -> dict | None (sync, fail-safe)
+    now: datetime | None = None,
 ) -> TickResult:
     """Evaluate every open position and act on triggers.
 
@@ -651,6 +869,12 @@ async def run_tick(
 
     ``on_profit_taken`` is an optional callback fired after a successful
     *profitable* sell — used by dip_watch to arm a buy-back.
+
+    ``thesis_getter(symbol) -> dict | None`` (sync) supplies the live
+    thesis-state signal for the thesis-invalidation exit. ``None`` (the
+    default) disables that exit entirely. Any exception it raises is
+    swallowed and treated as 'signal unavailable' → no invalidation
+    (fail safe — a dead feed is never bearish).
     """
     result = TickResult()
     th = thresholds or current_thresholds()
@@ -699,9 +923,29 @@ async def run_tick(
         live_symbols.add(symbol)
         result.evaluated += 1
 
+        # Stamp first-seen entry time (persisted across sessions) so the
+        # max-hold clock has a reference. Idempotent per symbol.
+        entry_ts = ENTRIES.touch(symbol, now)
+
+        # Resolve the thesis signal (fail-safe): any error => None.
+        thesis_signal: Any = None
+        if thesis_getter is not None:
+            try:
+                thesis_signal = thesis_getter(symbol)
+            except Exception as exc:
+                result.errors.append(f"{symbol} thesis signal failed: {exc}")
+                thesis_signal = None
+
         already_partial = SCALED_OUT.contains(symbol)
         decision = evaluate_position(
-            symbol, pnl_pct, th, peaks=PEAKS, already_scaled_out=already_partial
+            symbol,
+            pnl_pct,
+            th,
+            peaks=PEAKS,
+            already_scaled_out=already_partial,
+            entry_ts=entry_ts,
+            thesis_signal=thesis_signal,
+            now=now,
         )
         result.decisions.append(decision)
 
@@ -756,9 +1000,10 @@ async def run_tick(
                     # scale-out as done so we don't keep slicing.
                     SCALED_OUT.add(symbol)
                 else:
-                    # Full exit — wipe peak + any scale-out marker.
+                    # Full exit — wipe peak + scale-out + entry markers.
                     PEAKS.forget(symbol)
                     SCALED_OUT.forget(symbol)
+                    ENTRIES.forget(symbol)
                 # Notify dip_watch (optional callback). Scale-out counts
                 # as a profitable exit — the dip-watch buy-back hook
                 # should arm on partial wins too.
@@ -781,9 +1026,10 @@ async def run_tick(
         record_audit(decision, executed=executed, broker_msg=broker_msg)
         _push_chatter(decision, executed=executed)
 
-    # Prune peaks + scale-out markers for symbols we no longer hold.
+    # Prune peaks + scale-out + entry markers for symbols we no longer hold.
     PEAKS.prune(live_symbols)
     SCALED_OUT.prune(live_symbols)
+    ENTRIES.prune(live_symbols)
     # Phase 35 — publish the adaptive-cadence signal.
     _publish_hot_flag(any_hot)
     return result
@@ -816,14 +1062,17 @@ def snapshot() -> dict[str, Any]:
             "trail_arm_pct": th.trail_arm_pct,
             "trail_giveback_pct": th.trail_giveback_pct,
             "hard_stop_pct": th.hard_stop_pct,
+            "max_hold_hours": th.max_hold_hours,
             "preset": th.preset,
             "is_off": th.is_off(),
         },
         "peaks": PEAKS.snapshot(),
         "scaled_out": SCALED_OUT.snapshot(),
+        "entries": ENTRIES.snapshot(),
         "recent_audit": read_audit(limit=25),
         "audit_path": str(EXIT_AUDIT_PATH),
         "peaks_path": str(EXIT_PEAKS_PATH),
         "scaleout_path": str(EXIT_SCALEOUT_PATH),
+        "entries_path": str(EXIT_ENTRIES_PATH),
         "as_of": datetime.now(UTC).isoformat(timespec="seconds"),
     }
