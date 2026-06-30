@@ -500,3 +500,127 @@ def test_caps_unchanged_by_readout_fix(isolated):
     assert c.total_budget_usd == pytest.approx(300.0)
     assert c.max_per_trade_usd == pytest.approx(50.0)
     assert tc._budget_ceiling() == pytest.approx(10000.0)
+
+
+# ---------------------------------------------------------------------------
+# Trading Limits UNITS fix: paper mode shows PERCENT OF THE PAPER PORTFOLIO
+# DEPLOYED (deployed / paper equity, ~$100k sim), NOT paper dollars / $300.
+# The $300 live float cap is exposed separately. Live mode uses the $300 cap
+# as the denominator. Unknown mode -> paper. Missing equity -> fail-safe.
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def paper_equity(monkeypatch):
+    """Force a known paper-account equity for the deployment % math."""
+
+    def _install(equity):
+        monkeypatch.setattr(
+            srv, "latest_account_snapshot", lambda: {"equity": equity}
+        )
+
+    return _install
+
+
+@pytest.fixture
+def mode(monkeypatch):
+    """Force the cockpit trading_mode the payload reads."""
+
+    def _install(value):
+        class _S:
+            trading_mode = value
+
+        monkeypatch.setattr(srv, "load_state", lambda *a, **k: _S())
+
+    return _install
+
+
+def test_payload_paper_mode_pct_is_deployed_over_equity(
+    isolated, shadow, paper_equity, mode
+):
+    # $2,000 deployed in a $100k practice portfolio -> 2%, NOT 2000/300.
+    shadow([_trade("buy", "AMZN", qty=10, notional=2000.0)])
+    paper_equity(100_000.0)
+    mode("paper")
+    p = srv._trading_controls_payload()
+    assert p["budget_basis"] == "paper"
+    assert p["paper_deployed_usd"] == pytest.approx(2000.0)
+    assert p["paper_equity_usd"] == pytest.approx(100_000.0)
+    assert p["paper_deployed_pct"] == pytest.approx(2.0)
+    # The bar denominator is paper equity, not the $300 live cap.
+    assert p["budget_total_usd"] == pytest.approx(100_000.0)
+    assert p["budget_used_pct"] == pytest.approx(2.0)
+    assert p["budget_used_pct"] < 100.0
+
+
+def test_payload_live_cap_shown_separately_in_paper_mode(
+    isolated, shadow, paper_equity, mode
+):
+    shadow([_trade("buy", "AMZN", qty=10, notional=2000.0)])
+    paper_equity(100_000.0)
+    mode("paper")
+    p = srv._trading_controls_payload()
+    # $300 cap present as its own field, NOT the paper denominator.
+    assert p["live_cap_usd"] == pytest.approx(300.0)
+    assert p["budget_total_usd"] != pytest.approx(300.0)
+
+
+def test_payload_live_mode_uses_300_cap_as_denominator(
+    isolated, shadow, paper_equity, mode
+):
+    # In live mode the bar denominator follows the active mode = $300 cap.
+    shadow([_trade("buy", "AMZN", qty=10, notional=150.0)])
+    paper_equity(100_000.0)
+    mode("live")
+    p = srv._trading_controls_payload()
+    assert p["budget_basis"] == "live"
+    assert p["budget_total_usd"] == pytest.approx(300.0)
+    assert p["budget_used_usd"] == pytest.approx(150.0)
+    assert p["budget_used_pct"] == pytest.approx(50.0)
+
+
+def test_payload_unknown_mode_falls_back_to_paper(
+    isolated, shadow, paper_equity, mode
+):
+    shadow([_trade("buy", "AMZN", qty=10, notional=2000.0)])
+    paper_equity(100_000.0)
+    mode("garbage")
+    p = srv._trading_controls_payload()
+    assert p["budget_basis"] == "paper"
+    assert p["budget_total_usd"] == pytest.approx(100_000.0)
+
+
+def test_payload_missing_paper_equity_is_fail_safe(isolated, shadow, monkeypatch):
+    # Snapshot returns no equity -> non-zero fallback denom, confidence low,
+    # never divide-by-zero or raise.
+    shadow([_trade("buy", "AMZN", qty=10, notional=2000.0)])
+    monkeypatch.setattr(srv, "latest_account_snapshot", lambda: {"equity": None})
+    p = srv._trading_controls_payload()
+    assert p["paper_equity_confident"] is False
+    assert p["paper_equity_usd"] > 0  # no divide-by-zero
+    assert p["paper_deployed_pct"] >= 0.0
+
+
+def test_payload_paper_equity_snapshot_failure_never_raises(
+    isolated, shadow, monkeypatch
+):
+    def _boom():
+        raise RuntimeError("snapshot read failed")
+
+    shadow([_trade("buy", "AMZN", qty=10, notional=2000.0)])
+    monkeypatch.setattr(srv, "latest_account_snapshot", _boom)
+    p = srv._trading_controls_payload()  # must not raise
+    assert p["paper_equity_confident"] is False
+    assert p["paper_equity_usd"] > 0
+
+
+def test_payload_caps_unchanged_and_present(isolated, shadow, paper_equity, mode):
+    shadow([_trade("buy", "AMZN", qty=10, notional=2000.0)])
+    paper_equity(100_000.0)
+    mode("paper")
+    p = srv._trading_controls_payload()
+    assert p["live_cap_usd"] == pytest.approx(300.0)
+    assert p["total_budget_usd"] == pytest.approx(300.0)
+    assert p["max_per_trade_usd"] == pytest.approx(50.0)
+    assert p["absolute_max_usd"] == pytest.approx(10000.0)
+    # Backward-compat fields still present.
+    assert "used_budget_usd" in p
+    assert "remaining_budget_usd" in p
