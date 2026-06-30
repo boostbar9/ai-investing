@@ -59,6 +59,9 @@ DEFAULT_MAX_MARKET_CAP = 2_000_000_000.0
 # When market cap is unknown, fall back to a price ceiling to keep mega-cap
 # priced names (AAPL/SPY/...) out of the under-radar lane. Default $50.
 DEFAULT_MAX_PRICE = 50.0
+# How many under-radar candidates one sweep may surface, to bound latency/cost
+# of the downstream per-ticker fan-out. Default 10 (user-chosen). Env-overridable.
+DEFAULT_MAX_CANDIDATES = 10
 
 
 def _env_float(name: str, default: float) -> float:
@@ -94,6 +97,20 @@ def max_market_cap() -> float:
 
 def max_price() -> float:
     return _env_float("RADAR_MAX_PRICE", DEFAULT_MAX_PRICE)
+
+
+def radar_max_candidates() -> int:
+    """Max under-radar candidates one sweep may surface (``RADAR_MAX_CANDIDATES``,
+    default 10). Parsed as a non-negative int; falls back to the default on
+    anything missing/garbage/negative. Never raises."""
+    raw = os.getenv("RADAR_MAX_CANDIDATES")
+    if raw is None:
+        return DEFAULT_MAX_CANDIDATES
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_CANDIDATES
+    return v if v >= 0 else DEFAULT_MAX_CANDIDATES
 
 
 # ---------------------------------------------------------------------------
@@ -488,4 +505,5 @@ __all__ = [
     "max_spread_pct",
     "min_dollar_vol",
     "min_price",
+    "radar_max_candidates",
 ]
