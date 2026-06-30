@@ -2227,15 +2227,66 @@ def api_robinhood_cap_set(body: _FloatCapBody) -> dict[str, Any]:
 # gate, pending queue). Budget reads/writes through the onboarding cap above
 # so the two can never diverge.
 # ---------------------------------------------------------------------------
+def _trade_notional(t: dict[str, Any]) -> float:
+    """Best-effort cost basis for one trade row. Prefer a realized fill
+    notional/price where present, fall back to ``notional_estimate``, then
+    to ``price * qty``. Returns 0.0 when nothing usable is found."""
+    import math
+
+    for key in ("notional", "notional_estimate"):
+        try:
+            val = t.get(key)
+            if val is not None:
+                n = float(val)
+                if math.isfinite(n) and n > 0:
+                    return n
+        except (TypeError, ValueError):
+            pass
+    for price_key in ("fill_price", "price", "avg_price", "limit_price"):
+        try:
+            price = t.get(price_key)
+            qty = t.get("filled_qty", t.get("qty"))
+            if price is not None and qty is not None:
+                n = float(price) * float(qty)
+                if math.isfinite(n) and n > 0:
+                    return n
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
+def _trade_qty(t: dict[str, Any]) -> float:
+    """Filled/ordered share quantity for one row, 0.0 if unusable."""
+    import math
+
+    for key in ("filled_qty", "qty"):
+        try:
+            val = t.get(key)
+            if val is not None:
+                q = float(val)
+                if math.isfinite(q) and q > 0:
+                    return q
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
 def _trading_controls_live_state() -> dict[str, Any]:
     """Derive used-budget / open-positions / trades-today from today's
     shadow-trade audit log. Best-effort: any failure yields zeros so the
-    gate fails safe (treats the account as empty rather than blocking)."""
+    gate fails safe (treats the account as empty rather than blocking).
+
+    ``used_budget_usd`` is *currently deployed capital*: per symbol we track
+    net open shares and their cost basis, so a sell frees budget back rather
+    than leaving the buy's notional stuck in the total. This makes rotation
+    (sell A, buy B) report net deployment instead of double-counting both
+    legs. ``open_positions`` counts symbols with a net-open position;
+    ``trades_today`` stays a raw count of today's buys."""
     from datetime import date
 
-    used = 0.0
     trades_today = 0
-    open_syms: set[str] = set()
+    # symbol -> {"qty": net open shares, "cost": cost basis of those shares}
+    positions: dict[str, dict[str, float]] = {}
     try:
         from packages.execution.robinhood import load_shadow_trades
 
@@ -2245,21 +2296,36 @@ def _trading_controls_live_state() -> dict[str, Any]:
                 continue
             side = str(t.get("side", "")).lower()
             sym = str(t.get("symbol", "")).upper()
+            if not sym:
+                continue
+            pos = positions.setdefault(sym, {"qty": 0.0, "cost": 0.0})
             if side == "buy":
                 trades_today += 1
-                try:
-                    used += float(t.get("notional_estimate") or 0.0)
-                except (TypeError, ValueError):
-                    pass
-                if sym:
-                    open_syms.add(sym)
+                pos["qty"] += _trade_qty(t)
+                pos["cost"] += _trade_notional(t)
             elif side == "sell":
-                open_syms.discard(sym)
+                # Free budget proportional to the shares sold. When we lack
+                # qty data, a sell still fully closes the symbol so pure
+                # rotation can never inflate deployed capital.
+                sell_qty = _trade_qty(t)
+                open_qty = pos["qty"]
+                if open_qty > 0 and sell_qty > 0:
+                    frac = min(sell_qty, open_qty) / open_qty
+                    pos["cost"] = max(0.0, pos["cost"] * (1.0 - frac))
+                    pos["qty"] = max(0.0, open_qty - sell_qty)
+                else:
+                    pos["qty"] = 0.0
+                    pos["cost"] = 0.0
+        # A symbol is open / deployed when it still has cost basis left after
+        # netting sells. Using cost (not qty) keeps a buy that recorded a
+        # notional but no share count from silently vanishing.
+        used = sum(p["cost"] for p in positions.values() if p["cost"] > 1e-9)
+        open_count = sum(1 for p in positions.values() if p["cost"] > 1e-9)
     except Exception:  # pragma: no cover — defensive
         return {"used_budget_usd": 0.0, "open_positions": 0, "trades_today": 0}
     return {
-        "used_budget_usd": round(used, 2),
-        "open_positions": len(open_syms),
+        "used_budget_usd": round(max(0.0, used), 2),
+        "open_positions": open_count,
         "trades_today": trades_today,
     }
 

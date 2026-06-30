@@ -329,3 +329,174 @@ def test_page_renders(isolated, client):
     assert r.status_code == 200
     assert "How picky should the AI be?" in r.text
     assert 'data-path="/trading-controls"' in r.text  # nav highlight hook
+
+
+# ---------------------------------------------------------------------------
+# _trading_controls_live_state — "used_budget_usd" = currently DEPLOYED
+# capital. A sell must free budget back so rotation (sell A, buy B) reports
+# net deployment instead of double-counting both legs. Regression guard for
+# the panel showing "$750 / $300" when no cap was ever breached.
+# ---------------------------------------------------------------------------
+from datetime import date  # noqa: E402
+
+
+def _today_ts(hour: int = 10, minute: int = 0) -> str:
+    return f"{date.today().isoformat()}T{hour:02d}:{minute:02d}:00"
+
+
+def _trade(side, symbol, *, qty=10.0, notional=None, ts=None, **extra):
+    row = {
+        "ts": ts or _today_ts(),
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "notional_estimate": notional,
+    }
+    row.update(extra)
+    return row
+
+
+@pytest.fixture
+def shadow(monkeypatch):
+    """Install a fake shadow-trade log for _trading_controls_live_state."""
+    from packages.execution import robinhood as rh
+
+    def _install(rows):
+        monkeypatch.setattr(rh, "load_shadow_trades", lambda *a, **k: list(rows))
+
+    return _install
+
+
+def test_live_state_buys_only_sums_notional(shadow):
+    shadow([
+        _trade("buy", "AAA", qty=5, notional=100.0),
+        _trade("buy", "BBB", qty=5, notional=50.0),
+    ])
+    s = srv._trading_controls_live_state()
+    assert s["used_budget_usd"] == pytest.approx(150.0)
+    assert s["open_positions"] == 2
+    assert s["trades_today"] == 2
+
+
+def test_live_state_buy_then_sell_frees_budget(shadow):
+    # The exact rotation that produced the bogus "$750 / $300": buying then
+    # fully selling the same symbol must NOT leave the buy notional deployed.
+    shadow([
+        _trade("buy", "AAA", qty=10, notional=100.0),
+        _trade("sell", "AAA", qty=10),
+    ])
+    s = srv._trading_controls_live_state()
+    assert s["used_budget_usd"] == pytest.approx(0.0)
+    assert s["open_positions"] == 0
+    assert s["trades_today"] == 1  # the buy still counts as a trade today
+
+
+def test_live_state_rotation_not_double_counted(shadow):
+    # Sell A, buy B: only B is deployed -> used reflects B alone, never A+B.
+    shadow([
+        _trade("buy", "AAA", qty=10, notional=100.0),
+        _trade("sell", "AAA", qty=10),
+        _trade("buy", "BBB", qty=10, notional=120.0),
+    ])
+    s = srv._trading_controls_live_state()
+    assert s["used_budget_usd"] == pytest.approx(120.0)
+    assert s["open_positions"] == 1
+
+
+def test_live_state_many_rotations_never_exceed_net_deployment(shadow):
+    # Five rotations of a single $50 slot: deployment must stay ~$50, not $250.
+    rows = []
+    for i, sym in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"]):
+        rows.append(_trade("buy", sym, qty=10, notional=50.0,
+                           ts=_today_ts(minute=i * 2)))
+        if sym != "EEE":  # leave the last one open
+            rows.append(_trade("sell", sym, qty=10,
+                               ts=_today_ts(minute=i * 2 + 1)))
+    shadow(rows)
+    s = srv._trading_controls_live_state()
+    assert s["used_budget_usd"] == pytest.approx(50.0)
+    assert s["used_budget_usd"] <= 50.0
+    assert s["open_positions"] == 1
+    assert s["trades_today"] == 5
+
+
+def test_live_state_partial_sell_reduces_proportionally(shadow):
+    # Buy 10 @ $10 = $100, sell 4 -> 6 shares of cost basis remain ($60).
+    shadow([
+        _trade("buy", "AAA", qty=10, notional=100.0),
+        _trade("sell", "AAA", qty=4),
+    ])
+    s = srv._trading_controls_live_state()
+    assert s["used_budget_usd"] == pytest.approx(60.0)
+    assert s["open_positions"] == 1
+
+
+def test_live_state_oversell_clamps_non_negative(shadow):
+    # Selling more than held never drives deployed capital below zero.
+    shadow([
+        _trade("buy", "AAA", qty=10, notional=100.0),
+        _trade("sell", "AAA", qty=999),
+    ])
+    s = srv._trading_controls_live_state()
+    assert s["used_budget_usd"] == pytest.approx(0.0)
+    assert s["used_budget_usd"] >= 0.0
+    assert s["open_positions"] == 0
+
+
+def test_live_state_fill_price_fallback(shadow):
+    # No notional_estimate: derive cost basis from fill_price * qty.
+    shadow([
+        _trade("buy", "AAA", qty=3, notional=None, fill_price=20.0),
+    ])
+    s = srv._trading_controls_live_state()
+    assert s["used_budget_usd"] == pytest.approx(60.0)
+
+
+def test_live_state_remaining_budget_math(isolated, client, shadow):
+    shadow([
+        _trade("buy", "AAA", qty=10, notional=100.0),
+        _trade("sell", "AAA", qty=10),
+        _trade("buy", "BBB", qty=10, notional=120.0),
+    ])
+    j = client.get("/api/trading-controls").json()
+    assert j["total_budget_usd"] == pytest.approx(300.0)  # cap untouched
+    assert j["used_budget_usd"] == pytest.approx(120.0)
+    assert j["remaining_budget_usd"] == pytest.approx(180.0)
+
+
+def test_live_state_malformed_rows_fail_safe_zeros(shadow):
+    # If reading the log blows up, the gate fails safe with zeros rather than
+    # raising into the route.
+    from packages.execution import robinhood as rh
+
+    def _boom(*a, **k):
+        raise RuntimeError("corrupt log")
+
+    rh_load = rh.load_shadow_trades
+    try:
+        rh.load_shadow_trades = _boom
+        s = srv._trading_controls_live_state()
+    finally:
+        rh.load_shadow_trades = rh_load
+    assert s == {"used_budget_usd": 0.0, "open_positions": 0, "trades_today": 0}
+
+
+def test_live_state_garbage_fields_are_skipped(shadow):
+    # Individual junk rows must not crash; usable rows still count.
+    shadow([
+        {"ts": _today_ts(), "symbol": "AAA", "side": "buy",
+         "qty": "nope", "notional_estimate": "bad"},
+        _trade("buy", "BBB", qty=5, notional=80.0),
+        {"ts": "not-today", "symbol": "CCC", "side": "buy",
+         "qty": 1, "notional_estimate": 999.0},
+    ])
+    s = srv._trading_controls_live_state()
+    assert s["used_budget_usd"] == pytest.approx(80.0)
+    assert s["open_positions"] == 1  # only BBB has usable cost basis
+
+
+def test_caps_unchanged_by_readout_fix(isolated):
+    c = tc.load_controls()
+    assert c.total_budget_usd == pytest.approx(300.0)
+    assert c.max_per_trade_usd == pytest.approx(50.0)
+    assert tc._budget_ceiling() == pytest.approx(10000.0)
