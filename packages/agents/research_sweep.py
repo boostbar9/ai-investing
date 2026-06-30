@@ -116,6 +116,45 @@ def _radar_calendar_days() -> int:
 # calendar/scan can't blow up the downstream RH liquidity fan-out.
 RADAR_SOURCE_MAX_SYMBOLS = 40
 
+# Look-back window (trading days) used to derive average daily DOLLAR volume and
+# the spread proxy from price bars when the free data tier has no direct field.
+# Env-overridable via RADAR_ADV_WINDOW_DAYS (default 20), bounded to [1, 400].
+DEFAULT_RADAR_ADV_WINDOW_DAYS = 20
+# Minimum number of usable daily bars required to trust a bar-derived liquidity
+# profile. Fewer than this -> treated as MISSING so the gate fail-safe excludes
+# the name (never fabricate liquidity from a too-thin history).
+DEFAULT_RADAR_MIN_BARS = 5
+
+
+def _radar_adv_window_days() -> int:
+    """ADV/spread look-back window in trading days (``RADAR_ADV_WINDOW_DAYS``,
+    default 20). Parsed as a positive int, bounded to [1, 400]; falls back to the
+    default on anything missing/garbage. Never raises."""
+    raw = os.getenv("RADAR_ADV_WINDOW_DAYS")
+    if raw is None:
+        return DEFAULT_RADAR_ADV_WINDOW_DAYS
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_RADAR_ADV_WINDOW_DAYS
+    if v < 1:
+        return DEFAULT_RADAR_ADV_WINDOW_DAYS
+    return min(400, v)
+
+
+def _radar_min_bars() -> int:
+    """Minimum usable daily bars to trust a bar-derived profile
+    (``RADAR_MIN_BARS``, default 5). Parsed as a positive int; falls back to the
+    default on anything missing/garbage. Never raises."""
+    raw = os.getenv("RADAR_MIN_BARS")
+    if raw is None:
+        return DEFAULT_RADAR_MIN_BARS
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_RADAR_MIN_BARS
+    return v if v >= 1 else DEFAULT_RADAR_MIN_BARS
+
 
 SignalKind = Literal["portfolio", "sentiment", "news", "scan"]
 SweepStatus = Literal["idle", "running", "done", "failed"]
@@ -768,7 +807,9 @@ def candidates_from_under_radar_universe(
     *,
     liquidity_by_symbol: dict[str, dict[str, Any]],
     market_cap_by_symbol: dict[str, Any] | None = None,
+    bars_by_symbol: dict[str, list[dict[str, Any]]] | None = None,
     max_candidates: int | None = None,
+    funnel: dict[str, int] | None = None,
 ) -> tuple[list[Candidate], int]:
     """Turn an INDEPENDENT micro-cap discovery universe into under_radar candidates.
 
@@ -786,11 +827,33 @@ def candidates_from_under_radar_universe(
       3. apply the MANDATORY :func:`liquidity_gate` (price/$-volume/spread),
          fail-safe EXCLUDING any name whose liquidity data is missing.
 
+    When a name's direct ``price`` / ``avg_dollar_volume`` / ``spread_pct`` are
+    absent (the free data tier rarely has $-volume/spread for micro-caps), the
+    missing inputs are COMPUTED from the name's daily bars in ``bars_by_symbol``
+    via :func:`liquidity_from_bars` and fed to the UNCHANGED gate — genuinely
+    liquid micro-caps pass, junk is still rejected, and a name with too few /
+    failed bars is fail-safe EXCLUDED (never fabricated).
+
+    ``funnel`` (when provided) is populated with debug counts so a 0-candidate
+    sweep is diagnosable: ``priced_from_bars``, ``excluded_price``,
+    ``excluded_volume``, ``excluded_spread``, ``excluded_missing_bars``,
+    ``after_gate``.
+
     Returns ``(candidates, gate_passed_count)`` where ``candidates`` is capped at
     ``max_candidates`` (``RADAR_MAX_CANDIDATES``, default 10) for display and
     ``gate_passed_count`` is how many names cleared every gate (pre-cap) — the
     ``after_gate`` provenance figure. Empty input is a no-op. Never raises."""
+    counts = {
+        "priced_from_bars": 0,
+        "excluded_price": 0,
+        "excluded_volume": 0,
+        "excluded_spread": 0,
+        "excluded_missing_bars": 0,
+        "after_gate": 0,
+    }
     if not seeds:
+        if funnel is not None:
+            funnel.update(counts)
         return [], 0
     from packages.agents.catalyst import (
         classify_catalyst,
@@ -803,6 +866,7 @@ def candidates_from_under_radar_universe(
         max_candidates = radar_max_candidates()
     liq = {str(k).upper(): v for k, v in (liquidity_by_symbol or {}).items()}
     mcaps = {str(k).upper(): v for k, v in (market_cap_by_symbol or {}).items()}
+    bars_map = {str(k).upper(): v for k, v in (bars_by_symbol or {}).items()}
 
     # Aggregate the strongest catalyst + contributing sub-sources + sample event
     # text per symbol (a symbol can appear in several sub-sources, e.g. a scan
@@ -837,6 +901,30 @@ def candidates_from_under_radar_universe(
         if info.get("is_etf"):
             continue
         price = info.get("price")
+        adv = info.get("avg_dollar_volume")
+        spread = info.get("spread_pct")
+        # COMPUTE the gate's liquidity inputs from price bars when the free tier
+        # has no direct field (we feed the UNCHANGED gate real data, never weaken
+        # it). Too few / failed bars -> fail-safe excluded (never fabricated).
+        if price is None or adv is None or spread is None:
+            derived = liquidity_from_bars(
+                bars_map.get(sym), quote=info.get("quote")
+            )
+            if derived is None:
+                counts["excluded_missing_bars"] += 1
+                logger.info(
+                    "under_radar universe excludes %s: insufficient bars "
+                    "-> excluded (fail-safe)",
+                    sym,
+                )
+                continue
+            if price is None:
+                price = derived.get("price")
+            if adv is None:
+                adv = derived.get("avg_dollar_volume")
+            if spread is None:
+                spread = derived.get("spread_pct")
+            counts["priced_from_bars"] += 1
         mcap = mcaps.get(sym, info.get("market_cap"))
         # Mega-cap exclusion (small/micro-cap membership; keeps AAPL/SPY out).
         if not is_under_radar(market_cap=mcap, price=price):
@@ -845,11 +933,18 @@ def candidates_from_under_radar_universe(
         # data so we never surface an untradeable name into shadow.
         gate = liquidity_gate(
             price=price,
-            avg_dollar_volume=info.get("avg_dollar_volume"),
-            spread_pct=info.get("spread_pct"),
+            avg_dollar_volume=adv,
+            spread_pct=spread,
         )
         if not gate.passed:
-            logger.info("under_radar universe excludes %s: %s", sym, gate.reason)
+            reason = gate.reason
+            if "spread" in reason:
+                counts["excluded_spread"] += 1
+            elif "vol" in reason:
+                counts["excluded_volume"] += 1
+            elif "price" in reason:
+                counts["excluded_price"] += 1
+            logger.info("under_radar universe excludes %s: %s", sym, reason)
             continue
         srcs = sub_sources.get(sym, [])
         thesis = (
@@ -877,6 +972,9 @@ def candidates_from_under_radar_universe(
         )
     out.sort(key=lambda c: (-c.catalyst_score, c.symbol))
     gate_passed = len(out)
+    counts["after_gate"] = gate_passed
+    if funnel is not None:
+        funnel.update(counts)
     return out[:max_candidates], gate_passed
 
 
@@ -1604,6 +1702,141 @@ def _spread_pct_from_quote(quote: dict[str, Any]) -> float | None:
     return round((ask - bid) / mid, 6)
 
 
+def _bar_field(row: dict[str, Any], *keys: str) -> float | None:
+    """First positive float among ``keys`` in a raw bar row, else ``None``."""
+    for k in keys:
+        f = _num(row.get(k))
+        if f is not None and f > 0:
+            return f
+    return None
+
+
+def liquidity_from_bars(
+    bars: list[dict[str, Any]] | None,
+    *,
+    quote: dict[str, Any] | None = None,
+    window: int | None = None,
+    min_bars: int | None = None,
+) -> dict[str, Any] | None:
+    """Derive ``{price, avg_dollar_volume, spread_pct}`` from daily price bars.
+
+    Pure and fail-safe — used to FEED the UNCHANGED :func:`liquidity_gate` real
+    liquidity inputs computed from the free price bars we already fetch, instead
+    of weakening the gate. Given oldest-first daily bar rows (RH historicals
+    style: ``close_price`` / ``high_price`` / ``low_price`` / ``volume``):
+
+      * **price** = the latest usable close.
+      * **avg_dollar_volume** = the mean of ``close * volume`` over the usable
+        bars within the trailing ``window`` (env ``RADAR_ADV_WINDOW_DAYS``,
+        default 20).
+      * **spread_pct** = a conservative proxy = the MEDIAN of intraday
+        ``(high - low) / close`` over the window. A real bid/ask ``quote``, when
+        present and parseable, is PREFERRED over the proxy.
+
+    Returns ``None`` (treated as MISSING by the caller -> gate fail-safe
+    excludes) when there are fewer than ``min_bars`` usable bars (env
+    ``RADAR_MIN_BARS``, default 5) — we never fabricate liquidity from a
+    too-thin or empty/failed history. Individual fields that can't be computed
+    are left ``None`` so the gate still fail-safe excludes on them. Never raises.
+    """
+    win = window if window is not None else _radar_adv_window_days()
+    floor_bars = min_bars if min_bars is not None else _radar_min_bars()
+    if not isinstance(bars, list) or not bars:
+        return None
+    rows = [r for r in bars if isinstance(r, dict)]
+    window_rows = rows[-win:] if win > 0 else rows
+
+    dollar_vols: list[float] = []
+    last_close: float | None = None
+    hl_fracs: list[float] = []
+    for r in window_rows:
+        close = _bar_field(r, "close_price", "close", "adj_close", "last_close_price")
+        if close is not None:
+            last_close = close
+        vol = _num(r.get("volume"))
+        if close is not None and vol is not None and vol > 0:
+            dollar_vols.append(close * vol)
+        high = _bar_field(r, "high_price", "high")
+        low = _bar_field(r, "low_price", "low")
+        if close is not None and high is not None and low is not None and high >= low:
+            hl_fracs.append((high - low) / close)
+
+    # A bar is "usable" for ADV when it has both a positive close and volume.
+    # Too few usable bars -> the whole profile is MISSING (fail-safe exclude).
+    if len(dollar_vols) < floor_bars:
+        return None
+
+    avg_dollar_volume = sum(dollar_vols) / len(dollar_vols)
+
+    # Prefer a real bid/ask quote when available; otherwise the conservative
+    # median high-low proxy. Neither computable -> spread stays None (excluded).
+    spread_pct = _spread_pct_from_quote(quote) if quote else None
+    if spread_pct is None and hl_fracs:
+        ordered = sorted(hl_fracs)
+        n = len(ordered)
+        mid = n // 2
+        spread_pct = (
+            ordered[mid]
+            if n % 2
+            else (ordered[mid - 1] + ordered[mid]) / 2.0
+        )
+        spread_pct = round(spread_pct, 6)
+
+    return {
+        "price": last_close,
+        "avg_dollar_volume": round(avg_dollar_volume, 4),
+        "spread_pct": spread_pct,
+    }
+
+
+async def _fetch_daily_bars(symbol: str) -> list[dict[str, Any]] | None:
+    """READ-ONLY daily bars for ``symbol`` via the existing RH historicals
+    adapter (no new data provider). Returns the raw oldest-first bar rows, or
+    ``None`` on any failure / empty response so the caller fail-safe excludes the
+    name (counted as ``excluded_missing_bars``). Never raises."""
+    try:
+        from packages.data import rh_live
+
+        days = max(_radar_adv_window_days() * 2, 30)
+        res = await rh_live.get_bars(
+            symbol,
+            start_time=rh_live._historicals_start_time(days),
+            interval="day",
+            span="year",
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning(
+            "under_radar bar fetch failed for %s: %s", symbol, exc.__class__.__name__
+        )
+        return None
+    if not getattr(res, "ok", False) or not isinstance(res.value, list) or not res.value:
+        return None
+    return [r for r in res.value if isinstance(r, dict)]
+
+
+async def _gather_under_radar_bars(
+    symbols: list[str], *, limit: int | None = None
+) -> dict[str, list[dict[str, Any]]]:
+    """Fetch daily bars for the TOP ``limit`` symbols (by caller-supplied order,
+    which is catalyst-score ranked) to bound the read-only fan-out. Returns
+    ``{SYMBOL: bar_rows}`` for whatever resolved; a failed/empty fetch is simply
+    absent (caller counts it as ``excluded_missing_bars``). Never raises."""
+    if not symbols:
+        return {}
+    from packages.agents.catalyst import radar_max_candidates
+
+    cap = limit if limit is not None else radar_max_candidates()
+    out: dict[str, list[dict[str, Any]]] = {}
+    for sym in symbols[:cap]:
+        key = str(sym or "").strip().upper()
+        if not key or key in out:
+            continue
+        bars = await _fetch_daily_bars(key)
+        if bars:
+            out[key] = bars
+    return out
+
+
 async def _gather_under_radar_liquidity(
     symbols: list[str],
 ) -> dict[str, dict[str, Any]]:
@@ -2012,6 +2245,7 @@ async def run_sweep(
 
                 radar_cands: list[Candidate] = []
                 gate_passed = 0
+                radar_funnel: dict[str, int] = {}
                 if all_seeds:
                     # Bound the read-only RH liquidity fan-out: prioritise
                     # symbols that already carry a catalyst (they can actually
@@ -2031,9 +2265,17 @@ async def run_sweep(
                         (cat_first if has_cat else cat_rest).append(sym)
                     fanout_syms = cat_first + cat_rest
                     liquidity = await _gather_under_radar_liquidity(fanout_syms)
+                    # Compute the gate's liquidity inputs from free price bars for
+                    # the TOP catalyst-ranked names (bounded by RADAR_MAX_CANDIDATES)
+                    # so genuinely liquid micro-caps the free tier has no direct
+                    # $-volume/spread field for can still clear the UNCHANGED gate.
+                    radar_bars = await _gather_under_radar_bars(fanout_syms)
                     radar_cands, gate_passed = (
                         candidates_from_under_radar_universe(
-                            all_seeds, liquidity_by_symbol=liquidity
+                            all_seeds,
+                            liquidity_by_symbol=liquidity,
+                            bars_by_symbol=radar_bars,
+                            funnel=radar_funnel,
                         )
                     )
                     cands = merge_under_radar_candidates(cands, radar_cands)
@@ -2045,6 +2287,7 @@ async def run_sweep(
                         (time.monotonic() - radar_t0) * 1000.0, 1
                     ),
                     "after_gate": gate_passed,
+                    **{k: int(v) for k, v in radar_funnel.items()},
                     **{k: int(v) for k, v in provenance.items()},
                 }
             except Exception as exc:  # pragma: no cover — defensive
