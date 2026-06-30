@@ -1789,11 +1789,78 @@ def liquidity_from_bars(
     }
 
 
+def _yahoo_rows_from_bars(bars: list[Any]) -> list[dict[str, Any]]:
+    """Convert yfinance :class:`Bar` records into RH-historicals-style row dicts
+    (``begins_at`` / ``close_price`` / ``high_price`` / ``low_price`` / ``volume``)
+    so the SAME :func:`liquidity_from_bars` reader handles either source. Never
+    raises; skips any malformed bar."""
+    rows: list[dict[str, Any]] = []
+    for b in bars or []:
+        close = getattr(b, "close", None)
+        if close is None:
+            continue
+        ts = getattr(b, "ts", None)
+        rows.append(
+            {
+                "begins_at": ts.isoformat() if hasattr(ts, "isoformat") else None,
+                "close_price": getattr(b, "close", None),
+                "high_price": getattr(b, "high", None),
+                "low_price": getattr(b, "low", None),
+                "open_price": getattr(b, "open", None),
+                "volume": getattr(b, "volume", None),
+            }
+        )
+    return rows
+
+
+def _yahoo_bars_fallback(symbol: str, days: int):
+    """Build the RH-``get_bars`` fallback closure that fetches the SAME daily
+    OHLCV from Yahoo (the free, key-less adapter the rest of the platform falls
+    back to when ``rh_bars`` is off / down / returns empty). Returns an async
+    ``() -> (rows, "yahoo") | None`` callable; ``None`` (no usable bars) lets the
+    caller fail-safe exclude the name. Never raises."""
+
+    async def _fb() -> tuple[list[dict[str, Any]], str] | None:
+        try:
+            from packages.data.adapters.yfinance import YFinanceAdapter
+        except Exception:  # pragma: no cover — adapter import safety
+            return None
+        adapter = YFinanceAdapter()
+        try:
+            range_ = "3mo" if days <= 70 else "1y"
+            bars = await adapter.get_daily_bars(symbol, range_=range_)
+        except Exception as exc:
+            logger.warning(
+                "under_radar yahoo bar fallback failed for %s: %s",
+                symbol,
+                exc.__class__.__name__,
+            )
+            return None
+        finally:
+            with contextlib.suppress(Exception):  # best-effort cleanup
+                await adapter.aclose()
+        rows = _yahoo_rows_from_bars(bars)
+        return (rows, "yahoo") if rows else None
+
+    return _fb
+
+
 async def _fetch_daily_bars(symbol: str) -> list[dict[str, Any]] | None:
-    """READ-ONLY daily bars for ``symbol`` via the existing RH historicals
-    adapter (no new data provider). Returns the raw oldest-first bar rows, or
-    ``None`` on any failure / empty response so the caller fail-safe excludes the
-    name (counted as ``excluded_missing_bars``). Never raises."""
+    """READ-ONLY daily bars for ``symbol`` from the platform's primary bar source
+    ``rh_bars``, with the SAME Yahoo fallback the rest of the codebase uses when
+    RH is off / down / returns an empty (e.g. market-closed) response.
+
+    The previous wiring called :func:`rh_live.get_bars` with NO ``fallback=``: an
+    empty RH response records a *successful-but-empty* read (so the ``rh_bars``
+    health pill stays green) yet returns ``ok=False`` / ``value=None`` — so EVERY
+    under_radar symbol dropped to ``None`` and was mis-counted as
+    ``excluded_missing_bars`` even while ``rh_bars`` looked healthy. Wiring the
+    proven Yahoo fallback (matching the documented "rh_bars falls back to
+    Yahoo/parquet" contract) lets a genuinely-priced name resolve real bars.
+
+    Returns the raw oldest-first bar rows, or ``None`` on any failure / empty
+    response so the caller fail-safe excludes the name (counted as
+    ``excluded_missing_bars``). Never raises."""
     try:
         from packages.data import rh_live
 
@@ -1803,6 +1870,7 @@ async def _fetch_daily_bars(symbol: str) -> list[dict[str, Any]] | None:
             start_time=rh_live._historicals_start_time(days),
             interval="day",
             span="year",
+            fallback=_yahoo_bars_fallback(symbol, days),
         )
     except Exception as exc:  # pragma: no cover — defensive
         logger.warning(
@@ -1831,7 +1899,15 @@ async def _gather_under_radar_bars(
         key = str(sym or "").strip().upper()
         if not key or key in out:
             continue
-        bars = await _fetch_daily_bars(key)
+        # Per-symbol failure isolation: a single name's fetch must never abort
+        # the whole batch (it's just absent -> caller fail-safe excludes it).
+        try:
+            bars = await _fetch_daily_bars(key)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                "under_radar bar gather skipped %s: %s", key, exc.__class__.__name__
+            )
+            continue
         if bars:
             out[key] = bars
     return out
