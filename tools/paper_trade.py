@@ -208,6 +208,46 @@ def resolve_fill_provenance(
     return {"fill_price": None, "filled_qty": None, "fill_source": "unknown"}
 
 
+def load_lane_tags() -> dict[str, dict[str, Any]]:
+    """Read the latest research-sweep candidates and map ``SYMBOL -> lane/catalyst``.
+
+    READ-ONLY and fail-safe: returns ``{}`` on any missing/corrupt file so the
+    order ledger simply records no lane tag (which the performance engine treats
+    as the ``unknown`` lane bucket — never fabricated). The map lets each shadow
+    order/pick be stamped with the lane (``under_radar`` vs ``mainstream``) and
+    catalyst that surfaced its symbol, so per-lane round-trip win rate / profit
+    factor is computable downstream. This places no orders and mutates nothing.
+    """
+    try:
+        from packages.agents.research_sweep import load_sweep
+
+        sweep = load_sweep()
+    except Exception:  # pragma: no cover — fail-safe
+        return {}
+    if not isinstance(sweep, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for cand in sweep.get("candidates") or []:
+        if not isinstance(cand, dict):
+            continue
+        sym = str(cand.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        lane = cand.get("lane")
+        tags: dict[str, Any] = {}
+        if isinstance(lane, str) and lane.strip():
+            tags["lane"] = lane.strip().lower()
+        ct = cand.get("catalyst_type")
+        if isinstance(ct, str) and ct.strip():
+            tags["catalyst_type"] = ct.strip().lower()
+        cs = cand.get("catalyst_score")
+        if isinstance(cs, (int, float)) and not isinstance(cs, bool):
+            tags["catalyst_score"] = float(cs)
+        if tags:
+            out[sym] = tags
+    return out
+
+
 def _auto_default_strategy(now_utc: datetime | None = None) -> str:
     """Pick the right default strategy for the current wall-clock instant.
 
@@ -1484,6 +1524,11 @@ async def run(
 
         submitted = []
         errors = []
+        # Lane/catalyst tags for the ledger (read-only, fail-safe). Stamped onto
+        # every submitted order so per-lane (under_radar vs mainstream) round-trip
+        # win rate / profit factor is computable in performance_stats. An empty
+        # map (no sweep file) leaves orders untagged -> the "unknown" lane bucket.
+        lane_tags = load_lane_tags()
         # Order-routing seam: orders go to the *active* broker (the user's
         # selected backend) while account/positions/risk reads above keep
         # using the Alpaca paper broker as the data source. Default / unset
@@ -1545,6 +1590,11 @@ async def run(
                         "status": ack.status,
                         "broker": order_broker_backend,
                     }
+                    # Stamp lane/catalyst tags (read-only, fail-safe) so the
+                    # round-trip can be graded per lane. Absent symbol -> no tag.
+                    _tags = lane_tags.get(str(po.symbol).upper())
+                    if _tags:
+                        rec.update(_tags)
                     # Robinhood-realistic sim exposes per-fill provenance
                     # (pricing source, modeled spread/slippage, partial) so
                     # the learning layer/UI can show how realistic the data

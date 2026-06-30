@@ -447,3 +447,72 @@ def test_compute_performance_deterministic_pure():
     trades = [_trade("buy", "AAPL", 1, 100.0, ts="t1"), _trade("sell", "AAPL", 1, 101.0, ts="t2")]
     rows = [_row(0.02, source="news")]
     assert ps.compute_performance(pts, trades, rows) == ps.compute_performance(pts, trades, rows)
+
+
+# --- per-lane realized split (under_radar vs mainstream) -------------------
+
+
+def test_round_trips_carry_lane_and_catalyst_from_entry_leg():
+    trades = [
+        _trade("buy", "BCRX", 10, 1.50, ts="t1", lane="under_radar", catalyst_type="fda"),
+        _trade("sell", "BCRX", 10, 1.80, ts="t2"),
+    ]
+    fifo = ps.fifo_round_trips(trades)
+    rt = fifo["round_trips"][0]
+    assert rt["lane"] == "under_radar"
+    assert rt["catalyst_type"] == "fda"
+
+
+def test_realized_by_lane_splits_two_lanes():
+    trades = [
+        # under_radar winner
+        _trade("buy", "BCRX", 10, 1.00, ts="t1", lane="under_radar", catalyst_type="fda"),
+        _trade("sell", "BCRX", 10, 1.50, ts="t2"),
+        # mainstream loser
+        _trade("buy", "AAPL", 1, 200.0, ts="t3", lane="mainstream", catalyst_type="none"),
+        _trade("sell", "AAPL", 1, 180.0, ts="t4"),
+    ]
+    by_lane = ps.realized_by_lane(ps.fifo_round_trips(trades))
+    assert set(by_lane) == {"under_radar", "mainstream"}
+    assert by_lane["under_radar"]["round_trip_win_rate"] == 1.0
+    assert by_lane["mainstream"]["round_trip_win_rate"] == 0.0
+
+
+def test_realized_by_lane_legacy_rows_fall_into_unknown_bucket():
+    # No lane tag at all (old ledger rows) -> 'unknown', never merged into a real lane.
+    trades = [
+        _trade("buy", "AAPL", 1, 100.0, ts="t1"),
+        _trade("sell", "AAPL", 1, 110.0, ts="t2"),
+    ]
+    by_lane = ps.realized_by_lane(ps.fifo_round_trips(trades))
+    assert set(by_lane) == {ps.UNKNOWN_BUCKET}
+
+
+def test_realized_by_lane_empty_is_noop():
+    assert ps.realized_by_lane({"round_trips": []}) == {}
+    assert ps.realized_by_lane({}) == {}
+
+
+def test_account_performance_exposes_realized_by_lane():
+    pts = [{"t": "2026-05-01", "equity": 100.0}, {"t": "2026-05-02", "equity": 105.0}]
+    trades = [
+        _trade("buy", "BCRX", 10, 1.00, ts="t1", lane="under_radar", catalyst_type="fda"),
+        _trade("sell", "BCRX", 10, 1.50, ts="t2"),
+    ]
+    acct = ps.account_performance(pts, trades)
+    assert "realized_by_lane" in acct
+    assert "under_radar" in acct["realized_by_lane"]
+
+
+def test_legacy_rows_without_lane_still_parse_backward_compat():
+    # Backward-compat: pre-existing ledger rows have no lane/catalyst keys and
+    # must FIFO-match exactly as before (lane defaults to the unknown bucket).
+    trades = [
+        _trade("buy", "AAPL", 1, 100.0, ts="t1"),
+        _trade("sell", "AAPL", 1, 110.0, ts="t2"),
+    ]
+    fifo = ps.fifo_round_trips(trades)
+    assert len(fifo["round_trips"]) == 1
+    rt = fifo["round_trips"][0]
+    assert rt["lane"] == ps.UNKNOWN_BUCKET
+    assert rt["pnl_dollars"] == 10.0
