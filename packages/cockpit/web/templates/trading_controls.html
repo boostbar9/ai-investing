@@ -64,11 +64,14 @@
 
       <div class="mb-4">
         <div class="flex items-center justify-between text-sm mb-1">
-          <span style="color:var(--text-secondary);">Used so far today</span>
-          <span class="mono"><span id="tc-used">$0</span> of <span id="tc-budget-total">$300</span></span>
+          <span id="tc-budget-label" style="color:var(--text-secondary);">Deployed in your practice portfolio</span>
+          <span class="mono"><span id="tc-used">$0</span> of <span id="tc-budget-total">$0</span></span>
         </div>
         <div class="tc-bar-track"><div id="tc-budget-bar" class="tc-bar-fill" style="width:0%"></div></div>
-        <div class="tc-help"><span id="tc-remaining">$300</span> remaining today</div>
+        <div class="tc-help"><span id="tc-budget-caption">None of your practice money is in positions right now.</span></div>
+        <div class="tc-help" id="tc-live-cap-line" style="margin-top:6px;">
+          Live cap: <span class="mono" id="tc-live-cap">$300</span> — the real-money limit that applies when live trading is on.
+        </div>
       </div>
 
       <div class="tc-field">
@@ -238,14 +241,32 @@
     }
 
     function paintBudgetBar() {
-      const total = Number(TC.total_budget_usd) || 0;
-      const used = Number(TC.used_budget_usd) || 0;
-      const remaining = Number(TC.remaining_budget_usd ?? Math.max(0, total - used));
-      const w = total > 0 ? Math.min(100, (used / total) * 100) : 0;
+      // Mode-aware, like-to-like. Paper mode: % of the practice portfolio
+      // deployed (vs paper equity). Live mode: deployed vs the $300 live cap.
+      const basis = TC.budget_basis || 'paper';
+      const used = Number(TC.budget_used_usd ?? TC.used_budget_usd) || 0;
+      const total = Number(TC.budget_total_usd) || 0;
+      const pct = Number(TC.budget_used_pct);
+      const w = Number.isFinite(pct)
+        ? Math.min(100, Math.max(0, pct))
+        : (total > 0 ? Math.min(100, (used / total) * 100) : 0);
       $('tc-budget-bar').style.width = `${w}%`;
       $('tc-used').textContent = fmtUsd(used);
       $('tc-budget-total').textContent = fmtUsd(total);
-      $('tc-remaining').textContent = fmtUsd(remaining);
+      const liveCap = Number(TC.live_cap_usd ?? TC.total_budget_usd) || 0;
+      $('tc-live-cap').textContent = fmtUsd(liveCap);
+      if (basis === 'live') {
+        $('tc-budget-label').textContent = 'Deployed of your live cap';
+        $('tc-budget-caption').textContent =
+          `${w.toFixed(1)}% of your ${fmtUsd(liveCap)} live cap is in positions right now.`;
+        $('tc-live-cap-line').style.display = 'none';
+      } else {
+        $('tc-budget-label').textContent = 'Deployed in your practice portfolio';
+        const est = TC.paper_equity_confident === false ? ' (estimated balance)' : '';
+        $('tc-budget-caption').textContent =
+          `${w.toFixed(1)}% of your practice money is in positions right now${est}.`;
+        $('tc-live-cap-line').style.display = '';
+      }
     }
 
     function applyToForm(d) {

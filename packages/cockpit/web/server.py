@@ -2330,13 +2330,88 @@ def _trading_controls_live_state() -> dict[str, Any]:
     }
 
 
+# Sane non-zero denominator used only when the live paper-account equity
+# snapshot is unavailable, so the deployment % can never divide by zero. It
+# is NOT the real balance: when this kicks in we flag ``paper_equity_confident``
+# false so the UI/tests can tell it apart from a read of the real ~$100k sim.
+_PAPER_EQUITY_FALLBACK_USD = 100_000.0
+
+
+def _paper_equity_usd() -> tuple[float, bool]:
+    """Most recent paper-account equity — the same ~$100k sim balance the
+    equity curve / ``/api/state`` account block reads. Returns
+    ``(equity_usd, confident)``. Never raises: on any failure or a missing /
+    non-positive snapshot it falls back to ``_PAPER_EQUITY_FALLBACK_USD`` with
+    ``confident=False`` so the deployment % stays defined (no divide-by-zero)
+    without fabricating a real balance."""
+    import math
+
+    try:
+        snap = latest_account_snapshot()
+        eq = snap.get("equity") if isinstance(snap, dict) else None
+        if eq is not None:
+            eqf = float(eq)
+            if math.isfinite(eqf) and eqf > 0:
+                return eqf, True
+    except Exception:  # pragma: no cover — defensive
+        pass
+    return _PAPER_EQUITY_FALLBACK_USD, False
+
+
 def _trading_controls_payload() -> dict[str, Any]:
-    """Resolved controls + derived budget/position info for the GET route."""
+    """Resolved controls + derived budget/position info for the GET route.
+
+    The Trading Limits bar compares like-to-like per active mode. In
+    paper/shadow mode (the default) the bar shows *percent of the paper
+    portfolio deployed* = capital in open paper positions / paper account
+    equity (~$100k sim); the $300 LIVE float cap is exposed separately as
+    ``live_cap_usd`` ("applies when live"), never as the paper denominator.
+    In live mode the bar denominator follows the active mode and uses the
+    $300 live cap against real live notional. Unknown mode fails safe to
+    paper. Never raises into the route."""
     from packages.cockpit import trading_controls as tc
 
     controls = tc.load_controls()
     live = _trading_controls_live_state()
+    # Capital in open positions today (paper-world dollars, ~$100k scale).
+    deployed_usd = round(max(0.0, float(live["used_budget_usd"])), 2)
+    # Legacy field: deployed against the $300 cap. Kept for backward-compat;
+    # the bar no longer uses this in paper mode (it was the units bug).
     remaining = max(0.0, controls.total_budget_usd - live["used_budget_usd"])
+
+    # Active trading mode drives the bar denominator. Fail safe to paper.
+    try:
+        mode = load_state().trading_mode
+    except Exception:  # pragma: no cover — defensive
+        mode = "paper"
+    if mode not in ("paper", "live"):
+        mode = "paper"
+
+    live_cap_usd = round(float(controls.total_budget_usd), 2)  # $300 live cap
+    paper_equity_usd, paper_equity_confident = _paper_equity_usd()
+    paper_deployed_usd = deployed_usd
+    paper_deployed_pct = (
+        round(100.0 * paper_deployed_usd / paper_equity_usd, 2)
+        if paper_equity_usd > 0
+        else 0.0
+    )
+
+    if mode == "live":
+        # Live: real money — bar is deployed live notional vs the $300 cap.
+        budget_basis = "live"
+        budget_used_usd = paper_deployed_usd
+        budget_total_usd = live_cap_usd
+        budget_used_pct = (
+            round(100.0 * budget_used_usd / budget_total_usd, 2)
+            if budget_total_usd > 0
+            else 0.0
+        )
+    else:
+        # Paper/shadow: like-to-like deployment within the sim portfolio.
+        budget_basis = "paper"
+        budget_used_usd = paper_deployed_usd
+        budget_total_usd = round(paper_equity_usd, 2)
+        budget_used_pct = paper_deployed_pct
 
     # Paper-realism context for the "Paper realism" UI group. The modeled
     # spread/slippage constants + active backend let the UI explain how
@@ -2371,6 +2446,21 @@ def _trading_controls_payload() -> dict[str, Any]:
         "remaining_budget_usd": round(remaining, 2),
         "open_positions": live["open_positions"],
         "trades_today": live["trades_today"],
+        # --- Trading Limits bar (mode-aware, like-to-like) ---
+        "trading_mode": mode,
+        "budget_basis": budget_basis,
+        "budget_used_usd": budget_used_usd,
+        "budget_total_usd": budget_total_usd,
+        "budget_used_pct": budget_used_pct,
+        # Paper deployment (always present so the UI can show paper context).
+        "paper_deployed_usd": paper_deployed_usd,
+        "paper_equity_usd": round(paper_equity_usd, 2),
+        "paper_deployed_pct": paper_deployed_pct,
+        "paper_equity_confident": paper_equity_confident,
+        # The $300 LIVE float cap, shown as its own line ("applies when live"),
+        # and the $10,000 absolute ceiling — kept clearly separate from the
+        # paper denominator. Caps are unchanged.
+        "live_cap_usd": live_cap_usd,
         "paper_realism": paper_realism,
     }
 
