@@ -165,5 +165,55 @@ class FinnhubAdapter(DataAdapter):
                 )
             return out
 
+    async def get_earnings_calendar(
+        self, frm: str, to: str
+    ) -> list[dict[str, Any]]:
+        """Upcoming earnings calendar via ``/calendar/earnings`` (free tier).
+
+        READ-ONLY discovery source: returns the raw earnings rows for the
+        ``[frm, to]`` date window (each row carries a ``symbol`` + report
+        ``date``/``hour``). A dated upcoming earnings report is a real,
+        under-radar catalyst. Mirrors the other accessors: raises
+        :class:`DataAdapterError` on a missing key / non-200 so the caller can
+        fail safe. Returns ``[]`` when the window is empty."""
+        if not self.api_key:
+            raise DataAdapterError("finnhub: FINNHUB_API_KEY not set")
+        await BUCKETS["finnhub"].acquire()
+        with span("data.finnhub.earnings_calendar", {"from": frm, "to": to}):
+            r = await self._client.get(
+                f"{self.BASE}/calendar/earnings",
+                params={"from": frm, "to": to, "token": self.api_key},
+            )
+            if r.status_code != 200:
+                raise DataAdapterError(
+                    f"finnhub earnings calendar: HTTP {r.status_code}"
+                )
+            data = r.json() or {}
+            rows = data.get("earningsCalendar") if isinstance(data, dict) else None
+            return [row for row in (rows or []) if isinstance(row, dict)]
+
+    async def get_ipo_calendar(self, frm: str, to: str) -> list[dict[str, Any]]:
+        """Upcoming IPO calendar via ``/calendar/ipo`` (free tier).
+
+        READ-ONLY discovery source: returns the raw IPO rows for the
+        ``[frm, to]`` window (each carries a ``symbol`` + ``date`` + ``name``).
+        Raises :class:`DataAdapterError` on a missing key / non-200; ``[]`` when
+        the window is empty."""
+        if not self.api_key:
+            raise DataAdapterError("finnhub: FINNHUB_API_KEY not set")
+        await BUCKETS["finnhub"].acquire()
+        with span("data.finnhub.ipo_calendar", {"from": frm, "to": to}):
+            r = await self._client.get(
+                f"{self.BASE}/calendar/ipo",
+                params={"from": frm, "to": to, "token": self.api_key},
+            )
+            if r.status_code != 200:
+                raise DataAdapterError(
+                    f"finnhub ipo calendar: HTTP {r.status_code}"
+                )
+            data = r.json() or {}
+            rows = data.get("ipoCalendar") if isinstance(data, dict) else None
+            return [row for row in (rows or []) if isinstance(row, dict)]
+
     async def aclose(self) -> None:
         await self._client.aclose()

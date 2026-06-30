@@ -38,7 +38,7 @@ import tempfile
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -97,6 +97,24 @@ MOVERS_MAX_SYMBOLS = 40
 # A news mention alone is a weak signal, so we surface news candidates from a
 # single headline (min 1) -- the confidence stays low until corroborated.
 NEWS_MIN_MENTIONS = 1
+
+# How many days ahead the under_radar universe scans the catalyst calendars
+# (Finnhub earnings/IPO). A dated event inside this window is the target.
+# Env-overridable via RADAR_CALENDAR_DAYS. Bounded to a sane [1, 90].
+def _radar_calendar_days() -> int:
+    raw = os.getenv("RADAR_CALENDAR_DAYS")
+    if raw is None:
+        return 14
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        return 14
+    return min(90, max(1, v))
+
+
+# Cap the symbols pulled from any single under_radar sub-source so a noisy
+# calendar/scan can't blow up the downstream RH liquidity fan-out.
+RADAR_SOURCE_MAX_SYMBOLS = 40
 
 
 SignalKind = Literal["portfolio", "sentiment", "news", "scan"]
@@ -725,6 +743,141 @@ def candidates_from_under_radar(
         )
     out.sort(key=lambda c: (-c.catalyst_score, c.symbol))
     return out[:max_candidates]
+
+
+@dataclass
+class _RadarSeed:
+    """One sourced micro-cap candidate from the independent discovery universe.
+
+    ``catalyst_text`` is the real event text from the read-only source (e.g. an
+    earnings-calendar row → "upcoming earnings report"); it is run through the
+    SAME :func:`classify_catalyst` the news lane uses — a seed with no
+    detectable catalyst is never surfaced. ``source`` is the sub-source label
+    used for provenance accounting (``earnings_calendar`` / ``ipo`` /
+    ``rh_earnings`` / ``rh_scan`` / ...). Seeds carry NO price/liquidity data;
+    that is resolved separately and the MANDATORY gate fail-safe excludes any
+    name whose liquidity data is missing."""
+
+    symbol: str
+    catalyst_text: str = ""
+    source: str = ""
+
+
+def candidates_from_under_radar_universe(
+    seeds: list[_RadarSeed],
+    *,
+    liquidity_by_symbol: dict[str, dict[str, Any]],
+    market_cap_by_symbol: dict[str, Any] | None = None,
+    max_candidates: int | None = None,
+) -> tuple[list[Candidate], int]:
+    """Turn an INDEPENDENT micro-cap discovery universe into under_radar candidates.
+
+    This is the universe-sourced sibling of :func:`candidates_from_under_radar`:
+    instead of filtering the mainstream news feed, it takes proactively-sourced
+    ``seeds`` (Finnhub earnings/IPO calendars, RH read-only scans, ...) and runs
+    each through the EXISTING PR #22 pipeline UNCHANGED:
+
+      1. classify the catalyst from the seed's real event text
+         (:func:`classify_catalyst`); a seed with ``catalyst_type == "none"`` is
+         NOT surfaced (never fabricate a catalyst);
+      2. EXCLUDE index ETFs / funds via :func:`_is_etf_like` on the resolved
+         fundamentals row, and mega-caps via :func:`is_under_radar`
+         (``RADAR_MAX_MARKET_CAP`` cap ceiling, price fallback);
+      3. apply the MANDATORY :func:`liquidity_gate` (price/$-volume/spread),
+         fail-safe EXCLUDING any name whose liquidity data is missing.
+
+    Returns ``(candidates, gate_passed_count)`` where ``candidates`` is capped at
+    ``max_candidates`` (``RADAR_MAX_CANDIDATES``, default 10) for display and
+    ``gate_passed_count`` is how many names cleared every gate (pre-cap) — the
+    ``after_gate`` provenance figure. Empty input is a no-op. Never raises."""
+    if not seeds:
+        return [], 0
+    from packages.agents.catalyst import (
+        classify_catalyst,
+        is_under_radar,
+        liquidity_gate,
+        radar_max_candidates,
+    )
+
+    if max_candidates is None:
+        max_candidates = radar_max_candidates()
+    liq = {str(k).upper(): v for k, v in (liquidity_by_symbol or {}).items()}
+    mcaps = {str(k).upper(): v for k, v in (market_cap_by_symbol or {}).items()}
+
+    # Aggregate the strongest catalyst + contributing sub-sources + sample event
+    # text per symbol (a symbol can appear in several sub-sources, e.g. a scan
+    # name that ALSO has an upcoming earnings date).
+    best: dict[str, Any] = {}
+    sub_sources: dict[str, list[str]] = {}
+    samples: dict[str, list[str]] = {}
+    for seed in seeds:
+        sym = str(seed.symbol or "").strip().upper()
+        if not sym:
+            continue
+        srcs = sub_sources.setdefault(sym, [])
+        if seed.source and seed.source not in srcs:
+            srcs.append(seed.source)
+        sig = classify_catalyst(seed.catalyst_text)
+        if seed.catalyst_text:
+            bucket = samples.setdefault(sym, [])
+            if seed.catalyst_text not in bucket and len(bucket) < 5:
+                bucket.append(seed.catalyst_text)
+        prev = best.get(sym)
+        if prev is None or sig.catalyst_score > prev.catalyst_score:
+            best[sym] = sig
+
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    out: list[Candidate] = []
+    for sym, sig in best.items():
+        # Catalyst-gated: no detectable catalyst -> not surfaced (never fabricate).
+        if sig is None or sig.catalyst_type == "none" or sig.catalyst_score <= 0:
+            continue
+        info = liq.get(sym) or {}
+        # Index-ETF / fund exclusion (positive signal only; uncertain -> keep).
+        if info.get("is_etf"):
+            continue
+        price = info.get("price")
+        mcap = mcaps.get(sym, info.get("market_cap"))
+        # Mega-cap exclusion (small/micro-cap membership; keeps AAPL/SPY out).
+        if not is_under_radar(market_cap=mcap, price=price):
+            continue
+        # MANDATORY liquidity/spread/price gate — fail-safe excludes on missing
+        # data so we never surface an untradeable name into shadow.
+        gate = liquidity_gate(
+            price=price,
+            avg_dollar_volume=info.get("avg_dollar_volume"),
+            spread_pct=info.get("spread_pct"),
+        )
+        if not gate.passed:
+            logger.info("under_radar universe excludes %s: %s", sym, gate.reason)
+            continue
+        srcs = sub_sources.get(sym, [])
+        thesis = (
+            f"{sym}: under-the-radar {sig.catalyst_type} catalyst "
+            f"(score={sig.catalyst_score:.2f}) — {sig.catalyst_detail or 'see source'}. "
+            f"Sourced from {', '.join(srcs) or 'discovery universe'}; "
+            "liquidity-gated micro-cap play, verify before next session."
+        )
+        out.append(
+            Candidate(
+                symbol=sym,
+                signal_kind="scan",
+                thesis=thesis,
+                confidence=round(float(sig.catalyst_score), 4),
+                sentiment_score=0.0,
+                mentions=0,
+                sources=["under_radar", *srcs],
+                sample_headlines=samples.get(sym, [])[:5],
+                created_at=now,
+                lane="under_radar",
+                catalyst_type=sig.catalyst_type,
+                catalyst_score=round(float(sig.catalyst_score), 4),
+                catalyst_detail=sig.catalyst_detail,
+            )
+        )
+    out.sort(key=lambda c: (-c.catalyst_score, c.symbol))
+    gate_passed = len(out)
+    return out[:max_candidates], gate_passed
 
 
 def merge_under_radar_candidates(
@@ -1503,9 +1656,158 @@ async def _gather_under_radar_liquidity(
             "avg_dollar_volume": avg_dollar_vol,
             "spread_pct": _spread_pct_from_quote(quote),
             "market_cap": _num(row.get("market_cap")),
+            # Positive-signal ETF/fund flag so the under_radar universe can drop
+            # index ETFs even when their (large) market cap is blank.
+            "is_etf": _is_etf_like(row),
         }
         out[sym.upper()] = profile
     return out
+
+
+def _seed_from_earnings_row(
+    row: dict[str, Any], *, source: str
+) -> _RadarSeed | None:
+    """Build a seed from an earnings-calendar row (Finnhub or RH).
+
+    An upcoming earnings report IS a real, dated catalyst — we describe the
+    real row and let :func:`classify_catalyst` decide (never fabricate a type).
+    Returns ``None`` for a row with no usable symbol."""
+    sym = ""
+    for k in ("symbol", "ticker"):
+        v = row.get(k)
+        if v:
+            sym = str(v).strip().upper()
+            break
+    if not sym:
+        return None
+    date = str(row.get("date") or row.get("report_date") or "").strip()
+    when = f" scheduled for {date}" if date else ""
+    text = f"{sym} upcoming quarterly results / earnings report{when}"
+    return _RadarSeed(symbol=sym, catalyst_text=text, source=source)
+
+
+async def _gather_under_radar_universe() -> tuple[list[_RadarSeed], dict[str, int]]:
+    """Build the INDEPENDENT micro-cap discovery universe from read-only sources.
+
+    Each sub-source is probed in its OWN try/except and degrades independently
+    and fail-safe — an unreachable source is simply skipped (it contributes no
+    seeds and never fabricates one), the others still run. READ-ONLY throughout:
+    Finnhub earnings/IPO calendars (free tier) and Robinhood read-only earnings
+    calendar + saved scans. Returns ``(seeds, provenance)`` where ``provenance``
+    maps each sub-source label to the number of symbols it contributed (so a
+    0-candidate sweep is debuggable). Never raises."""
+    seeds: list[_RadarSeed] = []
+    provenance: dict[str, int] = {}
+    days = _radar_calendar_days()
+    today = datetime.now(UTC).date()
+    frm = today.isoformat()
+    to = (today + timedelta(days=days)).isoformat()
+
+    # --- Finnhub earnings + IPO calendars (only when the key is set) ---------
+    if os.getenv("FINNHUB_API_KEY"):
+        adapter = None
+        try:
+            from packages.data.adapters.finnhub import FinnhubAdapter
+
+            adapter = FinnhubAdapter()
+            if adapter.has_key:
+                try:
+                    rows = await adapter.get_earnings_calendar(frm, to)
+                    n = 0
+                    for row in rows[:RADAR_SOURCE_MAX_SYMBOLS]:
+                        seed = _seed_from_earnings_row(
+                            row, source="earnings_calendar"
+                        )
+                        if seed is not None:
+                            seeds.append(seed)
+                            n += 1
+                    provenance["earnings_calendar"] = n
+                except Exception as exc:  # pragma: no cover — network/defensive
+                    logger.warning(
+                        "under_radar earnings calendar failed: %s",
+                        exc.__class__.__name__,
+                    )
+                try:
+                    rows = await adapter.get_ipo_calendar(frm, to)
+                    n = 0
+                    for row in rows[:RADAR_SOURCE_MAX_SYMBOLS]:
+                        sym = str(row.get("symbol") or "").strip().upper()
+                        if not sym:
+                            continue
+                        # An IPO is a real dated event but has no classifier rule;
+                        # it joins the universe as a low-price member that only
+                        # surfaces if another sub-source supplies a catalyst.
+                        name = str(row.get("name") or "").strip()
+                        seeds.append(
+                            _RadarSeed(
+                                symbol=sym,
+                                catalyst_text=f"{sym} {name} IPO".strip(),
+                                source="ipo",
+                            )
+                        )
+                        n += 1
+                    provenance["ipo"] = n
+                except Exception as exc:  # pragma: no cover — network/defensive
+                    logger.warning(
+                        "under_radar ipo calendar failed: %s",
+                        exc.__class__.__name__,
+                    )
+        except Exception as exc:  # pragma: no cover — import safety
+            logger.warning(
+                "under_radar finnhub calendars import failed: %s",
+                exc.__class__.__name__,
+            )
+        finally:
+            if adapter is not None:
+                with contextlib.suppress(Exception):
+                    await adapter.aclose()
+
+    # --- Robinhood read-only earnings calendar + saved scans -----------------
+    try:
+        from packages.data import rh_live
+    except Exception as exc:  # pragma: no cover — import safety
+        logger.warning(
+            "under_radar rh_live import failed: %s", exc.__class__.__name__
+        )
+        rh_live = None  # type: ignore[assignment]
+    if rh_live is not None:
+        try:
+            eres = await rh_live.get_earnings()
+            rows = eres.value if eres.ok and isinstance(eres.value, list) else []
+            n = 0
+            for row in rows[:RADAR_SOURCE_MAX_SYMBOLS]:
+                if not isinstance(row, dict):
+                    continue
+                seed = _seed_from_earnings_row(row, source="rh_earnings")
+                if seed is not None:
+                    seeds.append(seed)
+                    n += 1
+            provenance["rh_earnings"] = n
+        except Exception as exc:  # pragma: no cover — network/defensive
+            logger.warning(
+                "under_radar rh earnings failed: %s", exc.__class__.__name__
+            )
+        try:
+            sres = await rh_live.get_scan_candidates(
+                max_symbols=RADAR_SOURCE_MAX_SYMBOLS
+            )
+            syms = sres.value if sres.ok and isinstance(sres.value, list) else []
+            n = 0
+            for sym in syms:
+                s = str(sym or "").strip().upper()
+                if not s:
+                    continue
+                # Scans supply symbols only (no catalyst text): they join the
+                # universe as low-price members and surface only when another
+                # sub-source supplies a real catalyst for the same symbol.
+                seeds.append(_RadarSeed(symbol=s, catalyst_text="", source="rh_scan"))
+                n += 1
+            provenance["rh_scan"] = n
+        except Exception as exc:  # pragma: no cover — network/defensive
+            logger.warning(
+                "under_radar rh scans failed: %s", exc.__class__.__name__
+            )
+    return seeds, provenance
 
 
 # ---------------------------------------------------------------------------
@@ -1666,22 +1968,30 @@ async def run_sweep(
                     "finnhub movers merge failed: %s", exc.__class__.__name__
                 )
 
-        # ADDITIVE: under-the-radar catalyst lane. Deliberately surfaces
-        # under-followed small/micro-cap names WITH a detectable catalyst,
-        # liquidity-gated for shadow-data integrity. Catalyst classification is
-        # pure (no network); only the MANDATORY liquidity/spread/price gate needs
-        # read-only RH quotes/fundamentals, so the lane only runs when RH is
-        # connected (otherwise liquidity data is missing -> fail-safe exclude ->
-        # no candidates, and tests / RH-off stay byte-for-byte unchanged). Fully
-        # fail-safe: any error leaves the existing universe untouched.
-        if _rh_connected():
+        # ADDITIVE: under-the-radar catalyst lane with its OWN independent
+        # micro-cap discovery universe. Instead of only filtering the
+        # mega-cap-dominated mainstream news feed, it proactively sources
+        # under-followed names from read-only catalyst calendars + scans
+        # (:func:`_gather_under_radar_universe`) and folds in any catalyst-bearing
+        # news symbols, then runs ALL of them through the UNCHANGED PR #22
+        # pipeline (catalyst classifier -> ETF/mega-cap exclusion -> MANDATORY
+        # liquidity/spread/price gate). The lane attempts sourcing whenever ANY
+        # underlying read-only source is reachable (RH connected OR a Finnhub
+        # key); each sub-source degrades independently and fail-safe. The
+        # MANDATORY gate still needs read-only RH quotes/fundamentals, so with RH
+        # off the liquidity map is empty -> every name fail-safe excluded -> 0
+        # candidates, but per-sub-source provenance is still recorded so a
+        # 0-candidate sweep is debuggable. Fully fail-safe: any error leaves the
+        # existing universe untouched.
+        if _rh_connected() or os.getenv("FINNHUB_API_KEY"):
             try:
                 from packages.agents.catalyst import classify_catalyst
 
-                # Cheap pure pre-scan: only fetch liquidity for symbols that
-                # actually carry a catalyst, to bound the RH fan-out.
-                catalyst_syms: list[str] = []
-                seen_cat: set[str] = set()
+                radar_t0 = time.monotonic()
+                # Catalyst-bearing names already in the news feed become seeds
+                # too, so the lane keeps its original input AND the new universe.
+                news_seeds: list[_RadarSeed] = []
+                news_syms: set[str] = set()
                 for it in news_items:
                     text = it.headline or ""
                     if it.summary:
@@ -1689,17 +1999,54 @@ async def run_sweep(
                     if classify_catalyst(text).catalyst_type == "none":
                         continue
                     for s in _symbols_from_news(it):
-                        if s not in seen_cat:
-                            seen_cat.add(s)
-                            catalyst_syms.append(s)
-                if catalyst_syms:
-                    radar_t0 = time.monotonic()
-                    liquidity = await _gather_under_radar_liquidity(catalyst_syms)
-                    radar_cands = candidates_from_under_radar(
-                        news_items, liquidity_by_symbol=liquidity
+                        news_seeds.append(
+                            _RadarSeed(
+                                symbol=s, catalyst_text=text, source="news_catalyst"
+                            )
+                        )
+                        news_syms.add(s)
+
+                universe_seeds, provenance = await _gather_under_radar_universe()
+                provenance["news_catalyst"] = len(news_syms)
+                all_seeds = news_seeds + universe_seeds
+
+                radar_cands: list[Candidate] = []
+                gate_passed = 0
+                if all_seeds:
+                    # Bound the read-only RH liquidity fan-out: prioritise
+                    # symbols that already carry a catalyst (they can actually
+                    # surface) ahead of catalyst-less universe members.
+                    cat_first: list[str] = []
+                    cat_rest: list[str] = []
+                    seen_sym: set[str] = set()
+                    for seed in all_seeds:
+                        sym = seed.symbol.strip().upper()
+                        if not sym or sym in seen_sym:
+                            continue
+                        seen_sym.add(sym)
+                        has_cat = bool(seed.catalyst_text) and (
+                            classify_catalyst(seed.catalyst_text).catalyst_type
+                            != "none"
+                        )
+                        (cat_first if has_cat else cat_rest).append(sym)
+                    fanout_syms = cat_first + cat_rest
+                    liquidity = await _gather_under_radar_liquidity(fanout_syms)
+                    radar_cands, gate_passed = (
+                        candidates_from_under_radar_universe(
+                            all_seeds, liquidity_by_symbol=liquidity
+                        )
                     )
                     cands = merge_under_radar_candidates(cands, radar_cands)
-                    _meta("under_radar", True, len(radar_cands), radar_t0)
+
+                sources_meta["under_radar"] = {
+                    "ok": True,
+                    "count": len(radar_cands),
+                    "latency_ms": round(
+                        (time.monotonic() - radar_t0) * 1000.0, 1
+                    ),
+                    "after_gate": gate_passed,
+                    **{k: int(v) for k, v in provenance.items()},
+                }
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning(
                     "under_radar lane merge failed: %s", exc.__class__.__name__
