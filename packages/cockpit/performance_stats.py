@@ -272,6 +272,28 @@ def _trade_ts(row: Mapping[str, Any]) -> str:
     return str(row.get("run_ts") or row.get("ts") or "")
 
 
+# Lane label for per-lane round-trip splits. Rows tagged by the under-radar
+# catalyst lane carry ``lane="under_radar"``; everything else is "mainstream".
+# An EXPLICITLY-tagged row wins; a legacy/untagged row (written before lane
+# tagging existed) falls into ``UNKNOWN_BUCKET`` so we never silently relabel
+# historical fills as belonging to a lane they predate.
+_VALID_LANES = ("under_radar", "mainstream")
+
+
+def _trade_lane(row: Mapping[str, Any]) -> str:
+    lane = row.get("lane")
+    if isinstance(lane, str) and lane.strip().lower() in _VALID_LANES:
+        return lane.strip().lower()
+    return UNKNOWN_BUCKET
+
+
+def _trade_catalyst_type(row: Mapping[str, Any]) -> str:
+    ct = row.get("catalyst_type")
+    if isinstance(ct, str) and ct.strip():
+        return ct.strip().lower()
+    return UNKNOWN_BUCKET
+
+
 def _trade_fill_source(row: Mapping[str, Any]) -> str | None:
     """Normalized fill provenance, or ``None`` when the field is absent.
 
@@ -349,7 +371,9 @@ def fifo_round_trips(trades: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         ts = _trade_ts(row) or None
         if side == "buy":
             buys += 1
-            open_lots.setdefault(symbol, []).append([qty, price, ts, source])
+            open_lots.setdefault(symbol, []).append(
+                [qty, price, ts, source, _trade_lane(row), _trade_catalyst_type(row)]
+            )
         else:  # sell — close oldest open buy lots first
             sells += 1
             lots = open_lots.get(symbol) or []
@@ -380,6 +404,10 @@ def fifo_round_trips(trades: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
                     "measured": measured,
                     "entry_fill_source": entry_source,
                     "exit_fill_source": source,
+                    # Lane/catalyst come from the ENTRY (buy) leg — the pick that
+                    # opened the position is what we're grading per lane.
+                    "lane": lot[4],
+                    "catalyst_type": lot[5],
                 })
                 lot[0] -= matched
                 remaining -= matched
@@ -511,6 +539,39 @@ def realized_trade_stats(fifo: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def realized_by_lane(fifo: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Split the closed round-trips by ``lane`` and grade each lane separately.
+
+    This is how we PROVE in shadow whether the AI is actually good at the
+    under-the-radar catalyst plays vs the mainstream flood: each lane gets its
+    own realized win rate / profit factor / expectancy from
+    :func:`realized_trade_stats`, computed over only that lane's round-trips.
+    Lanes with no round-trips are omitted. A legacy round-trip with no lane tag
+    falls into the ``"unknown"`` bucket (never silently merged into a real lane).
+    Pure & fail-safe — empty input yields ``{}``.
+    """
+    trips: list[Mapping[str, Any]] = list(fifo.get("round_trips") or [])
+    by_lane: dict[str, list[Mapping[str, Any]]] = {}
+    for t in trips:
+        lane = t.get("lane")
+        key = lane if isinstance(lane, str) and lane.strip() else UNKNOWN_BUCKET
+        by_lane.setdefault(key, []).append(t)
+    out: dict[str, dict[str, Any]] = {}
+    for lane, lane_trips in sorted(by_lane.items()):
+        measured = sum(1 for t in lane_trips if t.get("measured"))
+        sub_fifo = {
+            "round_trips": lane_trips,
+            "buys": 0,
+            "sells": 0,
+            "unpriced_fills": 0,
+            "measured_round_trips": measured,
+            "unmeasured_round_trips": len(lane_trips) - measured,
+            "open_lots": 0,
+        }
+        out[lane] = realized_trade_stats(sub_fifo)
+    return out
+
+
 def account_performance(
     equity_points: Iterable[Mapping[str, Any]],
     trades: Iterable[Mapping[str, Any]],
@@ -523,7 +584,12 @@ def account_performance(
     """
     series = clean_equity_series(equity_points)
     equities = [p["equity"] for p in series]
-    realized = realized_trade_stats(fifo_round_trips(trades))
+    fifo = fifo_round_trips(trades)
+    realized = realized_trade_stats(fifo)
+    # Per-lane split (under_radar vs mainstream) so shadow can prove whether the
+    # AI's catalyst picks actually beat the mainstream flood. Computed off the
+    # same FIFO round-trips; empty when no tagged round-trips exist.
+    by_lane = realized_by_lane(fifo)
 
     # Flatten the headline realized round-trip figures onto the account section
     # so callers (UI, readiness gate) can read them without reaching into the
@@ -551,6 +617,7 @@ def account_performance(
             "sharpe": None,
             "equity_curve": [dict(p) for p in series],
             "realized": realized,
+            "realized_by_lane": by_lane,
             **realized_summary,
         }
 
@@ -570,6 +637,7 @@ def account_performance(
         "sharpe": sharpe(period_returns),
         "equity_curve": _resample_for_display(series),
         "realized": realized,
+        "realized_by_lane": by_lane,
         **realized_summary,
     }
 
@@ -746,6 +814,7 @@ __all__ = [
     "fifo_round_trips",
     "max_drawdown",
     "profit_factor",
+    "realized_by_lane",
     "realized_trade_stats",
     "sharpe",
     "signal_quality",

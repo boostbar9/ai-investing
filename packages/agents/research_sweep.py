@@ -173,6 +173,16 @@ class Candidate:
     compliance_ok: bool = True           # False => Nasdaq noncompliant/delisting
     next_earnings_date: str = ""         # ISO date of next report, or ""
     days_to_earnings: int | None = None  # days until next report, or None
+    # Under-the-radar catalyst lane. ``lane`` partitions candidates into the
+    # mega-cap news flood ("mainstream", the default so every legacy/other-lane
+    # candidate is unchanged) vs the deliberately under-followed small/micro-cap
+    # catalyst plays ("under_radar"). The catalyst fields default to the
+    # fail-safe "no catalyst detected" state (type="none", score 0.0): a missing
+    # classifier run NEVER fabricates a catalyst. See packages/agents/catalyst.py.
+    lane: str = "mainstream"             # "mainstream" | "under_radar"
+    catalyst_type: str = "none"          # fda | m&a | contract | earnings | analyst | none
+    catalyst_score: float = 0.0          # [0, 1]; 0.0 when type == "none"
+    catalyst_detail: str = ""            # short quoted snippet, or ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -599,6 +609,155 @@ def merge_movers_candidates(
                 created_at=now,
             )
         )
+    return base
+
+
+def candidates_from_under_radar(
+    news_items: list[NewsItem],
+    *,
+    liquidity_by_symbol: dict[str, dict[str, Any]],
+    market_cap_by_symbol: dict[str, Any] | None = None,
+    min_mentions: int = NEWS_MIN_MENTIONS,
+    max_candidates: int = NEWS_MAX_CANDIDATES,
+) -> list[Candidate]:
+    """Build the under-the-radar catalyst lane from read-only signals.
+
+    This is the dedicated lane that deliberately surfaces under-followed
+    small/micro-cap names WITH a real, detectable catalyst — the opposite of the
+    mega-cap news-frequency funnel. For each symbol mentioned in ``news_items``
+    we:
+
+      1. classify the catalyst from the headline/summary
+         (:func:`packages.agents.catalyst.classify_catalyst`), keeping the
+         strongest catalyst seen for that symbol;
+      2. **catalyst-gate** it — a symbol with ``catalyst_type == "none"`` is NOT
+         surfaced (no fabricated catalyst, ever);
+      3. require it to look small/micro-cap (``is_under_radar``) so mega-caps
+         don't leak in; and
+      4. apply the MANDATORY :func:`liquidity_gate` using the per-symbol
+         price / avg-dollar-volume / spread in ``liquidity_by_symbol`` —
+         **fail-safe excluding** any name whose liquidity data is missing.
+
+    ``liquidity_by_symbol`` maps ``SYMBOL -> {"price", "avg_dollar_volume",
+    "spread_pct"[, "market_cap"]}``. ``market_cap_by_symbol`` is an optional
+    override/supplement for the small-cap membership test. Confidence is set to
+    the catalyst score so a stronger, dated catalyst ranks above raw hype.
+    Empty/ticker-less input is a no-op (returns ``[]``). Never raises.
+    """
+    if not news_items:
+        return []
+    from packages.agents.catalyst import (
+        classify_catalyst,
+        is_under_radar,
+        liquidity_gate,
+    )
+
+    liq = {str(k).upper(): v for k, v in (liquidity_by_symbol or {}).items()}
+    mcaps = {str(k).upper(): v for k, v in (market_cap_by_symbol or {}).items()}
+
+    # Aggregate the strongest catalyst + mention count + headlines per symbol.
+    best: dict[str, Any] = {}
+    counts: Counter[str] = Counter()
+    headlines: dict[str, list[str]] = {}
+    for it in news_items:
+        syms = _symbols_from_news(it)
+        if not syms:
+            continue
+        text = it.headline or ""
+        if it.summary:
+            text = f"{text} {it.summary}"
+        sig = classify_catalyst(text)
+        for sym in syms:
+            counts[sym] += 1
+            bucket = headlines.setdefault(sym, [])
+            if it.headline and it.headline not in bucket and len(bucket) < 5:
+                bucket.append(it.headline)
+            prev = best.get(sym)
+            if prev is None or sig.catalyst_score > prev.catalyst_score:
+                best[sym] = sig
+
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    out: list[Candidate] = []
+    for sym, mentions in counts.items():
+        if mentions < min_mentions:
+            continue
+        sig = best.get(sym)
+        # Catalyst-gated: a name with no detectable catalyst is NOT surfaced.
+        if sig is None or sig.catalyst_type == "none" or sig.catalyst_score <= 0:
+            continue
+        info = liq.get(sym) or {}
+        price = info.get("price")
+        mcap = mcaps.get(sym, info.get("market_cap"))
+        # Under-followed small/micro-cap membership (keeps mega-caps out).
+        if not is_under_radar(market_cap=mcap, price=price):
+            continue
+        # MANDATORY liquidity/spread/price gate — fail-safe excludes on missing
+        # data so we never surface an untradeable name into shadow.
+        gate = liquidity_gate(
+            price=price,
+            avg_dollar_volume=info.get("avg_dollar_volume"),
+            spread_pct=info.get("spread_pct"),
+        )
+        if not gate.passed:
+            logger.info("under_radar excludes %s: %s", sym, gate.reason)
+            continue
+        thesis = (
+            f"{sym}: under-the-radar {sig.catalyst_type} catalyst "
+            f"(score={sig.catalyst_score:.2f}) — {sig.catalyst_detail or 'see headline'}. "
+            "Liquidity-gated micro-cap play; verify before next session."
+        )
+        out.append(
+            Candidate(
+                symbol=sym,
+                signal_kind="scan",
+                thesis=thesis,
+                confidence=round(float(sig.catalyst_score), 4),
+                sentiment_score=0.0,
+                mentions=mentions,
+                sources=["under_radar"],
+                sample_headlines=headlines.get(sym, [])[:5],
+                created_at=now,
+                lane="under_radar",
+                catalyst_type=sig.catalyst_type,
+                catalyst_score=round(float(sig.catalyst_score), 4),
+                catalyst_detail=sig.catalyst_detail,
+            )
+        )
+    out.sort(key=lambda c: (-c.catalyst_score, c.symbol))
+    return out[:max_candidates]
+
+
+def merge_under_radar_candidates(
+    base: list[Candidate],
+    under_radar_candidates: list[Candidate],
+) -> list[Candidate]:
+    """ADDITIVELY union under-radar catalyst candidates into the universe.
+
+    Mirrors the other additive merges: an under-radar candidate for a symbol not
+    already present is appended; a symbol already present (mainstream) has the
+    ``"under_radar"`` source and its catalyst tags folded in WITHOUT being
+    down-ranked or relabeled out of its existing lane. Empty input is a no-op so
+    the universe only ever grows. Never raises.
+    """
+    if not under_radar_candidates:
+        return base
+    existing = {c.symbol.upper(): c for c in base}
+    for uc in under_radar_candidates:
+        key = uc.symbol.upper()
+        cur = existing.get(key)
+        if cur is None:
+            base.append(uc)
+            existing[key] = uc
+            continue
+        # Symbol already surfaced by another lane: enrich with the catalyst
+        # signal (so the round-trip can still be measured with a catalyst tag)
+        # but keep its original lane/ranking intact.
+        if "under_radar" not in cur.sources:
+            cur.sources.append("under_radar")
+        if uc.catalyst_score > cur.catalyst_score:
+            cur.catalyst_type = uc.catalyst_type
+            cur.catalyst_score = uc.catalyst_score
+            cur.catalyst_detail = uc.catalyst_detail
     return base
 
 
@@ -1274,6 +1433,81 @@ async def _gather_rh_earnings(
     return out
 
 
+def _spread_pct_from_quote(quote: dict[str, Any]) -> float | None:
+    """Estimate the bid/ask spread as a fraction of mid from an RH quote dict.
+
+    Returns ``None`` when bid/ask aren't both present and positive — the caller
+    then has no spread data and the liquidity gate will fail-safe exclude the
+    name. Never raises."""
+    if not isinstance(quote, dict):
+        return None
+    bid = _num(quote.get("bid") or quote.get("bid_price"))
+    ask = _num(quote.get("ask") or quote.get("ask_price"))
+    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return None
+    return round((ask - bid) / mid, 6)
+
+
+async def _gather_under_radar_liquidity(
+    symbols: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Build the per-symbol liquidity profile the under-radar gate needs.
+
+    For each symbol (READ-ONLY, RH-primary, cached): price + market cap + average
+    daily DOLLAR volume from fundamentals, and an estimated bid/ask spread from
+    the live quote. Returns ``{SYMBOL: {"price", "avg_dollar_volume",
+    "spread_pct", "market_cap"}}`` for whatever resolved. A symbol whose data
+    can't be fetched is simply absent from the map, so the liquidity gate
+    fail-safe EXCLUDES it. ``{}`` on any failure / RH off. Never raises."""
+    if not symbols:
+        return {}
+    try:
+        from packages.data import rh_live
+    except Exception as exc:  # pragma: no cover — import safety
+        logger.warning(
+            "under_radar liquidity import failed: %s", exc.__class__.__name__
+        )
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for sym in symbols[:RH_FUNDAMENTALS_MAX_SYMBOLS]:
+        try:
+            fres = await rh_live.get_fundamentals(sym)
+            qres = await rh_live.get_quote(sym)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                "under_radar liquidity gather failed for %s: %s",
+                sym,
+                exc.__class__.__name__,
+            )
+            continue
+        row = fres.value if fres.ok and isinstance(fres.value, dict) else {}
+        quote = qres.value if qres.ok and isinstance(qres.value, dict) else {}
+        price = (
+            _num(row.get("last_trade_price"))
+            or _num(row.get("last_price"))
+            or _num(quote.get("last") or quote.get("last_trade_price"))
+            or _num(quote.get("mid"))
+        )
+        avg_vol = _num(row.get("average_volume_30_days")) or _num(
+            row.get("average_volume_2_weeks")
+        )
+        avg_dollar_vol = (
+            avg_vol * price if (avg_vol and avg_vol > 0 and price and price > 0)
+            else None
+        )
+        profile: dict[str, Any] = {
+            "price": price,
+            "avg_dollar_volume": avg_dollar_vol,
+            "spread_pct": _spread_pct_from_quote(quote),
+            "market_cap": _num(row.get("market_cap")),
+        }
+        out[sym.upper()] = profile
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Top-level sweep orchestration
 # ---------------------------------------------------------------------------
@@ -1430,6 +1664,45 @@ async def run_sweep(
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning(
                     "finnhub movers merge failed: %s", exc.__class__.__name__
+                )
+
+        # ADDITIVE: under-the-radar catalyst lane. Deliberately surfaces
+        # under-followed small/micro-cap names WITH a detectable catalyst,
+        # liquidity-gated for shadow-data integrity. Catalyst classification is
+        # pure (no network); only the MANDATORY liquidity/spread/price gate needs
+        # read-only RH quotes/fundamentals, so the lane only runs when RH is
+        # connected (otherwise liquidity data is missing -> fail-safe exclude ->
+        # no candidates, and tests / RH-off stay byte-for-byte unchanged). Fully
+        # fail-safe: any error leaves the existing universe untouched.
+        if _rh_connected():
+            try:
+                from packages.agents.catalyst import classify_catalyst
+
+                # Cheap pure pre-scan: only fetch liquidity for symbols that
+                # actually carry a catalyst, to bound the RH fan-out.
+                catalyst_syms: list[str] = []
+                seen_cat: set[str] = set()
+                for it in news_items:
+                    text = it.headline or ""
+                    if it.summary:
+                        text = f"{text} {it.summary}"
+                    if classify_catalyst(text).catalyst_type == "none":
+                        continue
+                    for s in _symbols_from_news(it):
+                        if s not in seen_cat:
+                            seen_cat.add(s)
+                            catalyst_syms.append(s)
+                if catalyst_syms:
+                    radar_t0 = time.monotonic()
+                    liquidity = await _gather_under_radar_liquidity(catalyst_syms)
+                    radar_cands = candidates_from_under_radar(
+                        news_items, liquidity_by_symbol=liquidity
+                    )
+                    cands = merge_under_radar_candidates(cands, radar_cands)
+                    _meta("under_radar", True, len(radar_cands), radar_t0)
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning(
+                    "under_radar lane merge failed: %s", exc.__class__.__name__
                 )
 
         # Belt-and-braces: guarantee a symbol-unique universe after every
